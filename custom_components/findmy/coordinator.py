@@ -143,11 +143,13 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
     def get_account_next_fetch(self, account: AsyncAppleAccount) -> datetime | None:
         """Returns the next time a fetch will be attempted for the given account."""
         last_fetch = self.get_account_last_fetch(account)
-        if last_fetch is None:
+        num_accounts = len(self._storage.accounts)
+        if last_fetch is None or not num_accounts:
             return None
-        return last_fetch + timedelta(
-            seconds=self._MIN_ACCOUNT_UPDATE_DELAY * len(self._storage.accounts)
-        )
+        # Accounts are fetched round-robin, one per update interval (see reload()),
+        # so each account is fetched again after one interval per account.
+        interval = self._MIN_ACCOUNT_UPDATE_DELAY // num_accounts
+        return last_fetch + timedelta(seconds=interval * num_accounts)
 
     def get_account_last_fetch_result(
         self, account: AsyncAppleAccount
