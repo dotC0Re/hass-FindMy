@@ -5,8 +5,9 @@ Experimental custom integration to provide device tracker entities for FindMy Ne
 This is a fork of [malmeloo/hass-FindMy](https://github.com/malmeloo/hass-FindMy). Please report issues with
 this fork at [dotC0Re/hass-FindMy](https://github.com/dotC0Re/hass-FindMy/issues).
 
-A detailed code review (in German) with known security and stability issues and the refactoring
-plan is available in [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md).
+A detailed code review (in German) with known security and stability issues is available in
+[docs/CODE_REVIEW.md](docs/CODE_REVIEW.md). The verified findings, the fix strategy and the
+dependency analysis are in [docs/REFACTORING_STRATEGY.md](docs/REFACTORING_STRATEGY.md).
 
 ## Setting up
 

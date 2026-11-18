@@ -6,6 +6,7 @@
 | **Umfang** | Gesamte Integration `custom_components/findmy/` (≈ 3.300 Zeilen), Blueprints, Projekt- und CI-Konfiguration, relevante Teile der Bibliotheken `FindMy` 0.10.2 und `anisette` |
 | **Ziel** | Grundlage für ein Refactoring mit Fokus auf **Sicherheit** und **Stabilität**, bei guter Wartbarkeit, als Basis für den weiteren Ausbau |
 | **Methode** | Vollständiges manuelles Lesen aller Module; Abgleich jeder Annahme gegen den Quellcode von Home Assistant 2026.9.3 und FindMy 0.10.2 in `.venv`; einzelne Verhaltensannahmen per Skript geprüft |
+| **Nachprüfung** | Alle Befunde wurden ein zweites Mal geprüft, viele per Test. Ergebnis, drei neue Befunde (R20–R22) und die Strategie zur Behebung stehen in [REFACTORING_STRATEGY.md](REFACTORING_STRATEGY.md). Korrekturen sind hier eingearbeitet und mit „Nachprüfung:“ markiert. |
 
 ## Inhalt
 
@@ -22,7 +23,7 @@
 
 **Schweregrade:** 🔴 Hoch = Sicherheitslücke, Datenverlust, Sperrrisiko beim Apple-Konto oder stiller Funktionsausfall · 🟠 Mittel = Fehlverhalten in realistischen Situationen · 🟡 Niedrig = Randfall, Schönheitsfehler, technische Schuld
 
-**Status:** ✅ verifiziert (im Quellcode oder per Test nachgewiesen) · 🔍 plausibel (Ablauf schlüssig, aber nicht live reproduziert)
+**Status:** ✅ verifiziert (im Quellcode oder per Test nachgewiesen) · 🔍 plausibel (Ablauf schlüssig, aber nicht live reproduziert) · 🌐 extern berichtet (aus den Original-Repos, nicht selbst geprüft)
 
 ---
 
@@ -37,7 +38,9 @@ Die Schwächen liegen vor allem in vier Bereichen:
 3. **Rate-Limit:** Die zugesagte Grenze von einer Abfrage pro 15 Minuten und Konto wird nicht erzwungen. Nach dem Entfernen eines Kontos wird sie sogar dauerhaft überschritten (R3, R4). Damit steigt das Risiko einer Sperre durch Apple.
 4. **Struktur:** Ein globaler, prozessweiter Zustand (`hass.data[DOMAIN]`) wird nie abgebaut. Ein einzelner Coordinator für alle Konten verhindert eine saubere Fehlerzuordnung pro Konto. Es gibt keine Tests.
 
-Die meisten Befunde lassen sich mit überschaubarem Aufwand beheben. Kapitel 8 schlägt eine Reihenfolge vor, die zuerst die risikoreichsten Punkte schließt und gleichzeitig eine Testbasis aufbaut.
+Die meisten Befunde lassen sich mit überschaubarem Aufwand beheben. Kapitel 8 schlägt eine Reihenfolge vor, die zuerst die risikoreichsten Punkte schließt und gleichzeitig eine Testbasis aufbaut. Die ausgearbeitete Fassung mit Arbeitspaketen steht in [REFACTORING_STRATEGY.md](REFACTORING_STRATEGY.md).
+
+Die Nachprüfung hat drei weitere Befunde ergeben, die in der Strategie beschrieben sind: Der Abruf **blockiert die Event-Loop** von Home Assistant für Sekunden bis über eine Minute (R20), ein Abruf besteht aus **vielen HTTP-Anfragen** (R21), und Apple hat im Oktober 2026 die Anmeldung umgestellt, sodass **neue Anmeldungen voraussichtlich fehlschlagen** (R22).
 
 ### Befundübersicht
 
@@ -47,10 +50,10 @@ Die meisten Befunde lassen sich mit überschaubarem Aufwand beheben. Kapitel 8 s
 | [S2](#s2-private-schlüssel-und-2fa-codes-im-log) | Private Schlüssel und 2FA-Codes im Log | 🔴 | ✅ |
 | [S3](#s3-löschdienst-ohne-admin-prüfung-mit-gefährlichem-default) | Löschdienst ohne Admin-Prüfung, Default „alles löschen“ | 🔴 | ✅ |
 | [S4](#s4-lokale-anisette-lädt-ungeprüfte-binärdateien-nach) | Lokale Anisette lädt ungeprüfte Binärdateien nach | 🟠 | ✅ |
-| [S5](#s5-bluetooth-replay-kann-präsenz-vortäuschen-und-die-schlüsselausrichtung-verschieben) | Bluetooth-Replay täuscht Präsenz vor und verschiebt die Schlüsselausrichtung | 🟠 | 🔍 |
+| [S5](#s5-bluetooth-replay-kann-präsenz-vortäuschen-und-die-schlüsselausrichtung-verschieben) | Bluetooth-Replay täuscht Präsenz vor (🟠) und kann die Ortung verzögern (🟡) | 🟠 | ✅ |
 | [S6](#s6-positionsverlauf-in-unbegrenzten-langzeitstatistiken) | Positionsverlauf in unbegrenzten Langzeitstatistiken | 🟠 | ✅ |
 | [S7](#s7-personenbezogene-daten-in-logs-und-ids) | Personenbezogene Daten in Logs und IDs | 🟡 | ✅ |
-| [R1](#r1-re-authentifizierung-wird-nie-gestartet) | Re-Authentifizierung wird nie gestartet | 🔴 | ✅ |
+| [R1](#r1-re-authentifizierung-wird-nie-gestartet) | Re-Authentifizierung wird nie gestartet; ein abgelaufenes Konto stoppt alle Abfragen | 🔴 | ✅ |
 | [R2](#r2-fehlgeschlagene-abrufe-werden-als-erfolg-protokolliert) | Fehlgeschlagene Abrufe werden als Erfolg protokolliert | 🔴 | ✅ |
 | [R3](#r3-abfrageintervall-wird-nach-dem-entfernen-eines-kontos-nicht-angepasst) | Abfrageintervall nach Entfernen eines Kontos nicht angepasst | 🔴 | ✅ |
 | [R4](#r4-rate-limit-wird-nicht-erzwungen) | Rate-Limit wird nicht erzwungen | 🟠 | ✅ |
@@ -60,7 +63,7 @@ Die meisten Befunde lassen sich mit überschaubarem Aufwand beheben. Kapitel 8 s
 | [R8](#r8-geräte-können-doppelt-angelegt-werden) | Geräte können doppelt angelegt werden | 🟠 | ✅ |
 | [R9](#r9-kontogeräte-kollidieren-bei-gleichem-lokalen-teil-der-e-mail) | Kontogeräte kollidieren bei gleichem lokalen Teil der E-Mail | 🟠 | ✅ |
 | [R10](#r10-defekte-eintragsdaten-und-abgemeldete-konten-beim-start) | Defekte Eintragsdaten und abgemeldete Konten beim Start | 🟠 | ✅ |
-| [R11](#r11-bluetooth-ist-harte-abhängigkeit-obwohl-optional) | Bluetooth ist harte Abhängigkeit, obwohl optional | 🟠 | ✅ |
+| [R11](#r11-bluetooth-ist-harte-abhängigkeit-obwohl-optional) | Bluetooth ist harte Abhängigkeit, obwohl optional | 🟡 | ✅ |
 | [R12](#r12-falsche-mindestversion-in-hacsjson) | Falsche Mindestversion in `hacs.json` | 🟠 | ✅ |
 | [R13](#r13-auf--und-abbau-unvollständig) | Auf- und Abbau unvollständig | 🟡 | ✅ |
 | [R14](#r14-http-sessions-im-config-flow-werden-nie-geschlossen) | HTTP-Sessions im Config-Flow werden nie geschlossen | 🟡 | ✅ |
@@ -69,6 +72,9 @@ Die meisten Befunde lassen sich mit überschaubarem Aufwand beheben. Kapitel 8 s
 | [R17](#r17-abrufprotokoll-wächst-unbegrenzt) | Abrufprotokoll wächst unbegrenzt | 🟡 | ✅ |
 | [R18](#r18-config-entry-wird-bei-jedem-abruf-neu-geschrieben) | Config-Entry wird bei jedem Abruf neu geschrieben | 🟡 | ✅ |
 | [R19](#r19-blueprint-tag_stale-prüft-nur-einmal-pro-stunde) | Blueprint `tag_stale` prüft nur einmal pro Stunde | 🟡 | ✅ |
+| [R20](REFACTORING_STRATEGY.md#r20-der-abruf-blockiert-die-event-loop-von-home-assistant) | Der Abruf blockiert die Event-Loop von Home Assistant (neu) | 🔴 | ✅ |
+| [R21](REFACTORING_STRATEGY.md#r21-ein-abruf-sind-viele-http-anfragen) | Ein Abruf sind viele HTTP-Anfragen (neu) | 🟠 | ✅ |
+| [R22](REFACTORING_STRATEGY.md#r22-apple-umstellung-im-oktober-2026-anmeldung-und-abruf-gestört) | Apple-Umstellung im Oktober 2026: Anmeldung und Abruf gestört (neu) | 🔴 | 🌐 |
 | [W1–W10](#5-befunde-wartbarkeit-und-dokumentation) | Wartbarkeit und Dokumentation | 🟡 | ✅ |
 
 ---
@@ -182,18 +188,20 @@ HA Bluetooth ──► FindMyDeviceTracker._async_track_service_info ──► l
 
 ### S5 Bluetooth-Replay kann Präsenz vortäuschen und die Schlüsselausrichtung verschieben
 
-🟠 Mittel · 🔍 plausibel · [`device_tracker.py:298-312`](../custom_components/findmy/device_tracker.py#L298-L312), [`local_bluetooth.py:171-205`](../custom_components/findmy/local_bluetooth.py#L171-L205)
+🟠 Mittel (Präsenz) / 🟡 Niedrig (Ausrichtung) · ✅ verifiziert · [`device_tracker.py:298-312`](../custom_components/findmy/device_tracker.py#L298-L312), [`local_bluetooth.py:171-205`](../custom_components/findmy/local_bluetooth.py#L171-L205)
+
+**Nachprüfung:** Punkt 2 war in der ersten Fassung zu stark formuliert. Die Bibliothek verwirft Ausrichtungen, deren Index oder Zeitpunkt zurückliegt (`accessory.py:368-381`). Ein Replay wirkt deshalb nur, wenn die gespeicherte Ausrichtung **älter** ist als das abgespielte Signal. Im Test (Ausrichtung 3 h alt, Signal 2 h alt) fragte der nächste Abruf Schlüssel ab, die 2 h hinter dem wahren Stand lagen. Der Rückstand blieb bestehen, bis ein echtes Signal ihn korrigierte. War die Ausrichtung frisch, blieb das Replay ohne Wirkung. Zusätzlich neu: Jedes solche Signal stößt in der Integration eine Neuberechnung der Kandidaten an, auch wenn die Bibliothek die Ausrichtung ablehnt.
 
 **Problem:**
 1. Advertisements sind **nicht authentifiziert**. Wer ein Advertisement des Tags mitschneidet (Reichweite ≈ 10-50 m) und in der Nähe des Home-Assistant-Scanners wieder aussendet, erzeugt einen Treffer. Beim DULT-Format reicht schon die MAC-Adresse (`match_dult_advertisement` vergleicht nur `_lookup_prefix(mac)`).
-2. Ein Treffer mit `can_align=True` ruft `update_alignment(detected_at, key_index)` auf und **speichert** das Ergebnis stündlich im Config-Entry. Das Fenster der Kandidaten reicht 36 h zurück. Ein Replay eines bis zu 36 h alten Advertisements setzt den Index also auf einen alten Wert mit aktuellem Zeitstempel. Die Prüfung `observation.detected_at < previous.detected_at` greift nicht, weil der Replay neu empfangen wird.
+2. Ein Treffer mit `can_align=True` ruft `update_alignment(detected_at, key_index)` auf und **speichert** das Ergebnis stündlich im Config-Entry. Das Fenster der Kandidaten reicht 36 h zurück. Ein Replay eines bis zu 36 h alten Advertisements wird also als Treffer gewertet. Die Prüfung `observation.detected_at < previous.detected_at` greift nicht, weil der Replay neu empfangen wird. Ob die Ausrichtung dadurch tatsächlich verschoben wird, hängt vom gespeicherten Stand ab (siehe Nachprüfung oben).
 
 **Auswirkung:**
 - Präsenzsensoren melden „zu Hause“, obwohl der Tag fehlt. Das wird kritisch, wenn Automationen damit Türen, Alarmanlagen oder Ähnliches steuern.
-- Eine verschobene Ausrichtung kann dazu führen, dass Abrufe aus dem Netzwerk die falschen Schlüssel verwenden, bis ein echtes Advertisement korrigiert. Das ist plausibel, aber nicht live nachgestellt.
+- Ist die gespeicherte Ausrichtung älter als das abgespielte Signal, hinkt die Ortung über das Netzwerk um das Alter des Signals hinterher, bis ein echtes Advertisement korrigiert (per Simulation bestätigt). Der Schaden ist begrenzt und setzt voraus, dass der Angreifer in Funkreichweite des Scanners ist.
 
 **Empfehlung:**
-1. Die Ausrichtung nur **vorwärts** und innerhalb einer Toleranz übernehmen, etwa erwarteter Index ±2. Größere Sprünge erst nach mehreren konsistenten Beobachtungen akzeptieren.
+1. Die Ausrichtung aus Bluetooth nur übernehmen, wenn der Index nicht hinter der Erwartung aus der letzten bestätigten Ortung zurückliegt. Neuberechnungen der Kandidaten entprellen.
 2. In der README und in der Beschreibung des Präsenzsensors klar sagen: **Keine Sicherheitsfunktion.** Nicht für Zutrittssteuerung verwenden.
 3. Für DULT-Treffer prüfen, ob dieselbe MAC-Adresse vorher schon über das Offline-Finding-Format mit vollem Schlüssel bestätigt wurde.
 
@@ -226,7 +234,9 @@ HA Bluetooth ──► FindMyDeviceTracker._async_track_service_info ──► l
 
 **Problem:** Der Coordinator entsteht in `async_setup` ohne `config_entry=`. Home Assistant nimmt dann `config_entries.current_entry.get()`, und das ist in `async_setup` `None`. Der Kommentar in Zeile 226-229 verspricht, dass `ConfigEntryAuthFailed` den Nutzer zur Neuanmeldung auffordert. Home Assistant ruft `async_start_reauth_if_available` aber **nur** auf, wenn `self.config_entry` gesetzt ist (`helpers/update_coordinator.py:553-554`). Selbst wenn ein Eintrag gesetzt wäre, wäre es der falsche: Der Coordinator ist für alle Konten zuständig, Re-Auth gehört aber zum Konto, das gerade fehlgeschlagen ist.
 
-**Auswirkung:** Läuft eine Sitzung ab, werden **alle** Geräte-Entities `unavailable` (`last_update_success = False`). Der Nutzer bekommt keine Aufforderung, der Fehler ist still. Weil der Coordinator nach einem Auth-Fehler auch keine Listener mehr benachrichtigt, sieht man nur eingefrorene Daten.
+**Auswirkung:** Läuft eine Sitzung ab, werden **alle** Geräte-Entities `unavailable` (`last_update_success = False`). Der Nutzer bekommt keine Aufforderung, der Fehler ist still. 
+
+**Nachprüfung (per Test bestätigt und verschärft):** Nach `ConfigEntryAuthFailed` plant der Coordinator **keinen weiteren Abruf** (`helpers/update_coordinator.py:585`). Ein einziges abgelaufenes Konto beendet damit die Abfragen **aller** Konten, bis Home Assistant neu startet oder jemand manuell aktualisiert.
 
 **Empfehlung:** Bei einem Auth-Fehler explizit den Eintrag **des betroffenen Kontos** in Re-Auth schicken: `entry.async_start_reauth(hass)`. Das setzt voraus, dass die Zuordnung Konto → Entry bekannt ist (siehe Zielarchitektur in Kapitel 8). Der Fehler wird nur für dieses Konto behandelt. Ein Fehler bei Konto A darf Konto B nicht blockieren und nicht alle Geräte auf `unavailable` setzen.
 
@@ -245,7 +255,7 @@ except InvalidStateError: success = False; ...
 finally:
     self._log(account, FETCH_SUCCESS if success else FETCH_ERROR)
 ```
-Alle anderen Ausnahmen bleiben mit `success = True` stehen und werden als **Erfolg** protokolliert. Das betrifft `UnhandledProtocolError`, `EmptyResponseError`, `aiohttp.ClientError`, Timeouts und Anisette-Fehler, und genau diese Fehler sind in der Praxis die häufigsten. Weil sie außerdem nicht in `UpdateFailed` übersetzt werden, loggt Home Assistant sie als „Unexpected error“ mit Stacktrace.
+Alle anderen Ausnahmen bleiben mit `success = True` stehen und werden als **Erfolg** protokolliert. Das betrifft `UnhandledProtocolError`, `aiohttp.ClientError`, `TimeoutError`, Anisette-Fehler und `KeyError` (etwa `'searchPartyToken'` nach der Apple-Umstellung, siehe R22), und genau diese Fehler sind in der Praxis die häufigsten. Per Test bestätigt für `UnhandledProtocolError` und `TimeoutError`. `EmptyResponseError` fängt die Bibliothek selbst ab. Weil sie außerdem nicht in `UpdateFailed` übersetzt werden, loggt Home Assistant sie als „Unexpected error“ mit Stacktrace.
 
 **Auswirkung:** Die Sensoren `Last fetch result` zeigen `success`, obwohl nichts abgerufen wurde. Die Fehlersuche wird irreführend.
 
@@ -335,7 +345,9 @@ Alle anderen Ausnahmen bleiben mit `success = True` stehen und werden als **Erfo
 
 ### R11 Bluetooth ist harte Abhängigkeit, obwohl optional
 
-🟠 Mittel · ✅ verifiziert · [`manifest.json`](../custom_components/findmy/manifest.json), [`device_tracker.py:10`](../custom_components/findmy/device_tracker.py#L10), [`presence.py:13`](../custom_components/findmy/presence.py#L13)
+🟡 Niedrig · ✅ verifiziert · [`manifest.json`](../custom_components/findmy/manifest.json), [`device_tracker.py:10`](../custom_components/findmy/device_tracker.py#L10), [`presence.py:13`](../custom_components/findmy/presence.py#L13)
+
+**Nachprüfung:** Von 🟠 auf 🟡 herabgestuft. Das Setup der Bluetooth-Integration endet regulär mit `return True`; einen Abbruch wegen fehlender Adapter habe ich dort nicht gefunden. Ein Totalausfall ist deshalb vermutlich selten. Es bleibt, dass Bluetooth samt `usb` jedem Nutzer aufgezwungen wird und Tests unter Windows nicht laufen.
 
 **Problem:** `"dependencies": ["bluetooth"]` und die Imports auf Modulebene führen dazu, dass FindMy **nicht lädt**, wenn die Bluetooth-Integration nicht startet. Das kommt etwa vor bei Containern ohne D-Bus, auf manchen NAS-Systemen oder bei Windows- und Entwicklungsumgebungen (siehe Kapitel 7). Der Abruf über das Find-My-Netzwerk braucht aber kein Bluetooth.
 
@@ -424,6 +436,8 @@ Der Code rechnet `last + 15 min × Anzahl Konten`. Richtig ist `last + 15 min`: 
 
 ## 6. Abhängigkeiten: Bestand und Reduktion
 
+> **Nachprüfung:** Dieses Kapitel ist durch [Kapitel 8 der Strategie](REFACTORING_STRATEGY.md#8-abhängigkeiten) ersetzt. Dort stehen die geprüften Fakten, Alternativen und die Empfehlung. Die wichtigste Korrektur: `fs` wird nirgends importiert und ist **kein** Ausfallrisiko. Die betroffenen Stellen unten sind entsprechend berichtigt.
+
 ### Bestand
 
 **Laufzeit** (installiert Home Assistant über `manifest.json`):
@@ -444,7 +458,8 @@ Der Code rechnet `last + 15 min × Anzahl Konten`. Richtig ist `last + 15 min`: 
 
 ### Risiken im Bestand
 
-- **`fs` 2.4.16 ist faktisch unmaintained** und nutzt `pkg_resources.declare_namespace` (verifiziert: `DeprecationWarning` beim Import). setuptools hat die Entfernung von `pkg_resources` angekündigt. Sobald Home Assistant ein setuptools ohne `pkg_resources` mitbringt, schlägt `import fs` fehl, damit `import anisette`, damit `import findmy`, und die **gesamte Integration** lädt nicht mehr, auch mit entfernter Anisette.
+- **`fs` 2.4.16 ist eine Altlast, aber kein Ausfallrisiko (korrigiert).** Das Paket ist seit 2022 ohne Release und nutzt `pkg_resources`. `anisette` 1.2.4 führt es aber nur noch in den Metadaten und importiert es nicht mehr. Per Test geprüft: `anisette` und `findmy` laden auch, wenn `fs`, `appdirs` und `pkg_resources` blockiert sind. Die erste Fassung dieses Reviews warnte hier fälschlich vor einem Totalausfall.
+- **`bleak` ist das eigentliche Kopplungsrisiko.** `FindMy` verlangt `bleak<3.1.0`, Home Assistant legt `bleak==3.0.2` fest. Hebt Home Assistant auf 3.1 an, lässt sich `FindMy==0.10.2` nicht mehr installieren.
 - **`unicorn`** ist mit 58 MB das größte Paket. Es braucht native Wheels für jede Architektur und ist der Grund für lange Installationszeiten auf ARM-Geräten wie dem Raspberry Pi.
 - **Doppelte Versionsangaben:** `manifest.json` pinnt `FindMy==0.10.2`, `pyproject.toml` erlaubt `findmy>=0.10.2`. Die Entwicklungsumgebung kann damit von dem abweichen, was Nutzer bekommen.
 - **`homeassistant` als Laufzeitabhängigkeit** in `[project].dependencies`. Für eine Custom-Integration stellt Home Assistant die Umgebung bereit, das Paket gehört in die Dev-Gruppe.
@@ -455,7 +470,7 @@ Der Code rechnet `last + 15 min × Anzahl Konten`. Richtig ist `last + 15 min`: 
 |---|---|---|---|---|
 | A1 | **Bluetooth optional machen** (R11): `after_dependencies`, Bluetooth-Code verzögert laden | Harte Abhängigkeit auf die Bluetooth-Komponente samt `habluetooth`, `dbus-fast`, `bluetooth-adapters` und USB-Erkennung entfällt | mittel | nur Integration |
 | A2 | **`anisette` in FindMy.py optional machen** (Upstream-PR): `findmy[local-anisette]` als Extra; `LocalAnisetteProvider` importiert `anisette` erst bei Bedarf. FindMy importiert es heute auf Modulebene (`reports/anisette.py:17`). | ≈ 60 MB (`unicorn`, `pyelftools`, `fs`, `appdirs`) und das `pkg_resources`-Risiko, für alle Nutzer mit Anisette-Server | klein upstream, dann trivial | Upstream FindMy.py |
-| A3 | **`fs` in `anisette` ersetzen** (Upstream-PR): Für das In-Memory-Dateisystem genügen `io.BytesIO` und ein dict | `fs`, `appdirs`, Abhängigkeit von `setuptools` zur Laufzeit; das `pkg_resources`-Risiko entfällt | mittel | Upstream anisette |
+| A3 | **`fs` aus den Abhängigkeiten von `anisette` streichen** (Upstream-PR, korrigiert): Das Paket wird nicht mehr importiert | `fs`, `appdirs` | eine Zeile | Upstream anisette |
 | A4 | **`beautifulsoup4` in FindMy.py ersetzen** (Upstream): Die Telefonnummern stehen als JSON in einem `<script>`-Tag, ein gezielter Regex oder `html.parser` aus der Standardbibliothek reicht | 0,9 MB, 2 Pakete | klein | Upstream FindMy.py |
 | A5 | **`homeassistant` in die Dev-Gruppe verschieben**, besser durch `pytest-homeassistant-custom-component` ersetzen; das pinnt HA passend und bringt die Test-Fixtures mit | sauberere Semantik, reproduzierbare Tests | klein | nur Integration |
 | A6 | **Versionsangaben vereinheitlichen:** `findmy==0.10.2` in `pyproject.toml`, in CI per Skript gegen `manifest.json` prüfen | verhindert Abweichungen | klein | nur Integration |
@@ -571,7 +586,7 @@ Diese Fakten stützen die Befunde. Sie wurden gegen die installierten Versionen 
 | Fakt | Quelle |
 |---|---|
 | `DataUpdateCoordinator` ohne `config_entry` nutzt `config_entries.current_entry.get()`. Re-Auth startet nur, wenn `self.config_entry` gesetzt ist. | `homeassistant/helpers/update_coordinator.py:100-110`, `:538-554` |
-| Nach `ConfigEntryAuthFailed` benachrichtigt der Coordinator keine Listener (`if not auth_failed and self._listeners …`). | `helpers/update_coordinator.py:585` |
+| Nach `ConfigEntryAuthFailed` plant der Coordinator keinen weiteren Abruf (`if not auth_failed and self._listeners …: self._schedule_refresh()`). Korrigiert: Die erste Fassung sprach hier von nicht benachrichtigten Listenern. | `helpers/update_coordinator.py:585`, Test |
 | Der Coordinator entprellt `async_request_refresh` standardmäßig nur mit 10 s Cooldown. | `helpers/update_coordinator.py:35-36` |
 | `process_uploaded_file` liefert einen `Path` und löscht die Datei nach dem Kontext. | `components/file_upload/__init__.py:36-57` |
 | Enum-Sensoren ohne `options` sind zulässig; mit `options` wird der Wert validiert. | `components/sensor/__init__.py:697-712` |
@@ -584,4 +599,7 @@ Diese Fakten stützen die Befunde. Sie wurden gegen die installierten Versionen 
 | `__hash__` und `__eq__` von `FindMyAccessory`, `FixedRollingKeyPairAccessory` und `KeyPair` hängen nur an unveränderlichen Schlüsseln, nicht an der Ausrichtung. Die Geräte sind deshalb als Dict-Schlüssel sicher. | `findmy/accessory.py:214-222`, `:529-542`, `findmy/keys.py:63-67` |
 | `FindMyAccessory.from_plist` wirft bei fehlenden Feldern `KeyError`. | `findmy/accessory.py:412-440` |
 | `LocalAnisetteProvider` lädt die Bibliotheken ohne `libs_path` bei jeder Initialisierung herunter, von `anisette.dl.mikealmel.ooo`, ohne Timeout, Status- oder Hashprüfung. | `findmy/reports/anisette.py:318-370`, `anisette/anisette.py:26`, `anisette/_util.py:44-50` |
-| `fs` 2.4.16 ruft `pkg_resources.declare_namespace` auf. | `fs/__init__.py:4` |
+| `fs` 2.4.16 ruft `pkg_resources.declare_namespace` auf, wird aber von `anisette` 1.2.4 und `findmy` 0.10.2 nicht importiert. | `fs/__init__.py:4`, Import-Test |
+| `FindMyAccessory.update_alignment` verwirft Aufrufe mit älterem Datum oder kleinerem Index. | `findmy/accessory.py:368-381`, Test |
+| Pro Accessoire und Abruf leitet FindMy 2.016 Schlüsselpaare synchron ab (3 je Index, 672 Indizes). | Profil, siehe Strategie Kapitel 3 |
+| Home Assistant legt `bleak==3.0.2`, `mashumaro>=3.17.0` und `setuptools<82.0.0` fest. | `homeassistant/package_constraints.txt` |
