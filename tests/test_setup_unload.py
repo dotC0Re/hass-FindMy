@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from findmy import AsyncAppleAccount
+from findmy import AsyncAppleAccount, KeyPair
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
 
@@ -91,3 +91,21 @@ async def test_unloading_an_unknown_entry_fails_without_touching_the_interval(
     assert await async_unload_entry(hass, MagicMock(entry_id="missing")) is False
 
     assert storage.coordinator.update_interval == timedelta(minutes=15)
+
+
+def test_coordinate_sensors_do_not_feed_long_term_statistics() -> None:
+    """S6: a state class turns the coordinates into statistics that are never purged."""
+    # The sensor platform imports the Bluetooth integration, which is not importable on Windows.
+    sensor = pytest.importorskip(
+        "custom_components.findmy.sensor",
+        reason="needs homeassistant.components.bluetooth",
+        exc_type=ImportError,
+    )
+
+    coordinator = MagicMock(last_update_success=True)
+    device = KeyPair.new()
+
+    assert sensor.FindMyLatitudeSensor(coordinator, device, "entry").state_class is None
+    assert sensor.FindMyLongitudeSensor(coordinator, device, "entry").state_class is None
+    # Sensors that are meant to be graphed keep theirs.
+    assert sensor.FindMyBatteryPercentSensor(coordinator, device, "entry").state_class is not None

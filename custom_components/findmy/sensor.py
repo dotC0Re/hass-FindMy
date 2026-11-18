@@ -192,7 +192,8 @@ class _FindMyDeviceBaseSensor[T](
 class FindMyLatitudeSensor(_FindMyDeviceBaseSensor[float]):
     _attr_name: str | None = "Latitude"
     _attr_native_unit_of_measurement: str | None = "°"
-    _attr_state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
+    # No state class: one would make the recorder keep the coordinates as long-term statistics,
+    # which are never purged. The location history would then stay in the database for good.
     _attr_suggested_display_precision: int | None = 6
     _suffix: str = "latitude"
 
@@ -205,7 +206,7 @@ class FindMyLatitudeSensor(_FindMyDeviceBaseSensor[float]):
 class FindMyLongitudeSensor(_FindMyDeviceBaseSensor[float]):
     _attr_name: str | None = "Longitude"
     _attr_native_unit_of_measurement: str | None = "°"
-    _attr_state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
+    # No state class, see FindMyLatitudeSensor.
     _attr_suggested_display_precision: int | None = 6
     _suffix: str = "longitude"
 
