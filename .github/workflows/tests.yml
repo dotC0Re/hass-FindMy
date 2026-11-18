@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: './.github/actions/setup-project'
+
+    # findmy in manifest.json vs pyproject.toml, hacs.json minimum vs tested Home Assistant,
+    # and Home Assistant's package constraints vs [tool.uv].
+    - name: Check version pins
+      run: uv run --frozen python .github/scripts/check_pins.py
+
+    - name: Run pytest
+      run: uv run --frozen pytest
