@@ -298,8 +298,8 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         """Take an account out of the rotation and ask the user to sign in again.
 
         Fetching with it again would only repeat the failure, and FindMy.py answers an expired
-        session with a new sign-in attempt at Apple. Repeated failing sign-ins are what gets an
-        Apple account locked, so the account rests until its entry was reloaded.
+        session with a new sign-in attempt at Apple. That must not be repeated every few minutes
+        with credentials Apple already refused, so the account rests until its entry was reloaded.
         """
         self._reauth_required.add(account)
         self._apply_account_interval()
