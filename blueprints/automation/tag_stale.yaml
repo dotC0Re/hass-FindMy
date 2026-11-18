@@ -1,11 +1,17 @@
 blueprint:
   name: FindMy tag - stale report warning
   description: >-
-    Warns when a FindMy tag hasn't reported its location for a specified
+    Warns once when a FindMy tag has not reported its location for a given
     number of hours. Useful to catch dead batteries or firmware crashes early.
+    The warning is sent again only after the tag has reported in between and
+    then goes stale once more. If the tag is already stale when the automation
+    (re)starts, no warning is sent until it has reported and gone stale again.
   domain: automation
   source_url: https://github.com/dotC0Re/hass-FindMy/blob/main/blueprints/automation/tag_stale.yaml
-
+  homeassistant:
+    # `triggers:` / `conditions:` / `actions:` and `trigger: <platform>` /
+    # `action:` replaced the old keys in 2024.10.
+    min_version: 2024.10.0
   input:
     tag_entity:
       name: FindMy tag
@@ -17,7 +23,7 @@ blueprint:
               domain: device_tracker
     stale_hours:
       name: Stale threshold
-      description: Number of hours without a fresh report before triggering
+      description: Number of hours without a fresh report before warning
       default: 24
       selector:
         number:
@@ -26,16 +32,6 @@ blueprint:
           step: 1
           unit_of_measurement: h
           mode: box
-    check_interval_min:
-      name: Check every N minutes
-      description: How often to evaluate the stale condition
-      default: 30
-      selector:
-        number:
-          min: 5
-          max: 240
-          step: 5
-          unit_of_measurement: min
     notify_service:
       name: Notification target
       description: >-
@@ -45,51 +41,48 @@ blueprint:
       selector:
         text: {}
 
+# Only `trigger_variables` are available to trigger templates; plain
+# `variables` are not.
+trigger_variables:
+  tag_entity_var: !input tag_entity
+  stale_hours_var: !input stale_hours
+
 variables:
+  tag_entity_var: !input tag_entity
   stale_hours_var: !input stale_hours
   notify_service_var: !input notify_service
 
-trigger:
-  - platform: time_pattern
-    minutes: !input check_interval_min
-
-condition:
-  - condition: template
+# A template trigger fires only on a change from false to true, so this
+# warns once per stale period. Because the template uses now(), Home Assistant
+# re-evaluates it every minute, so no polling interval is needed.
+triggers:
+  - trigger: template
+    id: stale
     value_template: >-
-      {% set detected = state_attr(trigger.event_data.entity_id | default('sensor.dummy'), 'detected_at')
-                        or state_attr('{{ trigger.entity_id }}', 'detected_at') %}
-      {# Trigger platform time_pattern has no entity, so we recompute below in action #}
-      true
+      {% set detected = state_attr(tag_entity_var, 'detected_at') %}
+      {% set detected_ts = as_timestamp(detected, none) if detected is not none else none %}
+      {{ detected_ts is not none
+         and as_timestamp(now()) - detected_ts > stale_hours_var * 3600 }}
 
-action:
+actions:
   - variables:
-      entity_id_var: !input tag_entity
-      detected_at_raw: "{{ state_attr(entity_id_var, 'detected_at') }}"
-      detected_at_ts: >-
-        {% if detected_at_raw %}
-          {{ as_timestamp(detected_at_raw) }}
-        {% else %}
-          0
-        {% endif %}
-      now_ts: "{{ as_timestamp(now()) }}"
-      age_h: "{{ ((now_ts - (detected_at_ts | float(0))) / 3600) | round(1) }}"
-      tag_name: "{{ state_attr(entity_id_var, 'friendly_name') or entity_id_var }}"
+      detected_ts: "{{ as_timestamp(state_attr(tag_entity_var, 'detected_at'), 0) }}"
+      age_h: "{{ ((as_timestamp(now()) - detected_ts) / 3600) | round(1) }}"
+      tag_name: "{{ state_attr(tag_entity_var, 'friendly_name') or tag_entity_var }}"
       message: >-
         {{ tag_name }} hasn't reported for {{ age_h }} h
         (threshold: {{ stale_hours_var }} h).
-  - condition: template
-    value_template: >-
-      {{ detected_at_ts | float(0) > 0
-         and (now_ts - detected_at_ts | float(0)) > stale_hours_var * 3600 }}
   - choose:
-      - conditions: "{{ notify_service_var | length > 0 }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ notify_service_var | length > 0 }}"
         sequence:
-          - service: "{{ notify_service_var }}"
+          - action: "{{ notify_service_var }}"
             data:
               title: "FindMy: stale tag"
               message: "{{ message }}"
     default:
-      - service: persistent_notification.create
+      - action: persistent_notification.create
         data:
           title: "FindMy: stale tag"
           message: "{{ message }}"
