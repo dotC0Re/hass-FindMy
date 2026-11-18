@@ -5,7 +5,6 @@ Assistant nor the FindMy library. Warnings are errors here, and every test check
 nothing was left unclosed: no never-awaited coroutines, open loops or aiohttp sessions.
 """
 
-# ruff: noqa: PLR2004, INP001
 # pyright: basic
 
 from __future__ import annotations

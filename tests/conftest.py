@@ -14,13 +14,14 @@ import importlib
 import os
 import sys
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from findmy import AsyncAppleAccount, FindMyAccessory, KeyPair, KeyPairType, LoginState
+from homeassistant import core as ha_core
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
@@ -58,6 +59,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     skip = pytest.mark.skip(reason="homeassistant.components.bluetooth is not importable")
     for item in marked:
         item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def forget_home_assistant_instance() -> Generator[None]:
+    """Clear the instance Home Assistant remembers globally once a test is over.
+
+    Creating a ``HomeAssistant`` stores it in a thread-local that nothing clears, and
+    ``frame.async_setup`` keeps a second reference. Code that looks the instance up later,
+    such as a deprecation report issued while a module is imported, would otherwise find the
+    stopped instance of an earlier test and fail on its missing data.
+    """
+    yield
+    ha_core._hass.hass = None
+    frame._hass.hass = None
 
 
 @pytest.fixture

@@ -1,6 +1,5 @@
 """Tests for the `findmy.delete_devices` service (S3, R15)."""
 
-# ruff: noqa: ANN001, ANN201, ANN202, INP001
 # pyright: basic, reportAttributeAccessIssue=false
 
 from __future__ import annotations

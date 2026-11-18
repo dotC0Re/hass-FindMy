@@ -11,7 +11,6 @@ Assistant instance (the minutely re-evaluation of `now()` is read from the
 Home Assistant source, not exercised here), and delivery of notifications.
 """
 
-# ruff: noqa: ANN001, ANN201, ANN202, ANN401, ARG001, INP001, PLR2004
 # pyright: basic, reportAttributeAccessIssue=false, reportReturnType=false, reportArgumentType=false
 
 from __future__ import annotations
