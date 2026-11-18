@@ -8,10 +8,14 @@ two such passes a single index is new; everything else was derived again and aga
 The accessory below derives every key once, hands out key pairs whose public key and hash are
 stored, and can be warmed up from a worker thread so that the event loop only reads finished keys.
 
-Scope: this module only holds keys in memory. It stores nothing on disk (keys are derived again
-after a restart), talks to nobody, and does not decide when to warm up; the coordinator and the
-device tracker do that. The proper home of such a cache is FindMy.py itself (FindMy.py #285). Once
-the library keeps its key pairs, this module can be removed.
+It also limits how many key indices are searched per fetch, and plans the catch-up windows that
+make up for that limit (see MAX_SEARCH_INDICES and CatchUpWindow).
+
+Scope: this module only holds keys in memory and decides which indices to look at. It stores
+nothing on disk (keys are derived again after a restart, and a catch-up starts over), talks to
+nobody, and does not decide when to warm up or to fetch; the coordinator and the device tracker
+do that. The proper home of the cache is FindMy.py itself (FindMy.py #285). Once the library
+keeps its key pairs, that part of this module can be removed.
 """
 
 from __future__ import annotations
@@ -19,10 +23,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, final, override
 
-from findmy import FindMyAccessory, KeyPair
+from findmy import FindMyAccessory, KeyPair, RollingKeyPairSource
 
 if TYPE_CHECKING:
     from findmy import KeyPairType
@@ -44,13 +48,30 @@ _SECONDARY_KEY_SPAN = 96
 # years. Upstream PR #69 reports ~330 requests to Apple per fetch and ~80 s of key derivation
 # per local refresh for such an accessory; with the limit it is three requests.
 #
-# What the limit gives up: only the top of that range is searched, where an accessory is whose
-# index kept pace with the clock. An accessory whose index fell more than a week behind since its
-# last alignment is not found any more, neither in reports nor in local advertisements. In
-# practice that is one that spent more than a week in total without power (battery removed or
-# empty) since it was last located, and then came back. Nothing realigns it on its own; it has to
-# be exported from the Find My app and imported again, which brings a current alignment.
+# What the limit costs: only the top of that range is searched on every fetch, where an accessory
+# is whose index kept pace with the clock. One whose index fell more than a week behind since its
+# last alignment is below that window. That happens: a battery that was empty for more than a
+# week, or an accessory that advances its index far less often than every 15 minutes while it
+# lies where no Apple device passes by (FindMy.py #274).
+#
+# Such an accessory is not lost, only found later. The rest of the range is searched one
+# catch-up window at a time, see CATCH_UP_INTERVAL and CachedFindMyAccessory.plan_catch_up. A
+# report found there realigns the accessory, which puts it back into the top window.
+#
+# Not covered: the local Bluetooth matching only knows the keys of the top window. An accessory
+# below it is not recognised locally until a location report has realigned it.
 MAX_SEARCH_INDICES = 7 * 96
+
+# Minimum time between two catch-up windows of one accessory. A window holds at most
+# MAX_SEARCH_INDICES indices, which FindMy.py asks for in three requests, so an accessory with a
+# gap below its top window costs at most three more requests per interval. One without a gap
+# costs nothing. A gap of n indices is searched completely after about n / 672 intervals: three
+# hours for an accessory that is a month behind.
+CATCH_UP_INTERVAL = timedelta(hours=1)
+
+# FindMy.py looks for the reports of the last week, and derives the lowest index to search from
+# the start of that week.
+REPORT_WINDOW = timedelta(days=7)
 
 # Number of key indices kept per accessory. Holds the searched range plus a day: the Bluetooth
 # matching looks up to 12 hours (48 indices) ahead of the newest index, and the range moves up
@@ -185,6 +206,10 @@ class CachedFindMyAccessory(FindMyAccessory):
         self._key_cache: dict[int, tuple[CachedKeyPair, ...]] = {}
         # Both secondary keys per span of _SECONDARY_KEY_SPAN indices, which all share them.
         self._secondary_cache: dict[int, tuple[CachedKeyPair, CachedKeyPair]] = {}
+        # Catch-up below the top window, see plan_catch_up. Only touched on the event loop.
+        # Highest index that the catch-up windows of the current sweep have not covered yet.
+        self._catch_up_cursor: int | None = None
+        self._last_catch_up: datetime | None = None
 
     @override
     def get_min_index(self, dt: datetime) -> int:
@@ -247,8 +272,143 @@ class CachedFindMyAccessory(FindMyAccessory):
         span = ind // _SECONDARY_KEY_SPAN
         keys = self._secondary_cache.get(span)
         if keys is None:
-            key_1, key_2 = self._secondary_keys_at(ind)
-            keys = (CachedKeyPair.from_keypair(key_1), CachedKeyPair.from_keypair(key_2))
+            keys = self._derive_secondary(ind)
             self._secondary_cache[span] = keys
             _evict_farthest(self._secondary_cache, span, _MAX_CACHED_SECONDARY_SPANS)
         return keys
+
+    def _derive_secondary(self, ind: int) -> tuple[CachedKeyPair, CachedKeyPair]:
+        """Derive both secondary keys of an index. The caller holds the lock."""
+        key_1, key_2 = self._secondary_keys_at(ind)
+        return CachedKeyPair.from_keypair(key_1), CachedKeyPair.from_keypair(key_2)
+
+    def plan_catch_up(self, now: datetime) -> tuple[int, int] | None:
+        """Pick the next range of indices below the top window to search, if one is due.
+
+        Returns the lowest and highest index of the range, or None when the accessory has no
+        gap below its top window or the last catch-up is less than CATCH_UP_INTERVAL ago.
+
+        The gap reaches from the lowest index FindMy.py would search down from the top window.
+        A cursor walks it from the top down, one window per call, and starts over at the top
+        once it reached the bottom. The accessory keeps advancing meanwhile, by up to one index
+        per 15 minutes. Each window therefore overlaps the previous one by as many indices as
+        the accessory can have advanced since then, so it cannot slip from a window that is
+        still to come into one that was already searched.
+
+        Must be called on the event loop.
+        """
+        lowest_possible = super().get_min_index(now - REPORT_WINDOW)
+        top_floor = self.get_max_index(now) - MAX_SEARCH_INDICES + 1
+        gap_top = top_floor - 1
+        # A recently located accessory has 672 or 673 indices to search, depending on how the
+        # two halves of the week round. A single index is that rounding, not a gap.
+        if lowest_possible >= gap_top:
+            self._catch_up_cursor = None
+            return None
+
+        elapsed = None if self._last_catch_up is None else now - self._last_catch_up
+        if elapsed is not None and elapsed < timedelta(0):
+            # The clock was set back. What the cursor stood for is unknown now; start over.
+            elapsed = None
+        if elapsed is not None and elapsed < CATCH_UP_INTERVAL:
+            return None
+
+        cursor = self._catch_up_cursor
+        highest = gap_top
+        if cursor is not None and elapsed is not None and cursor >= lowest_possible:
+            # Continue the sweep below the last window, plus the overlap. The gap grows at
+            # its top as fast as an accessory can advance, so this stays inside the gap; the
+            # bound only guards against an alignment that changed in between.
+            highest = min(gap_top, cursor + elapsed // self.interval + 1)
+
+        # Recorded when the window is planned, not when it was searched: a fetch that fails
+        # may have sent its requests already, and those count against the interval too.
+        self._last_catch_up = now
+        return max(lowest_possible, highest - MAX_SEARCH_INDICES + 1), highest
+
+    def catch_up_window(self, lowest: int, highest: int) -> CatchUpWindow:
+        """Derive the keys of a range planned by :meth:`plan_catch_up`.
+
+        Meant to be run in a worker thread. The keys go into the returned window only: the
+        cache of the top window, which every fetch needs, stays as it is.
+        """
+        keys: dict[int, tuple[CachedKeyPair, ...]] = {}
+        secondary: dict[int, tuple[CachedKeyPair, CachedKeyPair]] = {}
+        for ind in range(max(lowest, 0), highest + 1):
+            with _DERIVE_LOCK:
+                span = ind // _SECONDARY_KEY_SPAN
+                if span not in secondary:
+                    secondary[span] = self._derive_secondary(ind)
+                keys[ind] = (self._derive_primary(ind), *secondary[span])
+        return CatchUpWindow(self, lowest, highest, keys)
+
+    def catch_up_searched(self, window: CatchUpWindow) -> None:
+        """Move the cursor below a window that a fetch has searched.
+
+        Must be called on the event loop. Not called for a fetch that failed, so that its
+        window is searched again instead of being skipped until the next sweep.
+        """
+        self._catch_up_cursor = window.lowest - 1
+
+
+@final
+class CatchUpWindow(RollingKeyPairSource):
+    """A fixed range of older key indices of an accessory, searched like an accessory itself.
+
+    FindMy.py searches whatever lies between the lowest and the highest index a key source
+    reports. This view reports the bounds of its range instead of those of the accessory, and is
+    handed to the fetch next to the accessory. The alternative, widening the range of the
+    accessory itself now and then, would send the top window a second time and put its keys
+    and those of the range through the same cache.
+
+    A report found in the range realigns the accessory. Its keys were derived when the window
+    was made, so searching it leaves no key derivation to the event loop.
+    """
+
+    def __init__(
+        self,
+        accessory: CachedFindMyAccessory,
+        lowest: int,
+        highest: int,
+        keys: dict[int, tuple[CachedKeyPair, ...]],
+    ) -> None:
+        self._accessory = accessory
+        self._lowest = lowest
+        self._highest = highest
+        self._keys = keys
+
+    @property
+    def accessory(self) -> CachedFindMyAccessory:
+        """The accessory this window belongs to; reports found in the window are its reports."""
+        return self._accessory
+
+    @property
+    def lowest(self) -> int:
+        """Lowest key index of the window."""
+        return self._lowest
+
+    @property
+    def highest(self) -> int:
+        """Highest key index of the window."""
+        return self._highest
+
+    @override
+    def get_min_index(self, dt: datetime) -> int:
+        return self._lowest
+
+    @override
+    def get_max_index(self, dt: datetime) -> int:
+        return self._highest
+
+    @override
+    def update_alignment(self, dt: datetime, index: int) -> None:
+        # This is what closes the gap: the accessory moves its top window to where it was seen.
+        self._accessory.update_alignment(dt, index)
+
+    @override
+    def keys_at(self, ind: int) -> set[KeyPair]:
+        return set(self._keys.get(ind, ()))
+
+    @override
+    def __repr__(self) -> str:
+        return f"CatchUpWindow({self._accessory.name!r}, {self._lowest}..{self._highest})"

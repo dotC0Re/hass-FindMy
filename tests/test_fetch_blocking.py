@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
     from pathlib import Path
 
-    from findmy import FindMyAccessoryMapping
+    from findmy import FindMyAccessoryMapping, RollingKeyPairSource
 
 # The acceptance criterion: a fetch from warm keys stalls the loop at least this much less.
 MIN_SPEEDUP = 10
@@ -100,7 +100,7 @@ async def measure_stall(work: Callable[[], Awaitable[object]]) -> Measurement:
     return Measurement(total, max(stalls, default=0.0))
 
 
-async def measure_fetch(accessory: FindMyAccessory, runs: int = 1) -> Measurement:
+async def measure_fetch(accessory: RollingKeyPairSource, runs: int = 1) -> Measurement:
     """Best of `runs` fetches. The minimum is what the code costs; the rest is other load."""
     best: Measurement | None = None
     for _ in range(runs):
@@ -221,6 +221,46 @@ async def test_accessory_without_recent_location_costs_no_more_than_any_other() 
     assert plain_fetch.requests > cached_fetch.requests
     assert cached_fetch.total * MIN_SPEEDUP <= plain_fetch.total
     assert cached_fetch.longest_stall * MIN_SPEEDUP <= plain_fetch.longest_stall
+
+
+@pytest.mark.asyncio
+async def test_catch_up_window_is_searched_without_stalling_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The extra search for an accessory below its top window must not bring the stall back."""
+    # A week of indices, the same amount of work as the catch-up window below.
+    plain = FindMyAccessory.from_json(accessory_data(paired_days=400, aligned_hours_ago=1))
+    cached = cached_accessory(accessory_data(paired_days=400, aligned_hours_ago=30 * 24))
+    planned = cached.plan_catch_up(datetime.now(tz=UTC))
+    assert planned is not None
+
+    started = time.perf_counter()
+    window = await asyncio.get_running_loop().run_in_executor(
+        None, cached.catch_up_window, *planned
+    )
+    build = time.perf_counter() - started
+    derivations = 0
+    original = findmy.keys.ec.derive_private_key
+
+    def counting(*args: object, **kwargs: object) -> object:
+        nonlocal derivations
+        derivations += 1
+        return original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(findmy.keys.ec, "derive_private_key", counting)
+    window_fetch = await measure_fetch(window, runs=3)
+    assert derivations == 0
+    plain_fetch = await measure_fetch(plain)
+
+    print()
+    print(f"  plain, a week of indices     : {plain_fetch}")
+    print(f"  catch-up window, build (thread): total {build * 1000:7.1f} ms")
+    print(f"  catch-up window, fetch       : {window_fetch}")
+
+    assert window.highest - window.lowest + 1 == 7 * 96
+    assert window_fetch.requests <= 3
+    assert window_fetch.total * MIN_SPEEDUP <= plain_fetch.total
+    assert window_fetch.longest_stall * MIN_SPEEDUP <= plain_fetch.longest_stall
 
 
 @pytest_asyncio.fixture

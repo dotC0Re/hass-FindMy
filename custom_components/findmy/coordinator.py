@@ -26,7 +26,7 @@ from findmy import (
 
 from ._entity import account_name
 from .const import signal_account_fetch
-from .key_cache import CachedFindMyAccessory
+from .key_cache import REPORT_WINDOW, CachedFindMyAccessory, CatchUpWindow
 
 if TYPE_CHECKING:
     from asyncio import TimerHandle
@@ -78,10 +78,6 @@ def _describe_fetch_error(err: Exception) -> str:
     if isinstance(err, UnhandledProtocolError):
         return f"Unexpected answer from Apple: {err}"
     return f"Could not fetch location reports: {err}"
-
-
-# FindMy.py searches the last week of keys of a rolling-key accessory for reports.
-_REPORT_KEY_WINDOW = timedelta(days=7)
 
 
 class CoordinatorFetchStatus(Enum):
@@ -268,9 +264,27 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 continue
             _ = await self.hass.async_add_executor_job(
                 device.warm_keys,
-                now - _REPORT_KEY_WINDOW,
+                now - REPORT_WINDOW,
                 now + device.interval,
             )
+
+    async def _async_catch_up_windows(self, devices: list[FindMyDevice]) -> list[CatchUpWindow]:
+        """Prepare the catch-up windows that are due, with their keys derived off the loop.
+
+        An accessory whose index fell below the range searched on every fetch would never be
+        found again. Its older indices are searched bit by bit instead, see key_cache.py.
+        """
+        now = datetime.now(tz=UTC)
+        windows: list[CatchUpWindow] = []
+        for device in devices:
+            if not isinstance(device, CachedFindMyAccessory):
+                continue
+            planned = device.plan_catch_up(now)
+            if planned is None:
+                continue
+            _LOGGER.debug("Catching up on key indices %i..%i of %s", *planned, device.name)
+            windows.append(await self.hass.async_add_executor_job(device.catch_up_window, *planned))
+        return windows
 
     def _log(self, account: AsyncAppleAccount, event: CoordinatorLogEvent) -> None:
         logs = self._logs.setdefault(account, deque(maxlen=self._MAX_LOG_ENTRIES_PER_ACCOUNT))
@@ -325,7 +339,8 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         try:
             # Inside the try block, so that a failure still ends the log entry started above.
             await self._async_warm_keys(devices)
-            device_reports = await account.fetch_location(devices)
+            windows = await self._async_catch_up_windows(devices)
+            device_reports = await account.fetch_location([*devices, *windows])
             success = True
         except _FETCH_ERRORS as err:
             if not _is_auth_error(err):
@@ -353,14 +368,26 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 (CoordinatorLogEvent.FETCH_SUCCESS if success else CoordinatorLogEvent.FETCH_ERROR),
             )
 
-        data: FindMyLocationData = (self.data or {}).copy()
-        for device, report in device_reports.items():
-            _LOGGER.debug("Got reports for device: %s - %s", device, report)
+        # Only after a fetch that worked, so that a failed one searches the same windows again.
+        for window in windows:
+            window.accessory.catch_up_searched(window)
+
+        fetched: dict[FindMyDevice, LocationReport] = {}
+        for source, report in device_reports.items():
+            _LOGGER.debug("Got reports for device: %s - %s", source, report)
+            # A report from a catch-up window is a report of the accessory it was cut from.
+            device = source.accessory if isinstance(source, CatchUpWindow) else source
             if not isinstance(device, FindMyDevice):
                 _LOGGER.warning("Device not supported yet: %s", device)
                 continue
+            if not report:
+                continue
 
-            if report:
-                data[device] = report
+            # An accessory and its window can both bring a report; the newer one counts.
+            known = fetched.get(device)
+            if known is None or report.timestamp >= known.timestamp:
+                fetched[device] = report
 
+        data: FindMyLocationData = (self.data or {}).copy()
+        data.update(fetched)
         return data

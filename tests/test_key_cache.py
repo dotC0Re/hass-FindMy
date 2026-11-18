@@ -14,6 +14,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -25,7 +26,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
 
 from custom_components.findmy import key_cache
-from custom_components.findmy.key_cache import CachedFindMyAccessory, CachedKeyPair
+from custom_components.findmy.key_cache import (
+    CATCH_UP_INTERVAL,
+    CachedFindMyAccessory,
+    CachedKeyPair,
+    CatchUpWindow,
+)
 from custom_components.findmy.local_bluetooth import (
     build_candidate_key_lookup,
     build_candidate_key_lookup_from_json,
@@ -256,8 +262,8 @@ def test_search_window_is_limited_for_an_accessory_that_was_never_located() -> N
     assert key_cache.MAX_SEARCH_INDICES + 48 <= key_cache.MAX_CACHED_INDICES
 
 
-def test_accessory_lagging_more_than_a_week_is_outside_the_search_window() -> None:
-    """The documented price of the limit, see MAX_SEARCH_INDICES."""
+def test_accessory_lagging_more_than_a_week_is_outside_the_top_window() -> None:
+    """The top window alone does not find it; the catch-up windows below are what does."""
     cached, plain = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
     now = datetime.now(tz=UTC)
     start = now - timedelta(days=7)
@@ -287,6 +293,154 @@ def test_search_window_of_a_recently_located_accessory_is_unchanged() -> None:
     start = datetime.now(tz=UTC) - timedelta(days=7)
 
     assert cached.get_min_index(start) == plain.get_min_index(start)
+
+
+def planned_window(accessory: CachedFindMyAccessory, now: datetime) -> CatchUpWindow:
+    """Plan a catch-up and mark it as searched, without spending time on deriving its keys."""
+    planned = accessory.plan_catch_up(now)
+    assert planned is not None
+    window = CatchUpWindow(accessory, *planned, {})
+    accessory.catch_up_searched(window)
+    return window
+
+
+def test_recently_located_accessory_needs_no_catch_up() -> None:
+    cached, _ = make_pair(aligned_hours_ago=1.0)
+    now = datetime.now(tz=UTC)
+
+    # Whatever the rounding of the two halves of the week, there is no gap to catch up on.
+    for minutes in range(0, 180, 7):
+        assert cached.plan_catch_up(now + timedelta(minutes=minutes)) is None
+
+
+def test_first_catch_up_window_lies_directly_below_the_top_window() -> None:
+    cached, _ = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+    newest = cached.get_max_index(now)
+
+    planned = cached.plan_catch_up(now)
+
+    assert planned == (newest - 2 * WEEK + 1, newest - WEEK)
+    # An accessory that is ten days behind the clock is in it.
+    assert newest - 2 * WEEK + 1 <= newest - 10 * 96 <= newest - WEEK
+
+
+def test_catch_up_is_planned_at_most_once_per_interval() -> None:
+    cached, _ = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+
+    assert cached.plan_catch_up(now) is not None
+    assert cached.plan_catch_up(now + timedelta(minutes=1)) is None
+    assert cached.plan_catch_up(now + CATCH_UP_INTERVAL - timedelta(seconds=1)) is None
+    assert cached.plan_catch_up(now + CATCH_UP_INTERVAL) is not None
+
+
+def test_sweep_covers_the_whole_gap_and_starts_over() -> None:
+    cached, plain = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+    alignment_index = plain.get_min_index(now - timedelta(days=7))
+    gap_top = cached.get_max_index(now) - WEEK
+
+    windows: list[CatchUpWindow] = []
+    while not windows or windows[-1].lowest > alignment_index:
+        windows.append(planned_window(cached, now + len(windows) * CATCH_UP_INTERVAL))
+        assert len(windows) < 10
+
+    assert windows[0].highest == gap_top
+    assert windows[-1].lowest == alignment_index
+    for window in windows:
+        assert window.highest - window.lowest + 1 <= WEEK
+    for upper, lower in pairwise(windows):
+        # Overlap: the indices an accessory can advance within an hour, and one to spare.
+        assert lower.highest == upper.lowest - 1 + 4 + 1
+    # 30 days without alignment are 2880 indices, 2208 of them below the top window.
+    assert len(windows) == 4
+
+    # The bottom is reached; the next window starts at the top again, where the top window of
+    # three hours ago has moved on by 12 indices.
+    restarted = planned_window(cached, now + len(windows) * CATCH_UP_INTERVAL)
+    assert restarted.highest == gap_top + 4 * len(windows)
+
+
+def test_advancing_accessory_cannot_slip_between_two_windows() -> None:
+    """The accessory moves up while the windows move down; the overlap has to catch it."""
+    now = datetime.now(tz=UTC)
+
+    for lag in range(WEEK, 29 * 96, 13):
+        cached, _ = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+        true_index = cached.get_max_index(now) - lag
+        found_after: int | None = None
+        for hour in range(8):
+            window = planned_window(cached, now + hour * CATCH_UP_INTERVAL)
+            # A running accessory advances four indices per hour, as the clock does.
+            if window.lowest <= true_index + 4 * hour <= window.highest:
+                found_after = hour
+                break
+
+        assert found_after is not None, lag
+        assert found_after <= (lag - WEEK) // (WEEK - 5) + 1, lag
+
+
+def test_overlap_grows_with_the_pause_between_two_catch_ups() -> None:
+    """No fetch for days (Home Assistant busy, account signed out): the accessory moved on."""
+    cached, _ = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+    first = planned_window(cached, now)
+
+    # Two days are 192 indices the accessory can have advanced from below the first window.
+    resumed = planned_window(cached, now + timedelta(days=2))
+    assert resumed.highest == first.lowest - 1 + 192 + 1
+    assert resumed.highest - resumed.lowest + 1 == WEEK
+
+
+def test_catch_up_window_has_its_own_keys(derivations: list[int]) -> None:
+    cached, plain = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+    _ = cached.warm_keys(now - timedelta(days=7), now)
+    top_keys = dict(cached._key_cache)
+    top_secondary = dict(cached._secondary_cache)
+    planned = cached.plan_catch_up(now)
+    assert planned is not None
+    lowest, highest = planned
+    derivations.clear()
+
+    window = cached.catch_up_window(lowest, highest)
+
+    # Every key once: a primary key per index and two secondary keys per started day.
+    assert len(derivations) <= WEEK + 2 * (WEEK // 96 + 2)
+    # The cache of the top window is neither extended nor displaced.
+    assert cached._key_cache == top_keys
+    assert cached._secondary_cache == top_secondary
+
+    start = now - timedelta(days=7)
+    assert (window.get_min_index(start), window.get_max_index(now)) == (lowest, highest)
+    assert window.accessory is cached
+    for ind in (lowest, (lowest + highest) // 2, highest):
+        assert describe(window.keys_at(ind)) == describe(plain.keys_at(ind))
+    assert window.keys_at(lowest - 1) == set()
+    assert window.keys_at(highest + 1) == set()
+
+    # Searching the window and the top window afterwards finds finished keys only.
+    derivations.clear()
+    for ind in range(highest, lowest - 1, -1):
+        assert len(window.keys_at(ind)) == 3
+    for ind in top_keys:
+        _ = cached.keys_at(ind)
+    assert derivations == []
+
+
+def test_report_in_a_catch_up_window_closes_the_gap() -> None:
+    cached, _ = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+    true_index = cached.get_max_index(now) - 10 * 96
+    window = planned_window(cached, now)
+
+    # What FindMy.py does with a report it found under a key of the window.
+    window.update_alignment(now - timedelta(hours=1), true_index)
+
+    assert cached._alignment_index == true_index
+    assert cached.get_min_index(now - timedelta(days=7)) <= true_index <= cached.get_max_index(now)
+    assert cached.plan_catch_up(now + CATCH_UP_INTERVAL) is None
 
 
 def test_bluetooth_candidates_come_from_the_shared_cache(derivations: list[int]) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,7 @@ from findmy import (
     UnauthorizedError,
     UnhandledProtocolError,
 )
+from findmy.reports.reports import LocationReportsFetcher
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -33,7 +35,11 @@ from custom_components.findmy.coordinator import (
     CoordinatorFetchStatus,
     FindMyCoordinator,
 )
-from custom_components.findmy.key_cache import CachedFindMyAccessory
+from custom_components.findmy.key_cache import (
+    CATCH_UP_INTERVAL,
+    CachedFindMyAccessory,
+    CatchUpWindow,
+)
 from custom_components.findmy.storage import RuntimeStorage
 
 if TYPE_CHECKING:
@@ -451,3 +457,227 @@ async def test_failing_warm_up_ends_the_fetch_as_error(
     account.fetch_location.assert_not_awaited()
     assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.ERROR
     assert isinstance(coordinator.last_exception, UpdateFailed)
+
+
+@dataclass(frozen=True, order=True)
+class FakeReport:
+    """Stands in for a decrypted location report: all FindMy.py's fetch looks at."""
+
+    timestamp: datetime
+    hashed_adv_key_bytes: bytes = field(compare=False)
+
+    def decrypt(self, _key: object) -> None:
+        return None
+
+
+class FakeApple:
+    """The report endpoint. Knows under which keys accessories were seen, and counts requests."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.sightings: dict[str, FakeReport] = {}
+
+    def see(self, accessory: FindMyAccessory, index: int, timestamp: datetime) -> FakeReport:
+        """Record that someone reported the accessory while it was at the given key index."""
+        key = FindMyAccessory.from_json(accessory.to_json())._primary_key_at(index)
+        report = FakeReport(timestamp, key.hashed_adv_key_bytes)
+        self.sightings[key.hashed_adv_key_b64] = report
+        return report
+
+    async def fetch_raw_reports(self, devices: list[tuple[list[str], list[str]]]) -> list[object]:
+        self.requests += 1
+        asked = {key_id for primary, secondary in devices for key_id in (*primary, *secondary)}
+        return [report for key_id, report in self.sightings.items() if key_id in asked]
+
+
+def add_fetching_account(
+    hass: HomeAssistant, storage: RuntimeStorage, entry_id: str, apple: FakeApple
+) -> MagicMock:
+    """An account that runs FindMy.py's real report fetcher against the fake endpoint."""
+    account = add_account(hass, storage, entry_id)
+    fetcher = LocationReportsFetcher(apple)  # pyright: ignore[reportArgumentType]
+
+    async def fetch_location(devices: list[object]) -> object:
+        # Same as AsyncAppleAccount.fetch_location, without the login check.
+        history = await fetcher.fetch_location_history(devices)  # pyright: ignore[reportArgumentType, reportCallIssue]
+        return {device: max(reports) if reports else None for device, reports in history.items()}
+
+    account.fetch_location.side_effect = fetch_location
+    return account
+
+
+def make_unlocated_accessory(days_without_report: int = 30) -> CachedFindMyAccessory:
+    """A cached accessory whose alignment is old, so that a gap opened below its top window."""
+    now = datetime.now(tz=UTC)
+    return CachedFindMyAccessory(
+        master_key=os.urandom(28),
+        skn=os.urandom(32),
+        sks=os.urandom(32),
+        paired_at=now - timedelta(days=days_without_report + 30),
+        alignment_date=now - timedelta(days=days_without_report),
+        alignment_index=30 * 96,
+        identifier="unlocated-accessory",
+        name="Unlocated tag",
+    )
+
+
+def fetched_sources(account: MagicMock) -> list[object]:
+    """What the latest fetch asked the account for."""
+    return list(account.fetch_location.await_args.args[0])
+
+
+@pytest.mark.asyncio
+async def test_accessory_ten_days_behind_the_clock_is_found_again(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    """An accessory below the weekly window must come back on its own, not stay lost."""
+    apple = FakeApple()
+    account = add_fetching_account(hass, storage, "a", apple)
+    accessory = make_unlocated_accessory()
+    now = datetime.now(tz=UTC)
+    # Its battery was empty for ten days: the index is 960 behind what the clock suggests.
+    true_index = accessory.get_max_index(now) - 10 * 96
+    assert true_index < accessory.get_min_index(now - timedelta(days=7))
+    report = apple.see(accessory, true_index, now - timedelta(hours=1))
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    await coordinator.async_refresh()
+
+    # First cycle: the top window finds nothing, the first catch-up window does.
+    sources = fetched_sources(account)
+    assert sources[0] is accessory
+    assert [type(source) for source in sources[1:]] == [CatchUpWindow]
+    assert coordinator.last_update_success is True
+    assert coordinator.data == {accessory: report}
+    # At most the three requests of the top window and three of the catch-up window.
+    assert apple.requests <= 6
+    # The report realigned the accessory: it is back in the window searched on every fetch.
+    assert accessory._alignment_index == true_index
+    assert accessory.get_min_index(now - timedelta(days=7)) <= true_index
+    assert true_index <= accessory.get_max_index(now)
+
+    apple.requests = 0
+    accessory._last_catch_up = None  # even if a catch-up were due again
+    await coordinator.async_refresh()
+
+    # Second cycle: found by the accessory itself, with no catch-up and no extra request.
+    assert fetched_sources(account) == [accessory]
+    assert apple.requests <= 3
+    assert coordinator.data == {accessory: report}
+
+
+@pytest.mark.asyncio
+async def test_located_accessory_causes_no_extra_requests(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    apple = FakeApple()
+    account = add_fetching_account(hass, storage, "a", apple)
+    accessory = make_cached_accessory()
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    for _ in range(3):
+        apple.requests = 0
+        await coordinator.async_refresh()
+
+        assert fetched_sources(account) == [accessory]
+        # A week of indices at 290 keys per request.
+        assert apple.requests == 3
+
+
+@pytest.mark.asyncio
+async def test_catch_up_costs_at_most_one_window_per_interval(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    """An accessory that nobody sees any more: the extra cost has to stay bounded."""
+    apple = FakeApple()
+    add_fetching_account(hass, storage, "a", apple)
+    accessory = make_unlocated_accessory(days_without_report=400)
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    requests: list[int] = []
+    for _ in range(4):
+        apple.requests = 0
+        await coordinator.async_refresh()
+        requests.append(apple.requests)
+
+    # Three for the top window on every cycle; three more for the one catch-up window.
+    assert requests == [6, 3, 3, 3]
+
+    # An hour later the next window is due, further down.
+    assert accessory._last_catch_up is not None
+    first_cursor = accessory._catch_up_cursor
+    accessory._last_catch_up -= CATCH_UP_INTERVAL
+    apple.requests = 0
+    await coordinator.async_refresh()
+
+    assert apple.requests == 6
+    assert accessory._catch_up_cursor is not None
+    assert first_cursor is not None
+    assert accessory._catch_up_cursor < first_cursor
+
+
+@pytest.mark.asyncio
+async def test_failed_fetch_searches_the_same_catch_up_window_again(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    account = add_account(hass, storage, "a")
+    accessory = make_unlocated_accessory()
+    account.fetch_location.side_effect = TimeoutError()
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    await coordinator.async_refresh()
+
+    failed_window = fetched_sources(account)[1]
+    assert isinstance(failed_window, CatchUpWindow)
+    assert accessory._catch_up_cursor is None
+
+    # Not retried at once: the failed fetch may have sent its requests already.
+    await coordinator.async_refresh()
+    assert fetched_sources(account) == [accessory]
+
+    assert accessory._last_catch_up is not None
+    accessory._last_catch_up -= CATCH_UP_INTERVAL
+    account.fetch_location.side_effect = None
+    await coordinator.async_refresh()
+
+    retried_window = fetched_sources(account)[1]
+    assert isinstance(retried_window, CatchUpWindow)
+    assert retried_window.highest >= failed_window.highest
+    assert accessory._catch_up_cursor == retried_window.lowest - 1
+
+
+@pytest.mark.parametrize(
+    ("top_age_hours", "window_age_hours", "expected"),
+    [(1, 5, "top"), (5, 1, "window"), (None, 5, "window"), (1, None, "top")],
+)
+@pytest.mark.asyncio
+async def test_newer_report_of_accessory_and_catch_up_window_wins(  # noqa: PLR0913, PLR0917
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    top_age_hours: int | None,
+    window_age_hours: int | None,
+    expected: str,
+) -> None:
+    account = add_account(hass, storage, "a")
+    accessory = make_unlocated_accessory()
+    now = datetime.now(tz=UTC)
+    reports = {
+        name: None if age is None else FakeReport(now - timedelta(hours=age), b"")
+        for name, age in (("top", top_age_hours), ("window", window_age_hours))
+    }
+
+    async def fetch(sources: list[object]) -> dict[object, object]:
+        return {sources[0]: reports["top"], sources[1]: reports["window"]}
+
+    account.fetch_location.side_effect = fetch
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    await coordinator.async_refresh()
+
+    assert coordinator.data == {accessory: reports[expected]}
