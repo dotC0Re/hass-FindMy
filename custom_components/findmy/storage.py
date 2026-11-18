@@ -6,10 +6,11 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, cast
 
-from findmy import AsyncAppleAccount, FindMyAccessory, FixedRollingKeyPairAccessory, KeyPair
+from findmy import AsyncAppleAccount, FixedRollingKeyPairAccessory, KeyPair
 
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
+from .key_cache import CachedFindMyAccessory
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -80,6 +81,13 @@ class RuntimeStorage:
     def get_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
         return self._entries[entry.entry_id]
 
+    def get_entry_id(self, item: StorageItem) -> str | None:
+        """Get the id of the config entry an item was stored for."""
+        return next(
+            (entry_id for entry_id, stored in self._entries.items() if stored is item),
+            None,
+        )
+
     async def add_entry(self, entry: ConfigEntry) -> StorageItem:
         data = cast("EntryData", entry.data)  # pyright: ignore[reportInvalidCast]
 
@@ -109,7 +117,8 @@ class RuntimeStorage:
             return key
 
         if data["type"] == "device_rolling_derived":
-            accessory = FindMyAccessory.from_json(data["data"])
+            # Derived keys are kept between fetches and local refreshes, see key_cache.py.
+            accessory = CachedFindMyAccessory.from_json(data["data"])
 
             _LOGGER.debug(
                 "Storing entry %s as rolling (derived) tag: %s",
