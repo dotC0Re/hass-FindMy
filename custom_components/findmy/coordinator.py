@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, final, override
 
+import aiohttp
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -19,6 +20,7 @@ from findmy import (
     KeyPair,
     LocationReport,
     UnauthorizedError,
+    UnhandledProtocolError,
 )
 
 from ._entity import account_name
@@ -37,6 +39,42 @@ _LOGGER = logging.getLogger(__name__)
 
 FindMyDevice = KeyPair | FindMyAccessory | FixedRollingKeyPairAccessory
 type FindMyLocationData = dict[FindMyDevice, LocationReport | None]
+
+# Raised by FindMy.py when a session expired and no password is stored to sign in again.
+_MISSING_CREDENTIALS = "No username or password specified"
+
+# What a fetch is known to raise. Anything else is a bug and keeps its traceback in the log.
+_FETCH_ERRORS = (
+    UnauthorizedError,
+    InvalidStateError,
+    InvalidCredentialsError,
+    UnhandledProtocolError,
+    aiohttp.ClientError,
+    TimeoutError,
+    # Missing fields in the stored session or in Apple's answer, such as 'searchPartyToken'.
+    KeyError,
+    ValueError,
+)
+
+
+def _is_auth_error(err: Exception) -> bool:
+    """Whether a fetch failed because the account has to sign in again."""
+    if isinstance(err, (UnauthorizedError, InvalidStateError, InvalidCredentialsError)):
+        return True
+    return isinstance(err, ValueError) and _MISSING_CREDENTIALS in str(err)
+
+
+def _describe_fetch_error(err: Exception) -> str:
+    """Short message for the log and the coordinator state; the cause keeps the details."""
+    if isinstance(err, TimeoutError):
+        return "Timeout while fetching location reports"
+    if isinstance(err, aiohttp.ClientError):
+        return f"Could not reach Apple: {err}"
+    if isinstance(err, KeyError):
+        return f"Apple account session is incomplete: missing {err}"
+    if isinstance(err, UnhandledProtocolError):
+        return f"Unexpected answer from Apple: {err}"
+    return f"Could not fetch location reports: {err}"
 
 
 class CoordinatorFetchStatus(Enum):
@@ -84,6 +122,8 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
         self._cur_acc_index = 0
         self._logs: list[CoordinatorLogEntry] = []
+        # Accounts whose session expired; compared by identity (see _fetchable_accounts).
+        self._reauth_required: set[AsyncAppleAccount] = set()
         self._refresh_handle: TimerHandle | None = None
 
     def schedule_refresh(self, delay_seconds: float = 10.0) -> None:
@@ -100,8 +140,16 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
         self._refresh_handle = self.hass.loop.call_later(delay_seconds, _request_refresh)
 
-    def get_account(self) -> AsyncAppleAccount | None:
+    def _fetchable_accounts(self) -> list[AsyncAppleAccount]:
+        """Accounts that take part in the rotation: all but those waiting for a new sign-in."""
         accounts = self._storage.accounts
+        # A reloaded entry gets a new account object, so dropping the markers of objects that
+        # left the storage is what puts a re-authenticated account back into the rotation.
+        self._reauth_required.intersection_update(accounts)
+        return [account for account in accounts if account not in self._reauth_required]
+
+    def get_account(self) -> AsyncAppleAccount | None:
+        accounts = self._fetchable_accounts()
         if not accounts:
             return None
 
@@ -112,7 +160,12 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
     async def reload(self) -> None:
         """Updates coordinator intervals. Must be called after adding or removing a new account."""
-        accounts = self._storage.accounts
+        self._apply_account_interval()
+
+    def _apply_account_interval(self) -> None:
+        # Only accounts in the rotation share the interval. Counting one that is skipped would
+        # fetch the remaining ones more often than once per _MIN_ACCOUNT_UPDATE_DELAY.
+        accounts = self._fetchable_accounts()
         if not accounts:
             _LOGGER.debug("Coordinator: disabling updates due to missing account")
             self.update_interval = None
@@ -145,7 +198,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
     def get_account_next_fetch(self, account: AsyncAppleAccount) -> datetime | None:
         """Returns the next time a fetch will be attempted for the given account."""
         last_fetch = self.get_account_last_fetch(account)
-        if last_fetch is None:
+        if last_fetch is None or account in self._reauth_required:
             return None
         # Accounts are fetched round-robin, one per update interval (see reload()),
         # so the same account is fetched again after _MIN_ACCOUNT_UPDATE_DELAY.
@@ -215,10 +268,25 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         # Does nothing if a re-authentication of the entry is already in progress.
         entry.async_start_reauth(self.hass)
 
+    def _require_reauth(self, account: AsyncAppleAccount) -> None:
+        """Take an account out of the rotation and ask the user to sign in again.
+
+        Fetching with it again would only repeat the failure, and FindMy.py answers an expired
+        session with a new sign-in attempt at Apple. Repeated failing sign-ins are what gets an
+        Apple account locked, so the account rests until its entry was reloaded.
+        """
+        self._reauth_required.add(account)
+        self._apply_account_interval()
+        self._start_reauth(account)
+
     @override
     async def _async_update_data(self) -> FindMyLocationData:
         account = self.get_account()
         if account is None:
+            if self._storage.accounts:
+                # Only reached by a manual refresh: reload() disables the schedule in this state.
+                msg = "Every Apple account needs to be re-authenticated"
+                raise UpdateFailed(msg)
             _LOGGER.debug("Skipping data update due to missing accounts")
             return {}
         _LOGGER.debug("Using lookup account: %s", account)
@@ -231,7 +299,10 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         try:
             device_reports = await account.fetch_location(devices)
             success = True
-        except (UnauthorizedError, InvalidStateError, InvalidCredentialsError) as err:
+        except _FETCH_ERRORS as err:
+            if not _is_auth_error(err):
+                raise UpdateFailed(_describe_fetch_error(err)) from err
+
             # Apple invalidates sessions periodically. The account then either sits in
             # REQUIRE_2FA (InvalidStateError), or signing in again with the stored password is
             # refused (InvalidCredentialsError), and every later fetch fails the same way until
@@ -241,8 +312,11 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 getattr(account, "login_state", "unknown"),
                 err,
             )
-            self._start_reauth(account)
+            self._require_reauth(account)
 
+            # Not ConfigEntryAuthFailed: this coordinator serves every account, and Home
+            # Assistant stops scheduling refreshes of a coordinator that raised it. One expired
+            # account would end the fetches of all the others.
             msg = "Apple account needs to be re-authenticated"
             raise UpdateFailed(msg) from err
         finally:

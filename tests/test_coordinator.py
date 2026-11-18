@@ -1,4 +1,4 @@
-# ruff: noqa: SLF001, INP001
+# ruff: noqa: SLF001, PLR2004, INP001
 # pyright: basic
 """Tests for the shared location coordinator.
 
@@ -13,11 +13,20 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 import pytest_asyncio
-from findmy import AsyncAppleAccount, FindMyAccessory
+from findmy import (
+    AsyncAppleAccount,
+    FindMyAccessory,
+    InvalidCredentialsError,
+    InvalidStateError,
+    UnauthorizedError,
+    UnhandledProtocolError,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.findmy.coordinator import (
     CoordinatorFetchStatus,
@@ -134,3 +143,188 @@ async def test_next_fetch_is_15_minutes_after_last_fetch_with_three_accounts(
     assert coordinator.get_account_next_fetch(fetched) == last_fetch + timedelta(minutes=15)
     assert coordinator.get_account_next_fetch(accounts[1]) is None
     assert coordinator.get_account_last_fetch_result(fetched) is CoordinatorFetchStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_successful_fetch_is_logged_as_success_and_stores_reports(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    account = add_account(hass, storage, "a")
+    accessory = make_accessory()
+    report = MagicMock(name="report")
+    account.fetch_location.return_value = {accessory: report}
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    await coordinator.async_refresh()
+
+    account.fetch_location.assert_awaited_once_with([accessory])
+    assert coordinator.last_update_success is True
+    assert coordinator.data == {accessory: report}
+    assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.SUCCESS
+    assert coordinator.get_account_last_fetch_duration(account) is not None
+
+
+@pytest.mark.asyncio
+async def test_result_is_ongoing_while_the_fetch_runs(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    """R2: the result must not read SUCCESS before the fetch has returned."""
+    account = add_account(hass, storage, "a")
+    seen: list[CoordinatorFetchStatus | None] = []
+
+    async def fetch(_devices: object) -> dict[object, object]:
+        seen.append(coordinator.get_account_last_fetch_result(account))
+        return {}
+
+    account.fetch_location.side_effect = fetch
+    await coordinator.reload()
+
+    await coordinator.async_refresh()
+
+    assert seen == [CoordinatorFetchStatus.ONGOING]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        (UnhandledProtocolError("Failed to fetch reports: 500"), "Unexpected answer from Apple"),
+        (aiohttp.ClientConnectionError("connection reset"), "Could not reach Apple"),
+        (TimeoutError(), "Timeout while fetching location reports"),
+        (KeyError("searchPartyToken"), "missing 'searchPartyToken'"),
+        (ValueError("bad payload"), "Could not fetch location reports: bad payload"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_library_errors_become_update_failed_and_are_logged_as_error(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    error: Exception,
+    expected_message: str,
+) -> None:
+    """R2: these errors used to be recorded as a successful fetch."""
+    account = add_account(hass, storage, "a")
+    account.fetch_location.side_effect = error
+    await coordinator.reload()
+    listen(coordinator)
+
+    await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is False
+    assert isinstance(coordinator.last_exception, UpdateFailed)
+    assert expected_message in str(coordinator.last_exception)
+    assert coordinator.last_exception.__cause__ is error
+    assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.ERROR
+    # Not an authentication problem: no re-authentication, and the account is tried again.
+    entry_of(hass, "a").async_start_reauth.assert_not_called()
+    assert coordinator._unsub_refresh is not None
+    assert coordinator.update_interval == timedelta(minutes=15)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        UnauthorizedError("Not authorized to fetch reports."),
+        InvalidStateError("account is in state REQUIRE_2FA"),
+        InvalidCredentialsError("Password authentication failed"),
+        ValueError("No username or password specified"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_auth_error_starts_reauth_for_that_account_only(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    error: Exception,
+) -> None:
+    """R1: the expired account asks for a new sign-in; the other account keeps fetching."""
+    expired = add_account(hass, storage, "a")
+    healthy = add_account(hass, storage, "b")
+    expired.fetch_location.side_effect = error
+    await coordinator.reload()
+    listen(coordinator)
+
+    await coordinator.async_refresh()
+
+    entry_of(hass, "a").async_start_reauth.assert_called_once_with(hass)
+    entry_of(hass, "b").async_start_reauth.assert_not_called()
+    assert isinstance(coordinator.last_exception, UpdateFailed)
+    assert coordinator.last_update_success is False
+    assert coordinator.get_account_last_fetch_result(expired) is CoordinatorFetchStatus.ERROR
+    assert coordinator.get_account_next_fetch(expired) is None
+    # The next fetch is scheduled, and only the healthy account shares the 15 minutes now.
+    assert coordinator._unsub_refresh is not None
+    assert coordinator.update_interval == timedelta(minutes=15)
+
+    for _ in range(3):
+        await coordinator.async_refresh()
+
+    assert expired.fetch_location.await_count == 1
+    assert healthy.fetch_location.await_count == 3
+    assert coordinator.last_update_success is True
+    assert coordinator.get_account_last_fetch_result(healthy) is CoordinatorFetchStatus.SUCCESS
+    # Skipped, so neither a second sign-in attempt at Apple nor a second flow.
+    entry_of(hass, "a").async_start_reauth.assert_called_once_with(hass)
+
+
+@pytest.mark.asyncio
+async def test_reloaded_entry_returns_to_the_rotation(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    expired = add_account(hass, storage, "a")
+    healthy = add_account(hass, storage, "b")
+    expired.fetch_location.side_effect = UnauthorizedError("Not authorized to fetch reports.")
+    await coordinator.reload()
+    listen(coordinator)
+    await coordinator.async_refresh()
+    assert coordinator.update_interval == timedelta(minutes=15)
+
+    # Re-authentication reloads the entry, which stores a new account object under the same id.
+    renewed = add_account(hass, storage, "a")
+    await coordinator.reload()
+
+    assert coordinator.update_interval == timedelta(minutes=7, seconds=30)
+    for _ in range(4):
+        await coordinator.async_refresh()
+    assert expired.fetch_location.await_count == 1
+    assert renewed.fetch_location.await_count == 2
+    assert healthy.fetch_location.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_all_accounts_expired_stops_the_schedule_and_fails_manual_refreshes(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    account = add_account(hass, storage, "a")
+    account.fetch_location.side_effect = InvalidStateError("account is in state REQUIRE_2FA")
+    await coordinator.reload()
+    listen(coordinator)
+
+    await coordinator.async_refresh()
+
+    assert coordinator.update_interval is None
+    assert coordinator._unsub_refresh is None
+
+    await coordinator.async_refresh()
+
+    assert account.fetch_location.await_count == 1
+    assert coordinator.last_update_success is False
+    assert "re-authenticated" in str(coordinator.last_exception)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_is_logged_as_error_and_fetching_continues(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    """A bug in the library must not be recorded as success nor stop the schedule."""
+    account = add_account(hass, storage, "a")
+    account.fetch_location.side_effect = RuntimeError("boom")
+    await coordinator.reload()
+    listen(coordinator)
+
+    await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is False
+    assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.ERROR
+    assert coordinator._unsub_refresh is not None
