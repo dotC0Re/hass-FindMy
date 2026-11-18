@@ -6,7 +6,7 @@
   "iot_class": "cloud_polling",
   "config_flow": true,
   "dependencies": ["bluetooth"],
-  "documentation": "https://github.com/malmeloo/hass-findmy",
-  "issue_tracker": "https://github.com/malmeloo/hass-findmy/issues",
+  "documentation": "https://github.com/dotC0Re/hass-FindMy",
+  "issue_tracker": "https://github.com/dotC0Re/hass-FindMy/issues",
   "requirements": ["FindMy==0.10.2"]
 }

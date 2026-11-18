@@ -4,7 +4,7 @@ blueprint:
     Warns when a FindMy tag hasn't reported its location for a specified
     number of hours. Useful to catch dead batteries or firmware crashes early.
   domain: automation
-  source_url: https://github.com/malmeloo/hass-FindMy/blob/main/blueprints/automation/tag_stale.yaml
+  source_url: https://github.com/dotC0Re/hass-FindMy/blob/main/blueprints/automation/tag_stale.yaml
 
   input:
     tag_entity:

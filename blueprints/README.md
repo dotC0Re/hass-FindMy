@@ -10,7 +10,7 @@ Fires a notification when a tag enters or leaves a zone. Handles the common
 
 Import URL:
 ```
-https://raw.githubusercontent.com/malmeloo/hass-FindMy/main/blueprints/automation/tag_zone_change.yaml
+https://raw.githubusercontent.com/dotC0Re/hass-FindMy/main/blueprints/automation/tag_zone_change.yaml
 ```
 
 Steps: Settings → Automations & Scenes → Blueprints → Import Blueprint →
@@ -25,7 +25,7 @@ Faraday cage).
 
 Import URL:
 ```
-https://raw.githubusercontent.com/malmeloo/hass-FindMy/main/blueprints/automation/tag_stale.yaml
+https://raw.githubusercontent.com/dotC0Re/hass-FindMy/main/blueprints/automation/tag_stale.yaml
 ```
 
 ## Notes on notification targets

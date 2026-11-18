@@ -5,7 +5,7 @@ blueprint:
     Works with any device_tracker entity, but pre-selects those provided
     by the FindMy integration.
   domain: automation
-  source_url: https://github.com/malmeloo/hass-FindMy/blob/main/blueprints/automation/tag_zone_change.yaml
+  source_url: https://github.com/dotC0Re/hass-FindMy/blob/main/blueprints/automation/tag_zone_change.yaml
 
   input:
     tag_entity:

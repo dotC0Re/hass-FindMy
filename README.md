@@ -2,9 +2,13 @@
 
 Experimental custom integration to provide device tracker entities for FindMy Network-enabled devices.
 
+This is a fork of [malmeloo/hass-FindMy](https://github.com/malmeloo/hass-FindMy). Please report issues with
+this fork at [dotC0Re/hass-FindMy](https://github.com/dotC0Re/hass-FindMy/issues).
+
 ## Setting up
 
-1. Add this repository to HACS and install the `FindMy` integration.
+1. Add `https://github.com/dotC0Re/hass-FindMy` to HACS as a custom repository (category: Integration) and
+   install the `FindMy` integration.
 2. Enable the integration. You must add at least two 'devices': one Apple Account and one tracker device.
    1. When adding an account, you will need to specify an anisette server. You can use a public one, but it
       might start throwing errors after a while, so private servers are preferred. Google is your friend.
