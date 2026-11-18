@@ -328,3 +328,55 @@ async def test_unexpected_error_is_logged_as_error_and_fetching_continues(
     assert coordinator.last_update_success is False
     assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.ERROR
     assert coordinator._unsub_refresh is not None
+
+
+@pytest.mark.asyncio
+async def test_fetch_log_stays_bounded(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    """R17: the log grew by two entries per fetch and was never trimmed."""
+    accounts = [add_account(hass, storage, entry_id) for entry_id in ("a", "b")]
+    await coordinator.reload()
+
+    for _ in range(200):
+        await coordinator.async_refresh()
+
+    limit = FindMyCoordinator._MAX_LOG_ENTRIES_PER_ACCOUNT
+    assert sum(len(logs) for logs in coordinator._logs.values()) <= limit * len(accounts)
+    for account in accounts:
+        assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.SUCCESS
+        assert coordinator.get_account_last_fetch_duration(account) is not None
+
+
+@pytest.mark.asyncio
+async def test_resting_account_keeps_its_last_result(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    """Trimming must not erase the state of an account that is skipped for a long time."""
+    expired = add_account(hass, storage, "a")
+    add_account(hass, storage, "b")
+    expired.fetch_location.side_effect = UnauthorizedError("Not authorized to fetch reports.")
+    await coordinator.reload()
+
+    for _ in range(200):
+        await coordinator.async_refresh()
+
+    assert coordinator.get_account_last_fetch_result(expired) is CoordinatorFetchStatus.ERROR
+    assert coordinator.get_account_last_fetch(expired) is not None
+
+
+@pytest.mark.asyncio
+async def test_log_of_a_removed_account_is_dropped(
+    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    removed = add_account(hass, storage, "a")
+    kept = add_account(hass, storage, "b")
+    await coordinator.reload()
+    for _ in range(2):
+        await coordinator.async_refresh()
+
+    del storage._entries["a"]
+    await coordinator.reload()
+
+    assert list(coordinator._logs) == [kept]
+    assert coordinator.get_account_last_fetch(removed) is None

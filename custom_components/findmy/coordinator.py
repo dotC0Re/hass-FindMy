@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -28,6 +29,7 @@ from .const import signal_account_fetch
 
 if TYPE_CHECKING:
     from asyncio import TimerHandle
+    from collections.abc import Iterator
 
     from homeassistant.core import HomeAssistant
 
@@ -106,8 +108,10 @@ class CoordinatorLogEntry:
 class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
     # minimum time (in seconds) between location fetches on an account.
     _MIN_ACCOUNT_UPDATE_DELAY = 15 * 60
-    # Fetch log entries kept for the account sensors, which only read the latest few.
-    _MAX_LOG_ENTRIES = 100
+    # Fetch log entries kept per account. The account sensors read the latest start and end of
+    # a fetch; the rest is slack. Kept per account, so that an account that is not fetched (it
+    # waits for a new sign-in) keeps its last result however often the others are fetched.
+    _MAX_LOG_ENTRIES_PER_ACCOUNT = 10
 
     def __init__(self, hass: HomeAssistant, storage: RuntimeStorage) -> None:
         super().__init__(
@@ -121,7 +125,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         self._storage = storage
 
         self._cur_acc_index = 0
-        self._logs: list[CoordinatorLogEntry] = []
+        self._logs: dict[AsyncAppleAccount, deque[CoordinatorLogEntry]] = {}
         # Accounts whose session expired; compared by identity (see _fetchable_accounts).
         self._reauth_required: set[AsyncAppleAccount] = set()
         self._refresh_handle: TimerHandle | None = None
@@ -162,6 +166,15 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         """Updates coordinator intervals. Must be called after adding or removing a new account."""
         self._apply_account_interval()
 
+        # A removed or reloaded account leaves its log behind; drop it with the account object.
+        accounts = self._storage.accounts
+        for account in [account for account in self._logs if account not in accounts]:
+            del self._logs[account]
+
+    def _account_logs(self, account: AsyncAppleAccount) -> Iterator[CoordinatorLogEntry]:
+        """The fetch log of an account, newest entry first."""
+        return reversed(self._logs.get(account, ()))
+
     def _apply_account_interval(self) -> None:
         # Only accounts in the rotation share the interval. Counting one that is skipped would
         # fetch the remaining ones more often than once per _MIN_ACCOUNT_UPDATE_DELAY.
@@ -184,10 +197,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
     def get_account_last_fetch(self, account: AsyncAppleAccount) -> datetime | None:
         """Returns the last time a fetch was attempted for the given account."""
-        for log in reversed(self._logs):
-            if log.account != account:
-                continue
-
+        for log in self._account_logs(account):
             if log.event in (
                 CoordinatorLogEvent.FETCH_SUCCESS,
                 CoordinatorLogEvent.FETCH_ERROR,
@@ -208,10 +218,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         self, account: AsyncAppleAccount
     ) -> CoordinatorFetchStatus | None:
         """Returns the result of the last fetch for the given account."""
-        for log in reversed(self._logs):
-            if log.account != account:
-                continue
-
+        for log in self._account_logs(account):
             match log.event:
                 case CoordinatorLogEvent.FETCH_START:
                     return CoordinatorFetchStatus.ONGOING
@@ -225,10 +232,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
     def get_account_last_fetch_duration(self, account: AsyncAppleAccount) -> timedelta | None:
         """Returns the duration of the last fetch for the given account."""
         end_time: datetime | None = None
-        for log in reversed(self._logs):
-            if log.account != account:
-                continue
-
+        for log in self._account_logs(account):
             match log.event:
                 case CoordinatorLogEvent.FETCH_SUCCESS | CoordinatorLogEvent.FETCH_ERROR:
                     end_time = log.timestamp
@@ -247,10 +251,10 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         return list({ctx for ctx in self.async_contexts() if isinstance(ctx, FindMyDevice)})  # pyright: ignore[reportAny]
 
     def _log(self, account: AsyncAppleAccount, event: CoordinatorLogEvent) -> None:
-        self._logs.append(
+        logs = self._logs.setdefault(account, deque(maxlen=self._MAX_LOG_ENTRIES_PER_ACCOUNT))
+        logs.append(
             CoordinatorLogEntry(timestamp=datetime.now(tz=UTC), account=account, event=event)
         )
-        del self._logs[: -self._MAX_LOG_ENTRIES]
         async_dispatcher_send(self.hass, signal_account_fetch(account_name(account)))
 
     def _start_reauth(self, account: AsyncAppleAccount) -> None:
