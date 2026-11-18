@@ -6,7 +6,10 @@ blueprint:
     by the FindMy integration.
   domain: automation
   source_url: https://github.com/dotC0Re/hass-FindMy/blob/main/blueprints/automation/tag_zone_change.yaml
-
+  homeassistant:
+    # `triggers:` / `conditions:` / `actions:` and `trigger: <platform>` /
+    # `action:` replaced the old keys in 2024.10.
+    min_version: 2024.10.0
   input:
     tag_entity:
       name: FindMy tag
@@ -49,39 +52,43 @@ variables:
   on_enter_var: !input on_enter
   on_leave_var: !input on_leave
 
-trigger:
-  - platform: zone
+triggers:
+  - trigger: zone
     entity_id: !input tag_entity
     zone: !input zone_entity
     event: enter
     id: entered
-  - platform: zone
+  - trigger: zone
     entity_id: !input tag_entity
     zone: !input zone_entity
     event: leave
     id: left
 
-condition:
+# The ENTER/LEAVE switches are plain inputs, so they are checked here rather
+# than by omitting a trigger.
+conditions:
   - condition: template
     value_template: >-
       {{ (trigger.id == 'entered' and on_enter_var)
          or (trigger.id == 'left' and on_leave_var) }}
 
-action:
+actions:
   - variables:
       tag_name: "{{ state_attr(trigger.entity_id, 'friendly_name') or trigger.entity_id }}"
       zone_name: "{{ state_attr(trigger.zone.entity_id, 'friendly_name') or trigger.zone.entity_id }}"
       verb: "{{ 'entered' if trigger.id == 'entered' else 'left' }}"
       message: "{{ tag_name }} has {{ verb }} zone {{ zone_name }}"
   - choose:
-      - conditions: "{{ notify_service_var | length > 0 }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ notify_service_var | length > 0 }}"
         sequence:
-          - service: "{{ notify_service_var }}"
+          - action: "{{ notify_service_var }}"
             data:
               title: FindMy
               message: "{{ message }}"
     default:
-      - service: persistent_notification.create
+      - action: persistent_notification.create
         data:
           title: FindMy
           message: "{{ message }}"
