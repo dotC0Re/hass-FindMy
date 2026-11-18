@@ -1,0 +1,30 @@
+name: Validate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Both validators change independently of this repository.
+    - cron: '0 4 * * 1'
+
+jobs:
+  hassfest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: hacs/action@main
+      with:
+        category: integration
+        # A home-assistant/brands entry is only needed for the HACS default store; this fork
+        # is installed as a custom repository.
+        ignore: brands
