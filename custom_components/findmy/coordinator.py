@@ -343,6 +343,10 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
             device_reports = await account.fetch_location([*devices, *windows])
             success = True
         except _FETCH_ERRORS as err:
+            # Some of these are also what a programming error raises (KeyError, ValueError).
+            # The translated message is short on purpose, so keep the traceback available.
+            _LOGGER.debug("Fetching location reports failed", exc_info=True)
+
             if not _is_auth_error(err):
                 raise UpdateFailed(_describe_fetch_error(err)) from err
 

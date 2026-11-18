@@ -8,6 +8,7 @@ FindMy library is replaced by mocks: nothing here talks to Apple.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
@@ -681,3 +682,32 @@ async def test_newer_report_of_accessory_and_catch_up_window_wins(  # noqa: PLR0
     await coordinator.async_refresh()
 
     assert coordinator.data == {accessory: reports[expected]}
+
+
+@pytest.mark.asyncio
+async def test_translated_error_keeps_its_traceback_in_the_debug_log(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A KeyError may be Apple's answer or a bug of ours; the short message cannot tell."""
+    account = add_account(hass, storage, "a")
+
+    async def fetch(_devices: object) -> dict[object, object]:
+        return {}["searchPartyToken"]
+
+    account.fetch_location.side_effect = fetch
+    await coordinator.reload()
+    caplog.set_level(logging.DEBUG, logger="custom_components.findmy.coordinator")
+
+    await coordinator.async_refresh()
+
+    assert isinstance(coordinator.last_exception, UpdateFailed)
+    records = [r for r in caplog.records if r.getMessage() == "Fetching location reports failed"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[0] is KeyError
+    # The frame that raised is part of what gets logged.
+    assert 'return {}["searchPartyToken"]' in caplog.text
