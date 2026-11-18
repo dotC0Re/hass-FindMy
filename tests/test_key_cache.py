@@ -248,8 +248,36 @@ def test_search_window_is_limited_for_an_accessory_that_was_never_located() -> N
 
     lowest = cached.get_min_index(now - timedelta(days=7))
 
-    assert newest - lowest + 1 == key_cache.MAX_SEARCH_INDICES
-    assert key_cache.MAX_SEARCH_INDICES <= key_cache.MAX_CACHED_INDICES
+    assert key_cache.MAX_SEARCH_INDICES == WEEK
+    assert newest - lowest + 1 == WEEK
+    # The searched range and the 12 hours the Bluetooth matching looks ahead fit the cache.
+    assert key_cache.MAX_SEARCH_INDICES + 48 <= key_cache.MAX_CACHED_INDICES
+
+
+def test_accessory_lagging_more_than_a_week_is_outside_the_search_window() -> None:
+    """The documented price of the limit, see MAX_SEARCH_INDICES."""
+    cached, plain = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
+    now = datetime.now(tz=UTC)
+    start = now - timedelta(days=7)
+    newest = cached.get_max_index(now)
+    # Ten days without power since the alignment: the index is 960 behind the clock.
+    lagging_index = newest - 10 * 96
+
+    assert plain.get_min_index(start) <= lagging_index
+    assert cached.get_min_index(start) > lagging_index
+    # A lag of less than a week is still covered.
+    assert cached.get_min_index(start) <= newest - 6 * 96
+
+
+def test_bluetooth_window_is_limited_too() -> None:
+    cached, _ = make_pair(paired_days=1000, aligned_hours_ago=900 * 24)
+    now = datetime.now(tz=UTC)
+
+    candidates = build_candidate_key_lookup(cached, now)
+
+    indices = {key.index for keys in candidates.values() for key in keys}
+    assert max(indices) - min(indices) + 1 <= WEEK + 48
+    assert len(cached._key_cache) <= key_cache.MAX_CACHED_INDICES
 
 
 def test_search_window_of_a_recently_located_accessory_is_unchanged() -> None:

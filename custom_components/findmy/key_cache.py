@@ -33,18 +33,29 @@ _LOGGER = logging.getLogger(__name__)
 # FindMyAccessory._secondary_keys_at, which only looks at `index // 96`.
 _SECONDARY_KEY_SPAN = 96
 
-# Number of key indices kept per accessory (15 minutes each, so about 85 days). An accessory
-# that was not located for longer than this has a larger search window; the indices beyond the
-# limit are derived on demand.
-MAX_CACHED_INDICES = 8192
+# Number of newest key indices that are searched for an accessory, per fetch and per local
+# Bluetooth refresh: one week of 15-minute indices. This is what FindMy.py searches anyway for an
+# accessory that was located recently, and it only asks Apple for the reports of the last week.
+#
+# Without the limit, FindMy.py searches every index between the last alignment and the highest
+# one the accessory can have reached, because the index may advance slower than the clock. That
+# range grows by 96 indices per day without a report. For an accessory that is not located any
+# more (empty battery, lost, never seen since the import) it reaches ~100,000 indices after a few
+# years. Upstream PR #69 reports ~330 requests to Apple per fetch and ~80 s of key derivation
+# per local refresh for such an accessory; with the limit it is three requests.
+#
+# What the limit gives up: only the top of that range is searched, where an accessory is whose
+# index kept pace with the clock. An accessory whose index fell more than a week behind since its
+# last alignment is not found any more, neither in reports nor in local advertisements. In
+# practice that is one that spent more than a week in total without power (battery removed or
+# empty) since it was last located, and then came back. Nothing realigns it on its own; it has to
+# be exported from the Find My app and imported again, which brings a current alignment.
+MAX_SEARCH_INDICES = 7 * 96
 
-# Number of newest key indices that are searched for an accessory. FindMy.py searches every
-# index since the last alignment, which never ends for an accessory that is not located any more
-# (empty battery, lost): after years that is ~100,000 indices, i.e. hundreds of requests to
-# Apple per fetch and more than a minute of key derivation per local refresh. Such an accessory
-# is only searched within this many indices (about 83 days) below the highest possible index;
-# the margin to MAX_CACHED_INDICES keeps the whole searched range in the cache.
-MAX_SEARCH_INDICES = MAX_CACHED_INDICES - 192
+# Number of key indices kept per accessory. Holds the searched range plus a day: the Bluetooth
+# matching looks up to 12 hours (48 indices) ahead of the newest index, and the range moves up
+# by one index every 15 minutes.
+MAX_CACHED_INDICES = MAX_SEARCH_INDICES + _SECONDARY_KEY_SPAN
 
 # Pairs of secondary keys kept per accessory: enough for every cached index, plus the day that
 # is partly inside the window at either end.
@@ -52,8 +63,8 @@ _MAX_CACHED_SECONDARY_SPANS = MAX_CACHED_INDICES // _SECONDARY_KEY_SPAN + 2
 
 # Guards every derivation and every change of a cache. FindMy.py's key generators keep state
 # (the chain of secrets) that must not be advanced by two threads at once. One lock for all
-# accessories, because deriving is CPU-bound and holds the GIL: several worker threads deriving
-# at the same time, as after a restart with many accessories, would starve the event loop. The
+# accessories, because deriving is CPU-bound: several worker threads deriving at the same time,
+# as after a restart with many accessories, would compete with the event loop for the CPU. The
 # lock is held for a single index only, so the event loop waits one derivation at most.
 _DERIVE_LOCK = threading.Lock()
 
@@ -177,6 +188,7 @@ class CachedFindMyAccessory(FindMyAccessory):
 
     @override
     def get_min_index(self, dt: datetime) -> int:
+        # Never further down than the search limit allows, see MAX_SEARCH_INDICES.
         newest = self.get_max_index(datetime.now(tz=UTC))
         return max(super().get_min_index(dt), newest - MAX_SEARCH_INDICES + 1)
 
