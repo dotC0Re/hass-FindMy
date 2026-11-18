@@ -31,10 +31,7 @@ from custom_components.findmy.key_cache import (
     CachedKeyPair,
     CatchUpWindow,
 )
-from custom_components.findmy.local_bluetooth import (
-    build_candidate_key_lookup,
-    build_candidate_key_lookup_from_json,
-)
+from custom_components.findmy.local_bluetooth import build_candidate_key_lookup
 from custom_components.findmy.storage import RuntimeStorage
 
 if TYPE_CHECKING:
@@ -448,7 +445,8 @@ def test_bluetooth_candidates_come_from_the_shared_cache(derivations: list[int])
 
     from_cache = build_candidate_key_lookup(cached, now)
 
-    assert from_cache == build_candidate_key_lookup_from_json(cached.to_json(), now)
+    plain = FindMyAccessory.from_json(cached.to_json())
+    assert from_cache == build_candidate_key_lookup(plain, now)
     assert from_cache
 
     # The next refresh, and a fetch of the same range, find the keys instead of deriving them.

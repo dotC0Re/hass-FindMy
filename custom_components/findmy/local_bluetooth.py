@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from findmy import (
-    FindMyAccessory,
     KeyPairType,
     NearbyOfflineFindingDevice,
     OfflineFindingDevice,
@@ -17,7 +16,7 @@ from findmy import (
 )
 
 if TYPE_CHECKING:
-    from findmy import FindMyAccessoryMapping
+    from findmy import FindMyAccessory
 
 APPLE_COMPANY_ID = 0x004C
 # Detecting Unwanted Location Trackers (IETF DULT) location-enabled payload. Second-generation
@@ -87,14 +86,6 @@ def build_candidate_key_lookup(
     return {partial_key: tuple(keys) for partial_key, keys in candidates.items()}
 
 
-def build_candidate_key_lookup_from_json(
-    accessory_data: FindMyAccessoryMapping,
-    observed_at: datetime,
-) -> dict[bytes, tuple[CandidateKey, ...]]:
-    """Build candidates from a snapshot to avoid mutating the live key generators."""
-    return build_candidate_key_lookup(FindMyAccessory.from_json(accessory_data), observed_at)
-
-
 def extract_offline_finding_payload(apple_data: bytes) -> bytes | None:
     """Extract one complete nearby or separated Offline Finding section."""
     for offset in range(max(0, len(apple_data) - 1)):
@@ -134,7 +125,9 @@ def match_local_advertisement(
             detected_at,
             rssi,
         )
-    except IndexError, ValueError:
+    except IndexError, OverflowError, ValueError:
+        # Advertisements come from anyone in radio range. FindMy.py raises OverflowError for a
+        # nearby payload with reserved bits set; like any malformed payload it is no match.
         return None
 
     if isinstance(device, NearbyOfflineFindingDevice):

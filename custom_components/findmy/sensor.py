@@ -63,13 +63,13 @@ async def async_setup_entry(
     if isinstance(item, FindMyDevice):
         entities.extend(
             (
-                FindMyLatitudeSensor(storage.coordinator, item, entry.entry_id),
-                FindMyLongitudeSensor(storage.coordinator, item, entry.entry_id),
-                FindMyPositionSensor(storage.coordinator, item, entry.entry_id),
-                FindMyBatteryLevelSensor(storage.coordinator, item, entry.entry_id),
-                FindMyBatteryPercentSensor(storage.coordinator, item, entry.entry_id),
-                FindMyBatteryVoltageSensor(storage.coordinator, item, entry.entry_id),
-                FindMyStatusCounterSensor(storage.coordinator, item, entry.entry_id),
+                FindMyLatitudeSensor(storage.coordinator, item),
+                FindMyLongitudeSensor(storage.coordinator, item),
+                FindMyPositionSensor(storage.coordinator, item),
+                FindMyBatteryLevelSensor(storage.coordinator, item),
+                FindMyBatteryPercentSensor(storage.coordinator, item),
+                FindMyBatteryVoltageSensor(storage.coordinator, item),
+                FindMyStatusCounterSensor(storage.coordinator, item),
             )
         )
 
@@ -81,11 +81,11 @@ async def async_setup_entry(
         # account status sensors
         entities.extend(
             (
-                FindMyAccountStateSensor(storage.coordinator, item, entry.entry_id),
-                FindMyAccountLastFetchSensor(storage.coordinator, item, entry.entry_id),
-                FindMyAccountLastFetchResultSensor(storage.coordinator, item, entry.entry_id),
-                FindMyAccountLastFetchDurationSensor(storage.coordinator, item, entry.entry_id),
-                FindMyAccountNextFetchSensor(storage.coordinator, item, entry.entry_id),
+                FindMyAccountStateSensor(storage.coordinator, item),
+                FindMyAccountLastFetchSensor(storage.coordinator, item),
+                FindMyAccountLastFetchResultSensor(storage.coordinator, item),
+                FindMyAccountLastFetchDurationSensor(storage.coordinator, item),
+                FindMyAccountNextFetchSensor(storage.coordinator, item),
             )
         )
 
@@ -112,12 +112,10 @@ class _FindMyDeviceBaseSensor[T](
         self,
         coordinator: FindMyCoordinator,
         device: FindMyDevice,
-        entry_id: str,
     ) -> None:
         super().__init__()
         self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
-        self._entry_id: str = entry_id
         self._cached_value: T | None = None
         self._attr_available: bool = coordinator.last_update_success
 
@@ -148,9 +146,6 @@ class _FindMyDeviceBaseSensor[T](
             self._attr_available = available
             self.async_write_ha_state()
 
-    async def async_update(self) -> None:
-        await self._coordinator.async_request_refresh()
-
     def _compute_available(self) -> bool:
         if self._from_status:
             return status_available(self.hass, self._coordinator, self._device)
@@ -165,11 +160,6 @@ class _FindMyDeviceBaseSensor[T](
     @override
     def device_info(self) -> DeviceInfo:
         return build_device_info(self._device)
-
-    @cached_property
-    @override
-    def available(self) -> bool:
-        return self._attr_available
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -300,11 +290,9 @@ class _FindMyAccountBaseSensor[T](
         self,
         coordinator: FindMyCoordinator,
         account: AsyncAppleAccount,
-        entry_id: str,
     ) -> None:
         self._coordinator: FindMyCoordinator = coordinator
         self._account: AsyncAppleAccount = account
-        self._entry_id: str = entry_id
 
         self._cached_value: T | None = None
         # Use generate_entity_id to properly slugify and validate the entity_id
@@ -325,9 +313,6 @@ class _FindMyAccountBaseSensor[T](
                 self._handle_fetch_update,
             )
         )
-
-    async def async_update(self) -> None:
-        await self._coordinator.async_request_refresh()
 
     @cached_property
     @override

@@ -12,7 +12,6 @@ from homeassistant.components.device_tracker import (
     TrackerEntity,  # pyright: ignore[reportPrivateImportUsage]
 )
 from homeassistant.components.device_tracker.const import SourceType
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.debounce import Debouncer
@@ -26,7 +25,6 @@ from findmy import FindMyAccessory, FixedRollingKeyPairAccessory, KeyPair
 
 from ._entity import battery_percent as _battery_percent
 from ._entity import latest_status as _latest_status
-from .config_flow import DeviceEntryData
 from .const import DOMAIN, signal_local_observation
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
@@ -36,7 +34,6 @@ from .local_bluetooth import (
     CandidateKeyLookup,
     LocalObservation,
     build_candidate_key_lookup,
-    build_candidate_key_lookup_from_json,
     match_dult_advertisement,
     match_local_advertisement,
 )
@@ -97,7 +94,6 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
     def __init__(self, coordinator: FindMyCoordinator, device: FindMyDevice, entry_id: str) -> None:
         super().__init__(coordinator, context=device)
 
-        self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
         self._entry_id: str = entry_id
 
@@ -128,7 +124,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         self.entity_id = generate_entity_id(
             "device_tracker.findmy_{}",
             self.given_name,
-            hass=self._coordinator.hass,
+            hass=self.coordinator.hass,
         )
 
     @override
@@ -203,28 +199,20 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
 
     async def _async_refresh_local_candidates(self, _now: datetime | None = None) -> None:
         """Generate rolling-key candidates outside Home Assistant's event loop."""
-        if not isinstance(self._device, FindMyAccessory):
+        # Storage creates every derived rolling-key accessory with a key cache. Without one, each
+        # refresh would have to derive the whole key chain since pairing again.
+        if not isinstance(self._device, CachedFindMyAccessory):
             return
 
         async with self._local_refresh_lock:
             observed_at = datetime.now(tz=UTC)
-            if isinstance(self._device, CachedFindMyAccessory):
-                # Keys are derived once per index and may be read from a worker thread, so
-                # a refresh only derives the indices that are new since the previous one.
-                candidates = await self.hass.async_add_executor_job(
-                    build_candidate_key_lookup,
-                    self._device,
-                    observed_at,
-                )
-            else:
-                # A snapshot starts with empty key generators and derives the whole key
-                # chain since pairing again; only used for accessories without key cache.
-                accessory_data = self._device.to_json()
-                candidates = await self.hass.async_add_executor_job(
-                    build_candidate_key_lookup_from_json,
-                    accessory_data,
-                    observed_at,
-                )
+            # Keys are derived once per index and may be read from a worker thread, so a
+            # refresh only derives the indices that are new since the previous one.
+            candidates = await self.hass.async_add_executor_job(
+                build_candidate_key_lookup,
+                self._device,
+                observed_at,
+            )
 
             if not self._local_active:
                 return
@@ -359,10 +347,6 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
             self._realignment_refresh.async_schedule_call()
 
     @property
-    def findmy_device(self) -> FindMyDevice:
-        return self._device
-
-    @property
     def given_name(self) -> str:
         return self._device.name or "Unknown"
 
@@ -426,7 +410,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         Drives the battery icon on HA's map card.  Companion sensor entities
         (from the sensor platform) surface the same value plus a text label
         and an opt-in mV estimate."""
-        return _battery_percent(_latest_status(self.hass, self._coordinator, self._device))
+        return _battery_percent(_latest_status(self.hass, self.coordinator, self._device))
 
     @property
     def mac_address(self) -> str | None:
@@ -510,7 +494,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
     @override
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        self._last_location = (self._coordinator.data or {}).get(self._device)
+        self._last_location = (self.coordinator.data or {}).get(self._device)
         _LOGGER.debug("Updated data from coordinator: %s", self._last_location)
 
         self.async_write_ha_state()

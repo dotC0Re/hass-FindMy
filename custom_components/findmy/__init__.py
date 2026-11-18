@@ -4,10 +4,11 @@ import logging
 from typing import TYPE_CHECKING
 
 from homeassistant.const import Platform
+from homeassistant.helpers import config_validation as cv
 
 from findmy import AsyncAppleAccount
 
-from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR
+from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR, DOMAIN
 from .coordinator import FindMyDevice
 from .services import async_register as _async_register_services
 from .storage import RuntimeStorage
@@ -15,10 +16,15 @@ from .storage import RuntimeStorage
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.typing import ConfigType
 
     from .config_flow import EntryData
 
 _LOGGER = logging.getLogger(__name__)
+
+# Set up from config entries only; there is no YAML configuration to validate.
+# Home Assistant types the returned validator with bare dicts.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
 
 ACCOUNT_PLATFORMS = [
     Platform.SENSOR,
@@ -67,7 +73,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     return True
 
 
-async def async_setup(hass: HomeAssistant, _config: ConfigEntry) -> bool:
+async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     _ = RuntimeStorage.attach(hass)
     _async_register_services(hass)
 

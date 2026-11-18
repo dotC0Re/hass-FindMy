@@ -104,7 +104,7 @@ def test_coordinate_sensors_do_not_feed_long_term_statistics() -> None:
     coordinator = MagicMock(last_update_success=True)
     device = KeyPair.new()
 
-    assert sensor.FindMyLatitudeSensor(coordinator, device, "entry").state_class is None
-    assert sensor.FindMyLongitudeSensor(coordinator, device, "entry").state_class is None
+    assert sensor.FindMyLatitudeSensor(coordinator, device).state_class is None
+    assert sensor.FindMyLongitudeSensor(coordinator, device).state_class is None
     # Sensors that are meant to be graphed keep theirs.
-    assert sensor.FindMyBatteryPercentSensor(coordinator, device, "entry").state_class is not None
+    assert sensor.FindMyBatteryPercentSensor(coordinator, device).state_class is not None

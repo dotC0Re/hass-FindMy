@@ -5,7 +5,6 @@ The entities are added by the binary_sensor and sensor platforms.
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from typing import TYPE_CHECKING, override
@@ -42,8 +41,6 @@ if TYPE_CHECKING:
     from findmy import FindMyAccessory
 
     from .local_bluetooth import LocalObservation
-
-_LOGGER = logging.getLogger(__name__)
 
 # How often the Bluetooth history is checked for newer advertisements.
 _REFRESH_INTERVAL = timedelta(seconds=30)

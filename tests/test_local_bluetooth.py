@@ -293,11 +293,6 @@ def test_no_match_for_broken_payload(
     assert match_local_advertisement(address, data, now, None, candidates) is None
 
 
-@pytest.mark.xfail(
-    raises=OverflowError,
-    strict=True,
-    reason="nearby key byte > 3 overflows in FindMy 0.10.2 and escapes the matcher",
-)
 def test_nearby_with_reserved_bits_set_does_not_raise(
     candidates: dict[bytes, tuple[CandidateKey, ...]],
     now: datetime,

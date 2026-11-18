@@ -51,7 +51,7 @@ async def async_setup_entry(
 
     storage = RuntimeStorage.get(hass)
     entities: list[BinarySensorEntity] = [
-        FindMyBatteryLowBinarySensor(storage.coordinator, item, entry.entry_id),
+        FindMyBatteryLowBinarySensor(storage.coordinator, item),
     ]
     if isinstance(item, FindMyAccessory):
         # Only accessories with derived rolling keys are matched against local advertisements.
@@ -73,12 +73,10 @@ class FindMyBatteryLowBinarySensor(
         self,
         coordinator: FindMyCoordinator,
         device: FindMyDevice,
-        entry_id: str,
     ) -> None:
         super().__init__()
         self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
-        self._entry_id: str = entry_id
         self._cached: bool | None = None
         self._attr_available: bool = coordinator.last_update_success
 
@@ -108,9 +106,6 @@ class FindMyBatteryLowBinarySensor(
             self._cached = value
             self._attr_available = available
             self.async_write_ha_state()
-
-    async def async_update(self) -> None:
-        await self._coordinator.async_request_refresh()
 
     @cached_property
     @override

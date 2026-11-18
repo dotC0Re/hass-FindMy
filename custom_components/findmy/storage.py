@@ -51,13 +51,6 @@ class RuntimeStorage:
 
         return storage
 
-    def detach(self, hass: HomeAssistant) -> None:
-        if hass.data.get(DOMAIN, None) != self:
-            msg = "Not attached!"
-            raise RuntimeError(msg)
-
-        del hass.data[DOMAIN]
-
     @classmethod
     def get(cls, hass: HomeAssistant) -> RuntimeStorage:
         if hass.data.get(DOMAIN, None) is None:
@@ -72,10 +65,6 @@ class RuntimeStorage:
 
     @property
     def accounts(self) -> list[AsyncAppleAccount]:
-        return [item for item in self._entries.values() if isinstance(item, AsyncAppleAccount)]
-
-    @property
-    def static_tags(self) -> list[AsyncAppleAccount]:
         return [item for item in self._entries.values() if isinstance(item, AsyncAppleAccount)]
 
     def get_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
