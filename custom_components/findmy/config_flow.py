@@ -283,9 +283,6 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Kept so the method selection can be shown again after a failed request.
         self._2fa_schema: vol.Schema | None = None
 
-        # Set while re-authenticating an existing entry (see async_step_reauth).
-        self._reauth_entry: config_entries.ConfigEntry | None = None
-
     def _log_step(self, step: str, user_input: Mapping[str, object] | None) -> None:
         _LOGGER.debug("%s Step: %s - %s", self.__class__.__name__, step, _redact(user_input))
 
@@ -320,8 +317,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _reauth_email(self) -> str:
-        entry = self._reauth_entry
-        return (entry.unique_id or "") if entry else ""
+        return self._get_reauth_entry().unique_id or ""
 
     def _show_login_form(
         self,
@@ -555,11 +551,11 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             account_data=self._account.to_json(),
         )
 
-        if self._reauth_entry is not None:
+        if self.source == config_entries.SOURCE_REAUTH:
             # Re-authentication: refresh the stored session on the existing
             # entry rather than creating a duplicate account entry.
             return self.async_update_reload_and_abort(
-                self._reauth_entry,
+                self._get_reauth_entry(),
                 data=data,
             )
 
@@ -579,10 +575,6 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Start re-authentication for an account whose session expired."""
         self._log_step("reauth", None)
 
-        entry_id = self.context.get("entry_id")
-        if entry_id is not None:
-            self._reauth_entry = self.hass.config_entries.async_get_entry(entry_id)
-
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
@@ -594,6 +586,11 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if info is None:
             return self._show_login_form()
+
+        # The e-mail field stays editable; logging into another account here
+        # would silently replace the session of the entry being repaired.
+        _ = await self.async_set_unique_id(info["email"].lower())
+        self._abort_if_unique_id_mismatch(reason="wrong_account")
 
         return await self._async_login(info)
 

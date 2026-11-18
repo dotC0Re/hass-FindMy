@@ -33,6 +33,7 @@ from findmy import (
 )
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import AbortFlow
 
 from custom_components.findmy import config_flow
 from custom_components.findmy.const import DOMAIN
@@ -469,3 +470,48 @@ async def test_valid_derived_key_file_creates_entry(hass, monkeypatch, tmp_path)
 
     assert result["type"] == "create_entry"
     assert result["data"]["type"] == "device_rolling_derived"
+
+
+###########
+### R7  ###
+###########
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("accounts")
+async def test_reauth_form_prefills_account(hass):
+    entry = add_account_entry(hass)
+    flow = make_flow(hass, config_entries.SOURCE_REAUTH, entry_id=entry.entry_id)
+
+    result = await flow.async_step_reauth(dict(entry.data))
+
+    assert result["step_id"] == "reauth_confirm"
+    assert (result.get("description_placeholders") or {}).get("account") == EMAIL
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("accounts")
+async def test_reauth_with_same_account_updates_entry(hass):
+    entry = add_account_entry(hass)
+    flow = make_flow(hass, config_entries.SOURCE_REAUTH, entry_id=entry.entry_id)
+
+    result = await flow.async_step_reauth_confirm(login_input(email=EMAIL.upper()))
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "reauth_successful"
+    assert entry.data["account_data"] == ACCOUNT_JSON
+    hass.config_entries.async_schedule_reload.assert_called_once_with(entry.entry_id)
+
+
+@pytest.mark.asyncio
+async def test_reauth_with_other_account_is_rejected(hass, accounts):
+    created, _factory_state = accounts
+    entry = add_account_entry(hass)
+    flow = make_flow(hass, config_entries.SOURCE_REAUTH, entry_id=entry.entry_id)
+
+    with pytest.raises(AbortFlow) as aborted:
+        await flow.async_step_reauth_confirm(login_input(email="someone.else@example.com"))
+
+    assert aborted.value.reason == "wrong_account"
+    assert not created, "no login may be attempted for the wrong account"
+    assert entry.data["account_data"] == {"old": True}
