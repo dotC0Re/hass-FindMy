@@ -5,52 +5,50 @@ uv sync --all-groups
 uv run pytest
 ```
 
-Kein Test spricht mit Apple. Konten sind Attrappen (`mock_account_factory`), Geräte und
-Schlüssel entstehen aus Zufallsschlüsseln (`accessory_factory`, `keypair_factory`). So laufen
-Schlüsselableitung und Abgleich echt, ohne Netz.
+No test talks to Apple. Accounts are mocks (`mock_account_factory`); accessories and key
+pairs are built from random keys (`accessory_factory`, `keypair_factory`). Key derivation and
+matching therefore run for real, without network access.
 
-## Warum kein `pytest-homeassistant-custom-component`
+## Why not `pytest-homeassistant-custom-component`
 
-Geprüft wurde Version 0.13.366, die genau Home Assistant 2026.9.3 festlegt. Unter Linux wäre
-sie die erste Wahl. Unter Windows lässt sich das Plugin aber nicht einmal laden:
-`homeassistant/runner.py` importiert `fcntl`, das es dort nicht gibt. Weil pytest Plugins beim
-Start automatisch lädt, wäre damit jeder Testlauf unter Windows kaputt.
+Version 0.13.366, which pins exactly Home Assistant 2026.9.3, was evaluated. On Linux it would
+be the first choice. On Windows, however, the plugin cannot even be loaded:
+`homeassistant/runner.py` imports `fcntl`, which does not exist there. Because pytest loads
+plugins automatically at startup, every test run on Windows would break.
 
-Deshalb gilt ein Weg für Windows und Linux: `pytest` + `pytest-asyncio` (`asyncio_mode =
-"auto"`) und ein eigenes `hass`-Fixture in `conftest.py`. Es baut ein `HomeAssistant` im
-temporären Verzeichnis mit Loader, Frame-Helfer und Config-Entries, richtet aber keine
-Integration ein. Was das Plugin sonst mitbrächte (z. B. `MockConfigEntry`), legen Tests bei
-Bedarf selbst an.
+So there is one setup for Windows and Linux: `pytest` + `pytest-asyncio` (`asyncio_mode =
+"auto"`) and an own `hass` fixture in `conftest.py`. It creates a `HomeAssistant` instance in a
+temporary directory with the loader, the frame helper and config entries, but sets up no
+integration. Anything the plugin would otherwise provide (e.g. `MockConfigEntry`) tests create
+themselves when needed.
 
-## Abhängigkeiten
+## Dependencies
 
-- `homeassistant==2026.9.3` steht nur in der Dev-Gruppe. Zur Laufzeit bringt Home Assistant
-  sich selbst mit. Die Mindestversion in `hacs.json` ist genau diese Version.
-- Home Assistant erzwingt zur Laufzeit die Versionen aus `package_constraints.txt`, nennt sie
-  aber nicht in seinen Paket-Metadaten. Sie stehen deshalb als
-  `[tool.uv] constraint-dependencies` in `pyproject.toml`. Nach einem Update von
-  `homeassistant`:
+- `homeassistant==2026.9.3` is only in the dev group. At runtime Home Assistant brings itself.
+  The minimum version in `hacs.json` is exactly this version.
+- At runtime Home Assistant enforces the versions from `package_constraints.txt`, but does not
+  list them in its package metadata. They are therefore mirrored as
+  `[tool.uv] constraint-dependencies` in `pyproject.toml`. After updating `homeassistant`:
 
   ```powershell
   uv run python .github/scripts/check_pins.py --write
   uv lock
   ```
 
-  CI prüft mit demselben Skript (ohne `--write`), dass Vorgaben, `findmy`-Version im Manifest
-  und Mindestversion in `hacs.json` zusammenpassen.
-- `aiousbwatcher`, `serialx` und `aiohasupervisor` braucht die Komponente `bluetooth` über
-  `usb` und `hassio`. Home Assistant installiert sie erst zur Laufzeit. Mit ihnen lassen sich
-  auch `device_tracker.py`, `presence.py`, `sensor.py` und `binary_sensor.py` unter Windows
-  importieren.
+  CI runs the same script (without `--write`) to check that the constraints, the `findmy`
+  version in the manifest and the minimum version in `hacs.json` agree.
+- `aiousbwatcher`, `serialx` and `aiohasupervisor` are needed by the `bluetooth` component via
+  `usb` and `hassio`. Home Assistant installs them only at runtime. With them,
+  `device_tracker.py`, `presence.py`, `sensor.py` and `binary_sensor.py` import on Windows too.
 
 ## Marker `requires_bluetooth`
 
-Für Tests, die `homeassistant.components.bluetooth` importieren. Unter Windows werden sie
-übersprungen, falls die Komponente nicht importierbar ist (unvollständige lokale Umgebung).
-Auf anderen Systemen schlagen sie dann fehl, damit CI keine Tests stillschweigend verliert.
+For tests that import `homeassistant.components.bluetooth`. On Windows they are skipped if the
+component cannot be imported (incomplete local environment). On other platforms they fail
+instead, so CI never silently loses tests.
 
-## Ruff und Pyright
+## Ruff and Pyright
 
-Für `tests/**` gelten in `pyproject.toml` gezielte Ausnahmen (fehlende Annotationen an
-Fixtures, private Helfer, Mocks als `Any`, Testwerte). Testdateien brauchen deshalb keine
-`# ruff: noqa`- oder `# pyright:`-Kopfzeilen.
+`pyproject.toml` defines targeted exceptions for `tests/**` (missing annotations on fixtures,
+private helpers, mocks typed as `Any`, literal test values). Test files therefore need no
+`# ruff: noqa` or `# pyright:` header lines.
