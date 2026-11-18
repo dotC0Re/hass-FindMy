@@ -1,4 +1,4 @@
-# ruff: noqa: SLF001, PLR2004, INP001, T201
+# ruff: noqa: T201
 # pyright: basic
 """Measures how long a location fetch keeps the event loop busy (R20).
 

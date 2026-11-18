@@ -1,4 +1,3 @@
-# ruff: noqa: SLF001, PLR2004, INP001
 # pyright: basic
 """Tests for the shared location coordinator.
 
@@ -656,7 +655,7 @@ async def test_failed_fetch_searches_the_same_catch_up_window_again(
     [(1, 5, "top"), (5, 1, "window"), (None, 5, "window"), (1, None, "top")],
 )
 @pytest.mark.asyncio
-async def test_newer_report_of_accessory_and_catch_up_window_wins(  # noqa: PLR0913, PLR0917
+async def test_newer_report_of_accessory_and_catch_up_window_wins(  # noqa: PLR0917
     hass: HomeAssistant,
     storage: RuntimeStorage,
     coordinator: FindMyCoordinator,

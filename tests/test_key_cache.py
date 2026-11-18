@@ -1,4 +1,3 @@
-# ruff: noqa: SLF001, PLR2004, INP001
 # pyright: basic
 """Tests for the key cache of rolling-key accessories.
 

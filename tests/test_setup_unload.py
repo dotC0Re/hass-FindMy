@@ -1,4 +1,3 @@
-# ruff: noqa: SLF001, INP001
 # pyright: basic
 """Tests for unloading config entries.
 
