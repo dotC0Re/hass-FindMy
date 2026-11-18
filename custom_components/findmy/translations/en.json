@@ -95,7 +95,6 @@
       "login_incomplete": "The login did not complete. Please try again"
     },
     "abort": {
-      "protocol_error": "A protocol exception occurred. Please report this error and try again later.",
       "unknown_error": "An unexpected error occurred. Please try again later.",
       "reauth_successful": "Re-authentication was successful",
       "wrong_account": "This is a different Apple Account. Please sign in with the account of this entry"

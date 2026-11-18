@@ -1,4 +1,4 @@
-# ruff: noqa: S105, SLF001, ANN001, ANN201, ANN202, INP001, TC003, PLR0913, PLR0917
+# ruff: noqa: PLR0917
 # pyright: basic, reportAttributeAccessIssue=false, reportArgumentType=false, reportTypedDictNotRequiredAccess=false
 """Tests for the config flow.
 
@@ -226,6 +226,18 @@ def test_redact_masks_nested_and_keeps_harmless_fields():
     }
     assert config_flow._redact(None) is None
     assert config_flow._mask_email("no-at-sign") == "**REDACTED**"
+
+
+@pytest.mark.parametrize(
+    ("url", "logged"),
+    [
+        ("http://ani.example:6969", "http://ani.example:6969"),
+        ("https://user:s3cret@ani.example:6969/v3", "https://**REDACTED**@ani.example:6969/v3"),
+        ("https://token@ani.example", "https://**REDACTED**@ani.example"),
+    ],
+)
+def test_anisette_url_is_logged_without_credentials(url: str, logged: str) -> None:
+    assert config_flow._url_without_credentials(url) == logged
 
 
 ###########

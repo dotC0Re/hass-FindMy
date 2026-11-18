@@ -131,6 +131,19 @@ def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) ->
     return "protocol_error"
 
 
+def _url_without_credentials(url: str) -> str:
+    """Drop ``user:password@`` from a URL before it is logged."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return _REDACTED
+    if parsed.username is None and parsed.password is None:
+        return url
+    host = parsed.hostname or ""
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return parsed._replace(netloc=f"{_REDACTED}@{netloc}").geturl()
+
+
 def _is_valid_anisette_url(url: str) -> bool:
     try:
         parsed = urlsplit(url)
@@ -278,7 +291,6 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._account: AsyncAppleAccount | None = None
         self._2fa_method: AsyncSecondFactorMethod | None = None
 
-        self._error: Exception | None = None
         self._2fa_methods: list[AsyncSecondFactorMethod] = []
         # Kept so the method selection can be shown again after a failed request.
         self._2fa_schema: vol.Schema | None = None
@@ -382,7 +394,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.debug(
             "Logging into Apple account %s (anisette: %s)",
             _mask_email(info["email"]),
-            anisette_url or "<integrated>",
+            _url_without_credentials(anisette_url) if anisette_url else "<integrated>",
         )
         if anisette_url is not None and not _is_valid_anisette_url(anisette_url):
             return self._show_login_form({"base": "invalid_anisette_url"})

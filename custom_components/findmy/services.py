@@ -26,8 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SERVICE_DELETE_DEVICES = "delete_devices"
 
-# Entry types as stored in `entry.data["type"]`.  Kept here as plain strings
-# because the entry-type constants are owned by other modules.
+# Entry types as stored in `entry.data["type"]`.
 _TYPE_STATIC = "device_static"
 _TYPE_ROLLING_DERIVED = "device_rolling_derived"
 _TYPE_ROLLING_PRE_GENERATED = "device_rolling_pre_generated"
