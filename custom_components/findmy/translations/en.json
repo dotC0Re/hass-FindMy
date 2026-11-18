@@ -87,12 +87,18 @@
       "2fa_unavailable": "No available 2FA methods found. Please try another account",
       "2fa_invalid": "Error while validating 2FA code. Please try again",
       "invalid_dev": "Invalid device specified",
-      "invalid_dev_key": "Invalid key specified"
+      "invalid_dev_key": "Invalid key specified",
+      "cannot_connect": "Could not connect to Apple or the Anisette server. Please check your network and try again",
+      "protocol_error": "Apple sent an unexpected response. Please try again later; if this persists, please report it",
+      "invalid_anisette_url": "The Anisette URL is invalid or does not point to an Anisette server",
+      "invalid_2fa_method": "Please select one of the offered 2FA methods",
+      "login_incomplete": "The login did not complete. Please try again"
     },
     "abort": {
       "protocol_error": "A protocol exception occurred. Please report this error and try again later.",
       "unknown_error": "An unexpected error occurred. Please try again later.",
-      "reauth_successful": "Re-authentication was successful"
+      "reauth_successful": "Re-authentication was successful",
+      "wrong_account": "This is a different Apple Account. Please sign in with the account of this entry"
     }
   },
   "selector": {
