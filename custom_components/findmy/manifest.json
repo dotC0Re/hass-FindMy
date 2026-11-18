@@ -1,12 +1,14 @@
 {
   "domain": "findmy",
   "name": "FindMy",
-  "version": "v0.0.1",
-  "integration_type": "device",
-  "iot_class": "cloud_polling",
+  "codeowners": ["@dotC0Re"],
   "config_flow": true,
   "dependencies": ["bluetooth"],
   "documentation": "https://github.com/dotC0Re/hass-FindMy",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/dotC0Re/hass-FindMy/issues",
-  "requirements": ["FindMy==0.10.2"]
+  "loggers": ["findmy", "anisette"],
+  "requirements": ["FindMy==0.10.2"],
+  "version": "v0.0.1"
 }
