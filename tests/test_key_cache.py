@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import findmy.keys
 import pytest
 from findmy import FindMyAccessory, KeyPair, KeyPairType
+from homeassistant import loader
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
 
@@ -332,28 +333,32 @@ async def test_realignment_refresh_is_debounced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Replayed advertisements must not rebuild the candidates more than once per minute."""
-    # The device tracker imports the Bluetooth integration, which is not importable on Windows.
-    device_tracker = pytest.importorskip(
-        "custom_components.findmy.device_tracker",
-        reason="needs homeassistant.components.bluetooth",
-        exc_type=ImportError,
-    )
     builds: list[datetime] = []
 
     def build(_accessory: object, observed_at: datetime) -> dict[bytes, tuple[object, ...]]:
         builds.append(observed_at)
         return {}
 
-    monkeypatch.setattr(device_tracker, "build_candidate_key_lookup", build)
-    monkeypatch.setattr(
-        device_tracker.bluetooth, "async_discovered_service_info", lambda *_a, **_kw: []
-    )
-    monkeypatch.setattr(device_tracker, "_LOCAL_REALIGNMENT_REFRESH_COOLDOWN", 0.2)
     cached, _ = make_pair()
     hass = HomeAssistant(str(tmp_path))
     frame.async_setup(hass)
+    # Defining the tracker class makes Home Assistant look up the integration, to word a
+    # deprecation warning about its `battery_level` property. The lookup needs the loader's data.
+    loader.async_setup(hass)
     monkeypatch.setattr(frame, "report_usage", lambda *_args, **_kwargs: None)
     try:
+        # The device tracker imports the Bluetooth integration, which is not importable on
+        # Windows.
+        device_tracker = pytest.importorskip(
+            "custom_components.findmy.device_tracker",
+            reason="needs homeassistant.components.bluetooth",
+            exc_type=ImportError,
+        )
+        monkeypatch.setattr(device_tracker, "build_candidate_key_lookup", build)
+        monkeypatch.setattr(
+            device_tracker.bluetooth, "async_discovered_service_info", lambda *_a, **_kw: []
+        )
+        monkeypatch.setattr(device_tracker, "_LOCAL_REALIGNMENT_REFRESH_COOLDOWN", 0.2)
         storage = RuntimeStorage(hass)
         tracker = device_tracker.FindMyDeviceTracker(storage.coordinator, cached, "entry")
         tracker.hass = hass
