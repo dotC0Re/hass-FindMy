@@ -103,14 +103,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) -> bool:
     _LOGGER.debug("Unloading FindMy entry: %s", entry.entry_id)
 
+    storage = RuntimeStorage.get(hass)
     try:
-        item = await RuntimeStorage.get(hass).del_entry(entry)
+        item = await storage.del_entry(entry)
     except KeyError:
         _LOGGER.warning(
             "Entry %s not found in storage during unload",
             entry.entry_id,
         )
         return False
+
+    # The interval is shared between the accounts. Without this, the accounts that remain after
+    # one was removed would keep being fetched more often than once per 15 minutes.
+    await storage.coordinator.reload()
 
     if isinstance(item, AsyncAppleAccount):
         _ = await hass.config_entries.async_unload_platforms(entry, ACCOUNT_PLATFORMS)
