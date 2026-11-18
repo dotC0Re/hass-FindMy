@@ -286,6 +286,29 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _log_step(self, step: str, user_input: Mapping[str, object] | None) -> None:
         _LOGGER.debug("%s Step: %s - %s", self.__class__.__name__, step, _redact(user_input))
 
+    async def _async_close_account(self) -> None:
+        """Close the HTTP sessions of the flow's account and forget it.
+
+        Every login attempt creates a new account, so the previous one must be
+        closed first; otherwise each wrong password leaks a client session.
+        """
+        account, self._account = self._account, None
+        self._2fa_method = None
+        self._2fa_methods = []
+        if account is not None:
+            await account.close()
+
+    @callback
+    @override
+    def async_remove(self) -> None:
+        """Close an account left open when the flow ends, e.g. cancelled during 2FA."""
+        account, self._account = self._account, None
+        if account is not None:
+            _ = self.hass.async_create_task(
+                account.close(),
+                "findmy config flow account cleanup",
+            )
+
     @override
     async def async_step_user(
         self,
@@ -344,6 +367,11 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={"account": email},
         )
 
+    async def _async_restart_login(self, error: str) -> config_entries.ConfigFlowResult:
+        """Drop the current account and ask for the login again."""
+        await self._async_close_account()
+        return self._show_login_form({"base": error})
+
     async def _async_login(self, info: LoginFlowInput) -> config_entries.ConfigFlowResult:
         """Log in with the form input, then continue with 2FA or finish.
 
@@ -359,6 +387,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if anisette_url is not None and not _is_valid_anisette_url(anisette_url):
             return self._show_login_form({"base": "invalid_anisette_url"})
 
+        await self._async_close_account()
         if anisette_url is None:
             anisette = LocalAnisetteProvider()
         else:
@@ -369,7 +398,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self._account.login(info["email"], info["password"])
         except _FLOW_ERRORS as err:
             error = _error_key(err, "login", remote_anisette=anisette_url is not None)
-            return self._show_login_form({"base": error})
+            return await self._async_restart_login(error)
 
         _LOGGER.debug("State after login: %s", self._account.login_state)
 
@@ -410,7 +439,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except _FLOW_ERRORS as err:
             # The account cannot be reused for another login attempt, so the user
             # starts over from the login form.
-            return self._show_login_form({"base": _error_key(err, "2FA method lookup")})
+            return await self._async_restart_login(_error_key(err, "2FA method lookup"))
 
         menu_options: list[SelectOptionDict] = []
         for i, method in enumerate(self._2fa_methods):
@@ -433,7 +462,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 continue
 
         if not menu_options:
-            return self._show_login_form({"base": "2fa_unavailable"})
+            return await self._async_restart_login("2fa_unavailable")
 
         self._2fa_schema = vol.Schema(
             {
@@ -529,7 +558,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors={"base": error or "2fa_invalid"},
             )
         # The 2FA session is gone; only a fresh login can continue.
-        return self._show_login_form({"base": error or "login_incomplete"})
+        return await self._async_restart_login(error or "login_incomplete")
 
     async def async_step_acc_done(
         self,
@@ -544,12 +573,17 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._account.login_state != LoginState.LOGGED_IN:
             # A half logged-in session would be stored and fail on every refresh.
             _LOGGER.warning("Login ended in state %s", self._account.login_state)
-            return self._show_login_form({"base": "login_incomplete"})
+            return await self._async_restart_login("login_incomplete")
 
-        data = EntryDataAccount(
-            type="account",
-            account_data=self._account.to_json(),
-        )
+        try:
+            data = EntryDataAccount(
+                type="account",
+                account_data=self._account.to_json(),
+            )
+            title = f"Account: {self._account.account_name}"
+        finally:
+            # The entry restores its own session from the stored data.
+            await self._async_close_account()
 
         if self.source == config_entries.SOURCE_REAUTH:
             # Re-authentication: refresh the stored session on the existing
@@ -560,7 +594,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
         return self.async_create_entry(
-            title=f"Account: {self._account.account_name}",
+            title=title,
             data=data,
         )
 

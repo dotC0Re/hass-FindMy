@@ -515,3 +515,86 @@ async def test_reauth_with_other_account_is_rejected(hass, accounts):
     assert aborted.value.reason == "wrong_account"
     assert not created, "no login may be attempted for the wrong account"
     assert entry.data["account_data"] == {"old": True}
+
+
+###########
+### R14 ###
+###########
+
+
+@pytest.mark.asyncio
+async def test_every_login_attempt_closes_its_account(hass, accounts):
+    created, factory_state = accounts
+    flow = make_flow(hass)
+
+    failed_attempts = 3
+    factory_state["login_error"] = InvalidCredentialsError("wrong password")
+    for _ in range(failed_attempts):
+        result = await flow.async_step_acc_login(login_input())
+        assert result["errors"] == {"base": "invalid_auth"}
+    factory_state["login_error"] = None
+    result = await flow.async_step_acc_login(login_input())
+
+    assert result["type"] == "create_entry"
+    assert len(created) == failed_attempts + 1
+    for account in created:
+        account.close.assert_awaited_once()
+    # Serialised before closing, so the entry carries the session.
+    assert result["data"]["account_data"] == ACCOUNT_JSON
+
+
+@pytest.mark.asyncio
+async def test_account_stays_open_during_2fa(hass, accounts):
+    flow, account = await _flow_at_2fa_request(hass, accounts)
+    await flow.async_step_acc_2fa_request({"method_id": "0"})
+    account.sms.submit.side_effect = UnhandledProtocolError("status 401")
+    await flow.async_step_acc_2fa_submit({"code": "000000"})
+
+    account.close.assert_not_awaited()
+
+    account.sms.submit.side_effect = None
+    account.sms.submit.return_value = LoginState.LOGGED_IN
+    account.login_state = LoginState.LOGGED_IN
+    result = await flow.async_step_acc_2fa_submit({"code": CODE})
+
+    assert result["type"] == "create_entry"
+    account.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_flow_closes_account(hass, accounts):
+    flow, account = await _flow_at_2fa_request(hass, accounts)
+
+    flow.async_remove()
+    await hass.async_block_till_done()
+
+    account.close.assert_awaited_once()
+    # A flow without an open account has nothing to clean up.
+    make_flow(hass).async_remove()
+
+
+@pytest.mark.asyncio
+async def test_failed_2fa_lookup_closes_account(hass, accounts):
+    created, factory_state = accounts
+    factory_state["final_state"] = LoginState.REQUIRE_2FA
+
+    def fail_methods(account):
+        account.get_2fa_methods.side_effect = aiohttp.ClientConnectionError()
+
+    factory_state["customize"] = fail_methods
+    result = await make_flow(hass).async_step_acc_login(login_input())
+
+    assert result["errors"] == {"base": "cannot_connect"}
+    created[0].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reauth_closes_account(hass, accounts):
+    created, _factory_state = accounts
+    entry = add_account_entry(hass)
+    flow = make_flow(hass, config_entries.SOURCE_REAUTH, entry_id=entry.entry_id)
+
+    result = await flow.async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    created[0].close.assert_awaited_once()
