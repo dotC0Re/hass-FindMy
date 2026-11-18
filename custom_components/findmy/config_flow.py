@@ -53,6 +53,7 @@ from .const import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from typing import Any
 
     from homeassistant.core import HomeAssistant
@@ -60,6 +61,43 @@ if TYPE_CHECKING:
 type AsyncSecondFactorMethod = AsyncSmsSecondFactor | AsyncTrustedDeviceSecondFactor
 
 _LOGGER = logging.getLogger(__name__)
+
+# Flow input that must never reach a log: the account password, the private key
+# of a static tag (it grants location access forever, since static keys never
+# rotate), the one-time 2FA code and the upload id of a key file.
+_SECRET_FIELDS = frozenset({"password", "private_key", "code", "file"})
+_REDACTED = "**REDACTED**"
+
+
+def _mask_email(email: str) -> str:
+    """Keep just enough of an address to tell accounts apart in a shared log."""
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return _REDACTED
+    return f"{local[:1]}***@{domain}"
+
+
+def _redact(user_input: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Return a copy of flow input that is safe to log.
+
+    Debug logs end up in public issues, so every log line of the flows goes
+    through here instead of printing raw input.
+    """
+    if user_input is None:
+        return None
+    redacted: dict[str, object] = {}
+    for key, value in user_input.items():
+        if key in _SECRET_FIELDS:
+            redacted[key] = _REDACTED
+        elif key == "email" and isinstance(value, str):
+            redacted[key] = _mask_email(value)
+        elif isinstance(value, dict):
+            # Form sections (e.g. advanced_options) arrive as nested dicts.
+            redacted[key] = _redact(cast("dict[str, object]", value))
+        else:
+            redacted[key] = value
+    return redacted
+
 
 DATA_SCHEMA_ACC_LOGIN = vol.Schema(
     {
@@ -206,12 +244,15 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Set while re-authenticating an existing entry (see async_step_reauth).
         self._reauth_entry: config_entries.ConfigEntry | None = None
 
+    def _log_step(self, step: str, user_input: Mapping[str, object] | None) -> None:
+        _LOGGER.debug("%s Step: %s - %s", self.__class__.__name__, step, _redact(user_input))
+
     @override
     async def async_step_user(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: user - %s", self.__class__.__name__, user_input)
+        self._log_step("user", user_input)
 
         return self.async_show_menu(
             step_id="user",
@@ -229,7 +270,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: start_acc - %s", self.__class__.__name__, user_input)
+        self._log_step("start_acc", user_input)
 
         return self.async_show_form(
             step_id="acc_login",
@@ -240,11 +281,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: LoginFlowInput | None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug(
-            "%s Step: acc_login - %s",
-            self.__class__.__name__,
-            {**(info or {}), "password": "**REDACTED**"},
-        )
+        self._log_step("acc_login", info)
 
         if info is None:
             _LOGGER.warning("Login step called without info data")
@@ -256,7 +293,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _ = await self.async_set_unique_id(info["email"].lower())
         self._abort_if_unique_id_configured()
 
-        _LOGGER.info("Logging into Apple account: %s", info["email"])
+        _LOGGER.debug("Logging into Apple account: %s", _mask_email(info["email"]))
 
         anisette_url = info.get("advanced_options", {}).get("anisette_url") or None
         _LOGGER.info("Using Anisette URL: %s", anisette_url or "<integrated>")
@@ -290,7 +327,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: dict[Any, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: acc_2fa_prompt - %s", self.__class__.__name__, info)
+        self._log_step("acc_2fa_prompt", info)
 
         if self._account is None or self._account.login_state != LoginState.REQUIRE_2FA:
             _LOGGER.error("2FA step called but account configured incorrectly")
@@ -346,7 +383,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: dict[Any, Any] | None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: acc_2fa_request - %s", self.__class__.__name__, info)
+        self._log_step("acc_2fa_request", info)
 
         if info is None:
             _LOGGER.error("2FA requested but no method ID")
@@ -370,7 +407,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: MfaSubmitInput,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: acc_2fa_submit - %s", self.__class__.__name__, info)
+        self._log_step("acc_2fa_submit", info)
 
         code = info.get("code")
         if not code:
@@ -400,7 +437,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: dict[Any, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: acc_done - %s", self.__class__.__name__, info)
+        self._log_step("acc_done", info)
 
         if self._account is None:
             _LOGGER.error("No account configured")
@@ -433,7 +470,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _entry_data: dict[str, Any],
     ) -> config_entries.ConfigFlowResult:
         """Start re-authentication for an account whose session expired."""
-        _LOGGER.debug("%s Step: reauth", self.__class__.__name__)
+        self._log_step("reauth", None)
 
         entry_id = self.context.get("entry_id")
         if entry_id is not None:
@@ -446,11 +483,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         info: LoginFlowInput | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Log the account in again, then reuse the normal 2FA steps."""
-        _LOGGER.debug(
-            "%s Step: reauth_confirm - %s",
-            self.__class__.__name__,
-            {**(info or {}), "password": "**REDACTED**"},
-        )
+        self._log_step("reauth_confirm", info)
 
         entry = self._reauth_entry
         # The unique_id is the account email, so the address can be pre-filled
@@ -468,8 +501,10 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
         anisette_url = info.get("advanced_options", {}).get("anisette_url") or None
-        _LOGGER.info(
-            "Re-authenticating %s (anisette: %s)", info["email"], anisette_url or "<integrated>"
+        _LOGGER.debug(
+            "Re-authenticating %s (anisette: %s)",
+            _mask_email(info["email"]),
+            anisette_url or "<integrated>",
         )
 
         if anisette_url is None:
@@ -508,7 +543,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: dict[Any, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: start_dev - %s", self.__class__.__name__, info)
+        self._log_step("start_dev", info)
 
         return self.async_show_form(
             step_id="dev_choose",
@@ -519,7 +554,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: DeviceTypeInput | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: dev_choose - %s", self.__class__.__name__, info)
+        self._log_step("dev_choose", info)
 
         dev_type = (info or {}).get("device_type", None)
         if dev_type == "static":
@@ -548,7 +583,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: StaticDeviceInput | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: dev_static - %s", self.__class__.__name__, info)
+        self._log_step("dev_static", info)
 
         if not info:
             return self.async_show_form(
@@ -584,7 +619,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: RollingDeviceInput | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: dev_rolling_derived - %s", self.__class__.__name__, info)
+        self._log_step("dev_rolling_derived", info)
 
         if not info:
             return self.async_show_form(
@@ -623,7 +658,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         info: RollingDeviceInput | None = None,
     ) -> config_entries.ConfigFlowResult:
-        _LOGGER.debug("%s Step: dev_rolling_pre_generated - %s", self.__class__.__name__, info)
+        self._log_step("dev_rolling_pre_generated", info)
 
         if not info:
             return self.async_show_form(
