@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
-import contextlib
+import json
 import logging
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
+from urllib.parse import urlsplit
 
+import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components.file_upload import process_uploaded_file
@@ -53,7 +55,8 @@ from .const import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
+    from pathlib import Path
     from typing import Any
 
     from homeassistant.core import HomeAssistant
@@ -97,6 +100,43 @@ def _redact(user_input: Mapping[str, object] | None) -> dict[str, object] | None
         else:
             redacted[key] = value
     return redacted
+
+
+# Failures of FindMy calls that the user can fix or simply retry. Anything else is
+# a bug and should surface with a traceback.
+_FLOW_ERRORS = (
+    InvalidCredentialsError,
+    UnhandledProtocolError,
+    aiohttp.ClientError,
+    TimeoutError,
+    json.JSONDecodeError,
+)
+
+
+def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) -> str:
+    """Map an expected FindMy failure to a form error key and log it."""
+    if isinstance(err, InvalidCredentialsError):
+        return "invalid_auth"
+    if isinstance(err, aiohttp.InvalidURL) or (
+        remote_anisette and isinstance(err, json.JSONDecodeError)
+    ):
+        # During login only the remote Anisette server answers in JSON (Apple
+        # uses plist), so a parse error means the URL points at something else.
+        _LOGGER.warning("Anisette server not usable during %s: %r", action, err)
+        return "invalid_anisette_url"
+    if isinstance(err, aiohttp.ClientError | TimeoutError):
+        _LOGGER.warning("Connection error during %s: %r", action, err)
+        return "cannot_connect"
+    _LOGGER.error("Unexpected response from Apple during %s", action, exc_info=err)
+    return "protocol_error"
+
+
+def _is_valid_anisette_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
 
 
 DATA_SCHEMA_ACC_LOGIN = vol.Schema(
@@ -240,6 +280,8 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         self._error: Exception | None = None
         self._2fa_methods: list[AsyncSecondFactorMethod] = []
+        # Kept so the method selection can be shown again after a failed request.
+        self._2fa_schema: vol.Schema | None = None
 
         # Set while re-authenticating an existing entry (see async_step_reauth).
         self._reauth_entry: config_entries.ConfigEntry | None = None
@@ -277,6 +319,68 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=DATA_SCHEMA_ACC_LOGIN,
         )
 
+    def _reauth_email(self) -> str:
+        entry = self._reauth_entry
+        return (entry.unique_id or "") if entry else ""
+
+    def _show_login_form(
+        self,
+        errors: dict[str, str] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Show the login form of this flow, which differs for re-authentication."""
+        if self.source != config_entries.SOURCE_REAUTH:
+            return self.async_show_form(
+                step_id="acc_login",
+                data_schema=DATA_SCHEMA_ACC_LOGIN,
+                errors=errors,
+            )
+
+        # The unique_id is the account email, so the address can be pre-filled
+        # and the user only has to supply the password and 2FA code.
+        email = self._reauth_email()
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=self.add_suggested_values_to_schema(
+                DATA_SCHEMA_ACC_LOGIN,
+                {"email": email},
+            ),
+            errors=errors,
+            description_placeholders={"account": email},
+        )
+
+    async def _async_login(self, info: LoginFlowInput) -> config_entries.ConfigFlowResult:
+        """Log in with the form input, then continue with 2FA or finish.
+
+        Shared by the initial setup and re-authentication. Failures the user can
+        fix or retry are shown on the login form instead of aborting the flow.
+        """
+        anisette_url = (info.get("advanced_options") or {}).get("anisette_url") or None
+        _LOGGER.debug(
+            "Logging into Apple account %s (anisette: %s)",
+            _mask_email(info["email"]),
+            anisette_url or "<integrated>",
+        )
+        if anisette_url is not None and not _is_valid_anisette_url(anisette_url):
+            return self._show_login_form({"base": "invalid_anisette_url"})
+
+        if anisette_url is None:
+            anisette = LocalAnisetteProvider()
+        else:
+            anisette = RemoteAnisetteProvider(anisette_url)
+        self._account = AsyncAppleAccount(anisette=anisette)
+
+        try:
+            await self._account.login(info["email"], info["password"])
+        except _FLOW_ERRORS as err:
+            error = _error_key(err, "login", remote_anisette=anisette_url is not None)
+            return self._show_login_form({"base": error})
+
+        _LOGGER.debug("State after login: %s", self._account.login_state)
+
+        if self._account.login_state == LoginState.REQUIRE_2FA:
+            return await self.async_step_acc_2fa_prompt()
+        return await self.async_step_acc_done()
+
     async def async_step_acc_login(
         self,
         info: LoginFlowInput | None,
@@ -285,43 +389,12 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if info is None:
             _LOGGER.warning("Login step called without info data")
-            return self.async_show_form(
-                step_id="acc_login",
-                data_schema=DATA_SCHEMA_ACC_LOGIN,
-            )
+            return self._show_login_form()
 
         _ = await self.async_set_unique_id(info["email"].lower())
         self._abort_if_unique_id_configured()
 
-        _LOGGER.debug("Logging into Apple account: %s", _mask_email(info["email"]))
-
-        anisette_url = info.get("advanced_options", {}).get("anisette_url") or None
-        _LOGGER.info("Using Anisette URL: %s", anisette_url or "<integrated>")
-
-        if anisette_url is None:
-            anisette = LocalAnisetteProvider()
-        else:
-            anisette = RemoteAnisetteProvider(anisette_url)
-        self._account = AsyncAppleAccount(anisette=anisette)
-
-        # Attempt login
-        try:
-            await self._account.login(info["email"], info["password"])
-        except InvalidCredentialsError:
-            return self.async_show_form(
-                step_id="acc_login",
-                data_schema=DATA_SCHEMA_ACC_LOGIN,
-                errors={"base": "invalid_auth"},
-            )
-        except UnhandledProtocolError:
-            _LOGGER.exception("Unhandled protocol exception during login")
-            return self.async_abort(reason="protocol_error")
-
-        _LOGGER.debug("State after login: %s", self._account.login_state)
-
-        if self._account.login_state == LoginState.REQUIRE_2FA:
-            return await self.async_step_acc_2fa_prompt()
-        return await self.async_step_acc_done()
+        return await self._async_login(info)
 
     async def async_step_acc_2fa_prompt(
         self,
@@ -333,10 +406,15 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.error("2FA step called but account configured incorrectly")
             return self.async_abort(reason="unknown_error")
 
-        self._2fa_methods = cast(
-            "list[AsyncSecondFactorMethod]",
-            await self._account.get_2fa_methods(),
-        )
+        try:
+            self._2fa_methods = cast(
+                "list[AsyncSecondFactorMethod]",
+                await self._account.get_2fa_methods(),
+            )
+        except _FLOW_ERRORS as err:
+            # The account cannot be reused for another login attempt, so the user
+            # starts over from the login form.
+            return self._show_login_form({"base": _error_key(err, "2FA method lookup")})
 
         menu_options: list[SelectOptionDict] = []
         for i, method in enumerate(self._2fa_methods):
@@ -359,13 +437,9 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 continue
 
         if not menu_options:
-            return self.async_show_form(
-                step_id="acc_login",
-                data_schema=DATA_SCHEMA_ACC_LOGIN,
-                errors={"base": "2fa_unavailable"},
-            )
+            return self._show_login_form({"base": "2fa_unavailable"})
 
-        schema = vol.Schema(
+        self._2fa_schema = vol.Schema(
             {
                 "method_id": SelectSelector(
                     SelectSelectorConfig(
@@ -376,7 +450,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(
             step_id="acc_2fa_request",
-            data_schema=schema,
+            data_schema=self._2fa_schema,
         )
 
     async def async_step_acc_2fa_request(
@@ -385,18 +459,33 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         self._log_step("acc_2fa_request", info)
 
-        if info is None:
+        if info is None or self._2fa_schema is None:
             _LOGGER.error("2FA requested but no method ID")
             return self.async_abort(reason="unknown_error")
 
         try:
-            method_id: int = int(cast("int", info["method_id"]))
-            self._2fa_method = self._2fa_methods[method_id]
-        except KeyError, ValueError:
-            _LOGGER.exception("Unable to look up method ID")
-            return self.async_abort(reason="unknown_error")
+            method_id = int(cast("int", info["method_id"]))
+        except KeyError, TypeError, ValueError:
+            method_id = -1
+        # A range check instead of catching IndexError: negative ids would
+        # silently pick a method from the end of the list.
+        if not 0 <= method_id < len(self._2fa_methods):
+            _LOGGER.warning("Unknown 2FA method ID: %s", info.get("method_id"))
+            return self.async_show_form(
+                step_id="acc_2fa_request",
+                data_schema=self._2fa_schema,
+                errors={"base": "invalid_2fa_method"},
+            )
+        self._2fa_method = self._2fa_methods[method_id]
 
-        await self._2fa_method.request()
+        try:
+            await self._2fa_method.request()
+        except _FLOW_ERRORS as err:
+            return self.async_show_form(
+                step_id="acc_2fa_request",
+                data_schema=self._2fa_schema,
+                errors={"base": _error_key(err, "2FA code request")},
+            )
 
         return self.async_show_form(
             step_id="acc_2fa_submit",
@@ -413,25 +502,38 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if not code:
             _LOGGER.error("No 2FA code submitted")
             return self.async_show_form(
-                step_id="2fa_submit",
+                step_id="acc_2fa_submit",
                 data_schema=DATA_SCHEME_ACC_2FA,
+                errors={"base": "2fa_invalid"},
             )
 
-        if self._2fa_method is None:
+        if self._account is None or self._2fa_method is None:
             _LOGGER.error("No active 2FA method in the flow")
             return self.async_abort(reason="unknown_error")
 
         try:
             _ = await self._2fa_method.submit(code)
         except UnhandledProtocolError:
-            _LOGGER.exception("Unhandled protocol exception during 2FA submit")
+            # Apple answers a wrong code with an unexpected status code.
+            _LOGGER.warning("2FA code was rejected", exc_info=True)
+            error = "2fa_invalid"
+        except _FLOW_ERRORS as err:
+            error = _error_key(err, "2FA submit")
+        else:
+            error = None
+
+        state = self._account.login_state
+        _LOGGER.debug("State after 2FA: %s", state)
+        if state == LoginState.LOGGED_IN:
+            return await self.async_step_acc_done()
+        if state == LoginState.REQUIRE_2FA:
             return self.async_show_form(
                 step_id="acc_2fa_submit",
                 data_schema=DATA_SCHEME_ACC_2FA,
-                errors={"base": "2fa_invalid"},
+                errors={"base": error or "2fa_invalid"},
             )
-
-        return await self.async_step_acc_done()
+        # The 2FA session is gone; only a fresh login can continue.
+        return self._show_login_form({"base": error or "login_incomplete"})
 
     async def async_step_acc_done(
         self,
@@ -442,6 +544,11 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._account is None:
             _LOGGER.error("No account configured")
             return self.async_abort(reason="unknown_error")
+
+        if self._account.login_state != LoginState.LOGGED_IN:
+            # A half logged-in session would be stored and fail on every refresh.
+            _LOGGER.warning("Login ended in state %s", self._account.login_state)
+            return self._show_login_form({"base": "login_incomplete"})
 
         data = EntryDataAccount(
             type="account",
@@ -485,55 +592,10 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Log the account in again, then reuse the normal 2FA steps."""
         self._log_step("reauth_confirm", info)
 
-        entry = self._reauth_entry
-        # The unique_id is the account email, so the address can be pre-filled
-        # and the user only has to supply the password and 2FA code.
-        suggested = {"email": (entry.unique_id or "") if entry else ""}
-
         if info is None:
-            return self.async_show_form(
-                step_id="reauth_confirm",
-                data_schema=self.add_suggested_values_to_schema(
-                    DATA_SCHEMA_ACC_LOGIN,
-                    suggested,
-                ),
-                description_placeholders={"account": suggested["email"]},
-            )
+            return self._show_login_form()
 
-        anisette_url = info.get("advanced_options", {}).get("anisette_url") or None
-        _LOGGER.debug(
-            "Re-authenticating %s (anisette: %s)",
-            _mask_email(info["email"]),
-            anisette_url or "<integrated>",
-        )
-
-        if anisette_url is None:
-            anisette = LocalAnisetteProvider()
-        else:
-            anisette = RemoteAnisetteProvider(anisette_url)
-        self._account = AsyncAppleAccount(anisette=anisette)
-
-        try:
-            await self._account.login(info["email"], info["password"])
-        except InvalidCredentialsError:
-            return self.async_show_form(
-                step_id="reauth_confirm",
-                data_schema=self.add_suggested_values_to_schema(
-                    DATA_SCHEMA_ACC_LOGIN,
-                    suggested,
-                ),
-                errors={"base": "invalid_auth"},
-                description_placeholders={"account": suggested["email"]},
-            )
-        except UnhandledProtocolError:
-            _LOGGER.exception("Unhandled protocol exception during re-authentication")
-            return self.async_abort(reason="protocol_error")
-
-        _LOGGER.debug("State after re-login: %s", self._account.login_state)
-
-        if self._account.login_state == LoginState.REQUIRE_2FA:
-            return await self.async_step_acc_2fa_prompt()
-        return await self.async_step_acc_done()
+        return await self._async_login(info)
 
     #########################
     ### Device Setup Flow ###
@@ -694,35 +756,49 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
+# What the FindMy parsers raise for a file of the wrong kind or with missing
+# fields: KeyError for an absent field (also a JSON file without "type"),
+# AssertionError for a different "type", TypeError for unexpected value types,
+# and ValueError for decode errors and a missing upload.
+_KEY_FILE_ERRORS = (KeyError, ValueError, TypeError, AssertionError)
+
+
+def _parse_key_file[T](path: Path, *parsers: Callable[[Path], T]) -> T | None:
+    """Return the result of the first parser that accepts the file, if any."""
+    for parser in parsers:
+        try:
+            return parser(path)
+        except _KEY_FILE_ERRORS as err:
+            # Only the error type: messages may quote parts of the key file.
+            _LOGGER.debug("Key file rejected by %s: %s", parser.__qualname__, type(err).__name__)
+    return None
+
+
 def _get_derived_key_device_from_file(hass: HomeAssistant, file_id: str) -> FindMyAccessory | None:
-    """Load a FindMyAccessory from an uploaded file."""
-    with process_uploaded_file(hass, file_id) as f:
-        device = None
-
-        # try plist
-        with contextlib.suppress(ValueError):
-            device = FindMyAccessory.from_plist(f)
-
-        # try json
-        if device is None:
-            with contextlib.suppress(ValueError):
-                device = FindMyAccessory.from_json(f)
-
-    return device
+    """Load a FindMyAccessory from an uploaded .plist or .json file."""
+    try:
+        with process_uploaded_file(hass, file_id) as path:
+            return _parse_key_file(
+                path,
+                FindMyAccessory.from_plist,  # pyright: ignore[reportUnknownArgumentType]
+                FindMyAccessory.from_json,
+            )
+    except ValueError:
+        _LOGGER.warning("Uploaded key file is missing or expired")
+        return None
 
 
 def _get_pre_generated_key_device_from_file(
     hass: HomeAssistant,
     file_id: str,
 ) -> FixedRollingKeyPairAccessory | None:
-    """Load a FixedRollingKeyPairAccessory from an uploaded file."""
-    with process_uploaded_file(hass, file_id) as f:
-        device = None
-
-        with contextlib.suppress(ValueError):
-            device = FixedRollingKeyPairAccessory.from_json(f)
-
-    return device
+    """Load a FixedRollingKeyPairAccessory from an uploaded .json file."""
+    try:
+        with process_uploaded_file(hass, file_id) as path:
+            return _parse_key_file(path, FixedRollingKeyPairAccessory.from_json)
+    except ValueError:
+        _LOGGER.warning("Uploaded key file is missing or expired")
+        return None
 
 
 DATA_SCHEMA_ROLLING_OPTIONS = vol.Schema(
