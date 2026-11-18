@@ -9,6 +9,7 @@ Keys are random; nothing here talks to Apple.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -322,5 +323,57 @@ async def test_storage_creates_cached_accessories(
         # Nothing of the cache leaks into what is written back to the config entry.
         assert item.to_json() == data
         assert item == cached
+    finally:
+        await hass.async_stop(force=True)
+
+
+@pytest.mark.asyncio
+async def test_realignment_refresh_is_debounced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replayed advertisements must not rebuild the candidates more than once per minute."""
+    # The device tracker imports the Bluetooth integration, which is not importable on Windows.
+    device_tracker = pytest.importorskip(
+        "custom_components.findmy.device_tracker",
+        reason="needs homeassistant.components.bluetooth",
+        exc_type=ImportError,
+    )
+    builds: list[datetime] = []
+
+    def build(_accessory: object, observed_at: datetime) -> dict[bytes, tuple[object, ...]]:
+        builds.append(observed_at)
+        return {}
+
+    monkeypatch.setattr(device_tracker, "build_candidate_key_lookup", build)
+    monkeypatch.setattr(
+        device_tracker.bluetooth, "async_discovered_service_info", lambda *_a, **_kw: []
+    )
+    monkeypatch.setattr(device_tracker, "_LOCAL_REALIGNMENT_REFRESH_COOLDOWN", 0.2)
+    cached, _ = make_pair()
+    hass = HomeAssistant(str(tmp_path))
+    frame.async_setup(hass)
+    monkeypatch.setattr(frame, "report_usage", lambda *_args, **_kwargs: None)
+    try:
+        storage = RuntimeStorage(hass)
+        tracker = device_tracker.FindMyDeviceTracker(storage.coordinator, cached, "entry")
+        tracker.hass = hass
+        tracker.async_write_ha_state = lambda: None
+        tracker._local_active = True
+
+        for _ in range(20):
+            tracker._realignment_refresh.async_schedule_call()
+            await asyncio.sleep(0)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        # The first request refreshes at once; the other 19 wait for the cooldown.
+        assert len(builds) == 1
+
+        await asyncio.sleep(0.3)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        # They collapse into a single refresh, so the last realignment is not lost.
+        assert len(builds) == 2
+
+        tracker._realignment_refresh.async_cancel()
     finally:
         await hass.async_stop(force=True)
