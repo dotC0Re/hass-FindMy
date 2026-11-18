@@ -15,6 +15,7 @@ from homeassistant.components.device_tracker.const import SourceType
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity import generate_entity_id
@@ -57,6 +58,9 @@ _LOGGER = logging.getLogger(__name__)
 _LOCAL_KEY_REFRESH_INTERVAL = timedelta(minutes=15)
 _LOCAL_STATE_UPDATE_DELAY = 60
 _LOCAL_ALIGNMENT_UPDATE_DELAY = 60
+# A realignment rebuilds the candidates and replays the Bluetooth history. Anyone in radio range
+# can trigger realignments by replaying recorded advertisements, so their cost has to be bounded.
+_LOCAL_REALIGNMENT_REFRESH_COOLDOWN = 60
 # The key index advances every 15 minutes; persisting it on every rollover rewrites
 # core.config_entries for each accessory, so the saved alignment only trails by up to an hour.
 _LOCAL_ALIGNMENT_SAVE_DELAY = 60 * 60
@@ -104,6 +108,16 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         self._local_candidate_count = 0
         self._local_refresh_lock = asyncio.Lock()
         self._local_refresh_tasks: set[asyncio.Task[None]] = set()
+        # Refreshes right away, then at most once per cooldown; requests in between collapse
+        # into a single refresh when the cooldown ends, so the last realignment is not lost.
+        self._realignment_refresh = Debouncer(
+            coordinator.hass,
+            _LOGGER,
+            cooldown=_LOCAL_REALIGNMENT_REFRESH_COOLDOWN,
+            immediate=True,
+            function=self._async_refresh_local_candidates,
+            background=True,
+        )
         self._local_active = False
         self._last_local_state_update = 0.0
         self._last_alignment_update = 0.0
@@ -160,6 +174,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
             ),
         )
         self.async_on_remove(self._cancel_local_refresh_tasks)
+        self.async_on_remove(self._realignment_refresh.async_cancel)
 
         self._schedule_local_candidate_refresh("initial")
 
@@ -341,7 +356,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         # refresh when the alignment really moved. Refreshing on every such advertisement
         # replays the Bluetooth history, which matches it again and refreshes in a loop.
         if self._device._alignment_index != current_index:  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            self._schedule_local_candidate_refresh("realignment")
+            self._realignment_refresh.async_schedule_call()
 
     @property
     def findmy_device(self) -> FindMyDevice:

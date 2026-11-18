@@ -1,12 +1,17 @@
 """Rolling-key accessory that keeps its derived key pairs between uses.
 
-FindMy.py derives a new :class:`KeyPair` (one elliptic-curve operation) for every key index on
-every call, and hashing a key pair derives its public key again. Location fetches walk up to a
-week of indices for every accessory on the event loop, and the local Bluetooth matching rebuilds
-a two-day window every 15 minutes, so the same keys were derived over and over again.
+FindMy.py derives a new :class:`KeyPair` (one elliptic-curve multiplication) for every key index
+on every call. A location fetch walks a week of indices per accessory on the event loop, three
+keys per index, and the local Bluetooth matching walks two days of them every 15 minutes. Between
+two such passes a single index is new; everything else was derived again and again.
 
 The accessory below derives every key once, hands out key pairs whose public key and hash are
-stored, and can be warmed up from a worker thread so the event loop only reads finished keys.
+stored, and can be warmed up from a worker thread so that the event loop only reads finished keys.
+
+Scope: this module only holds keys in memory. It stores nothing on disk (keys are derived again
+after a restart), talks to nobody, and does not decide when to warm up; the coordinator and the
+device tracker do that. The proper home of such a cache is FindMy.py itself (FindMy.py #285). Once
+the library keeps its key pairs, this module can be removed.
 """
 
 from __future__ import annotations
@@ -24,6 +29,10 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Primary indices that share one pair of secondary keys: a day of 15-minute indices. Mirrors
+# FindMyAccessory._secondary_keys_at, which only looks at `index // 96`.
+_SECONDARY_KEY_SPAN = 96
+
 # Number of key indices kept per accessory (15 minutes each, so about 85 days). An accessory
 # that was not located for longer than this has a larger search window; the indices beyond the
 # limit are derived on demand.
@@ -37,15 +46,41 @@ MAX_CACHED_INDICES = 8192
 # the margin to MAX_CACHED_INDICES keeps the whole searched range in the cache.
 MAX_SEARCH_INDICES = MAX_CACHED_INDICES - 192
 
-# Deriving keys is CPU-bound Python and OpenSSL work that holds the GIL. Only one thread derives
-# at a time, so a restart with many accessories cannot starve the event loop from several
-# worker threads at once. The lock is held for a single index only.
+# Pairs of secondary keys kept per accessory: enough for every cached index, plus the day that
+# is partly inside the window at either end.
+_MAX_CACHED_SECONDARY_SPANS = MAX_CACHED_INDICES // _SECONDARY_KEY_SPAN + 2
+
+# Guards every derivation and every change of a cache. FindMy.py's key generators keep state
+# (the chain of secrets) that must not be advanced by two threads at once. One lock for all
+# accessories, because deriving is CPU-bound and holds the GIL: several worker threads deriving
+# at the same time, as after a restart with many accessories, would starve the event loop. The
+# lock is held for a single index only, so the event loop waits one derivation at most.
 _DERIVE_LOCK = threading.Lock()
+
+
+def _evict_farthest[T](cache: dict[int, T], newest: int, limit: int) -> None:
+    """Shrink a cache to its limit by dropping the entries farthest from the one just added.
+
+    The indices in use form a window that moves up by one every 15 minutes, and jumps down when
+    a report or an advertisement shows that the index of the accessory lags behind the clock.
+    Whichever way it moves, the end far from the latest request is what is not needed any more.
+    """
+    while len(cache) > limit:
+        lowest, highest = min(cache), max(cache)
+        del cache[lowest if newest - lowest >= highest - newest else highest]
 
 
 @final
 class CachedKeyPair(KeyPair):
-    """A key pair that remembers its public key and hash instead of deriving them per access."""
+    """A key pair that remembers its public key and hash instead of computing them per access.
+
+    A fetch reads these several times per key (set membership, request ids, lookup tables),
+    which adds up to a noticeable pause over a week of indices.
+    """
+
+    _adv_key_bytes: bytes
+    _hashed_adv_key_bytes: bytes
+    _hash: int
 
     def __init__(
         self,
@@ -54,16 +89,26 @@ class CachedKeyPair(KeyPair):
         name: str | None = None,
     ) -> None:
         super().__init__(private_key, key_type, name)
-
-        self._adv_key_bytes: bytes = super().adv_key_bytes
-        self._hashed_adv_key_bytes: bytes = hashlib.sha256(self._adv_key_bytes).digest()
-        # Same value as HasHashedPublicKey.__hash__, so plain and cached key pairs stay equal.
-        self._hash: int = int.from_bytes(self._hashed_adv_key_bytes, "big")
+        self._remember_public_key()
 
     @classmethod
     def from_keypair(cls, key: KeyPair) -> CachedKeyPair:
-        """Create a cached copy of a key pair."""
-        return cls(key.private_key_bytes, key.key_type, key.name)
+        """Turn a finished key pair into a cached one without deriving its key again.
+
+        KeyPair.__init__ is the expensive part, so it is skipped: the new object takes over the
+        state of the given one, including the private key object that was already derived.
+        """
+        cached = cls.__new__(cls)
+        vars(cached).update(vars(key))
+        cached._remember_public_key()  # noqa: SLF001  # own class, on the instance made above
+        return cached
+
+    def _remember_public_key(self) -> None:
+        self._adv_key_bytes = super().adv_key_bytes
+        self._hashed_adv_key_bytes = hashlib.sha256(self._adv_key_bytes).digest()
+        # Same value as HasHashedPublicKey.__hash__, so plain and cached key pairs that are
+        # equal also hash alike.
+        self._hash = int.from_bytes(self._hashed_adv_key_bytes, "big")
 
     @property
     @override
@@ -90,7 +135,10 @@ class CachedKeyPair(KeyPair):
 class CachedFindMyAccessory(FindMyAccessory):
     """A :class:`FindMyAccessory` whose keys are derived once per index.
 
-    :meth:`keys_at` may be called from the event loop and from worker threads.
+    :meth:`keys_at` and :meth:`warm_keys` may be called from the event loop and from worker
+    threads at the same time. The alignment is still only updated from the event loop. A worker
+    thread that reads it in that moment may warm a range that is off by a few indices; the
+    missing ones are then derived when they are asked for.
     """
 
     def __init__(  # noqa: PLR0913
@@ -122,12 +170,10 @@ class CachedFindMyAccessory(FindMyAccessory):
             alignment_index=alignment_index,
         )
 
-        # Key pairs per key index. Only indices in [_cache_floor, _cache_top] are kept.
-        self._key_cache: dict[int, tuple[KeyPair, ...]] = {}
-        self._cache_top: int = -1
-        self._cache_floor: int = 0
-        # Secondary keys are valid for many indices; share one object between them.
-        self._interned: dict[bytes, CachedKeyPair] = {}
+        # Finished key pairs per key index: the primary key followed by both secondary keys.
+        self._key_cache: dict[int, tuple[CachedKeyPair, ...]] = {}
+        # Both secondary keys per span of _SECONDARY_KEY_SPAN indices, which all share them.
+        self._secondary_cache: dict[int, tuple[CachedKeyPair, CachedKeyPair]] = {}
 
     @override
     def get_min_index(self, dt: datetime) -> int:
@@ -139,13 +185,17 @@ class CachedFindMyAccessory(FindMyAccessory):
         if ind < 0:
             return set()
 
+        # Reading one dict entry is atomic, so finished keys are handed out without the lock.
+        # This is the only path the event loop takes after a warm-up.
         keys = self._key_cache.get(ind)
         if keys is None:
             with _DERIVE_LOCK:
                 keys = self._key_cache.get(ind)
                 if keys is None:
-                    keys = tuple(self._intern(key) for key in super().keys_at(ind))
-                    self._store(ind, keys)
+                    keys = (self._derive_primary(ind), *self._secondary_keys(ind))
+                    self._key_cache[ind] = keys
+                    _evict_farthest(self._key_cache, ind, MAX_CACHED_INDICES)
+        # A new set per call: the caller owns what it gets.
         return set(keys)
 
     def warm_keys(self, start: datetime, end: datetime) -> int:
@@ -172,34 +222,21 @@ class CachedFindMyAccessory(FindMyAccessory):
             )
         return derived
 
-    def _intern(self, key: KeyPair) -> CachedKeyPair:
-        private_key = key.private_key_bytes
-        cached = self._interned.get(private_key)
-        if cached is None:
-            cached = CachedKeyPair.from_keypair(key)
-            self._interned[private_key] = cached
-        return cached
+    def _derive_primary(self, ind: int) -> CachedKeyPair:
+        """Derive the primary key of an index. The caller holds the lock."""
+        return CachedKeyPair.from_keypair(self._primary_key_at(ind))
 
-    def _store(self, ind: int, keys: tuple[KeyPair, ...]) -> None:
-        """Remember the keys of an index and drop indices that fell out of the kept range."""
-        if ind > self._cache_top:
-            new_floor = max(ind - MAX_CACHED_INDICES + 1, 0)
-            for old in [i for i in self._key_cache if i < new_floor]:
-                self._evict(old, new_floor)
-            self._cache_top = ind
-            self._cache_floor = new_floor
+    def _secondary_keys(self, ind: int) -> tuple[CachedKeyPair, CachedKeyPair]:
+        """Get both secondary keys of an index. The caller holds the lock.
 
-        if ind >= self._cache_floor:
-            self._key_cache[ind] = keys
-        else:
-            # Not kept: forget the key objects again unless a kept index shares them.
-            self._release(keys, self._key_cache.get(self._cache_floor, ()))
-
-    def _evict(self, ind: int, new_floor: int) -> None:
-        keys = self._key_cache.pop(ind)
-        self._release(keys, self._key_cache.get(new_floor, ()))
-
-    def _release(self, keys: tuple[KeyPair, ...], still_used: tuple[KeyPair, ...]) -> None:
-        for key in keys:
-            if key not in still_used:
-                _ = self._interned.pop(key.private_key_bytes, None)
+        FindMy.py derives them for every index although a whole day of indices shares them:
+        two thirds of all derivations of a fetch produced the same handful of keys.
+        """
+        span = ind // _SECONDARY_KEY_SPAN
+        keys = self._secondary_cache.get(span)
+        if keys is None:
+            key_1, key_2 = self._secondary_keys_at(ind)
+            keys = (CachedKeyPair.from_keypair(key_1), CachedKeyPair.from_keypair(key_2))
+            self._secondary_cache[span] = keys
+            _evict_farthest(self._secondary_cache, span, _MAX_CACHED_SECONDARY_SPANS)
+        return keys

@@ -9,6 +9,7 @@ FindMy library is replaced by mocks: nothing here talks to Apple.
 from __future__ import annotations
 
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -32,6 +33,7 @@ from custom_components.findmy.coordinator import (
     CoordinatorFetchStatus,
     FindMyCoordinator,
 )
+from custom_components.findmy.key_cache import CachedFindMyAccessory
 from custom_components.findmy.storage import RuntimeStorage
 
 if TYPE_CHECKING:
@@ -380,3 +382,72 @@ async def test_log_of_a_removed_account_is_dropped(
 
     assert list(coordinator._logs) == [kept]
     assert coordinator.get_account_last_fetch(removed) is None
+
+
+def make_cached_accessory() -> CachedFindMyAccessory:
+    accessory = CachedFindMyAccessory.from_json(make_accessory().to_json())
+    assert isinstance(accessory, CachedFindMyAccessory)
+    return accessory
+
+
+@pytest.mark.asyncio
+async def test_keys_are_warmed_outside_the_event_loop_before_the_fetch(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R20: the fetch must find finished keys instead of deriving them on the event loop."""
+    account = add_account(hass, storage, "a")
+    accessory = make_cached_accessory()
+    loop_thread = threading.get_ident()
+    warm_threads: list[int] = []
+    original = CachedFindMyAccessory.warm_keys
+
+    def warm_keys(self: CachedFindMyAccessory, start: datetime, end: datetime) -> int:
+        warm_threads.append(threading.get_ident())
+        return original(self, start, end)
+
+    monkeypatch.setattr(CachedFindMyAccessory, "warm_keys", warm_keys)
+    cached_at_fetch: list[int] = []
+
+    async def fetch(_devices: object) -> dict[object, object]:
+        cached_at_fetch.append(len(accessory._key_cache))
+        return {}
+
+    account.fetch_location.side_effect = fetch
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    await coordinator.async_refresh()
+
+    assert len(warm_threads) == 1
+    assert warm_threads[0] != loop_thread
+    # A week of 15-minute indices was ready when the library was called.
+    assert cached_at_fetch[0] >= 7 * 96
+    assert coordinator.last_update_success is True
+
+
+@pytest.mark.asyncio
+async def test_failing_warm_up_ends_the_fetch_as_error(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fetch that never started must not leave the account in the state 'ongoing'."""
+    account = add_account(hass, storage, "a")
+
+    def warm_keys(_self: CachedFindMyAccessory, _start: datetime, _end: datetime) -> int:
+        msg = "The key index must be non-negative"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(CachedFindMyAccessory, "warm_keys", warm_keys)
+    await coordinator.reload()
+    listen(coordinator, make_cached_accessory())
+
+    await coordinator.async_refresh()
+
+    account.fetch_location.assert_not_awaited()
+    assert coordinator.get_account_last_fetch_result(account) is CoordinatorFetchStatus.ERROR
+    assert isinstance(coordinator.last_exception, UpdateFailed)

@@ -320,10 +320,11 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         self._log(account, CoordinatorLogEvent.FETCH_START)
 
         devices: list[FindMyDevice] = self.devices
-        await self._async_warm_keys(devices)
         _LOGGER.debug("Fetching reports for devices: %s", devices)
         success = False
         try:
+            # Inside the try block, so that a failure still ends the log entry started above.
+            await self._async_warm_keys(devices)
             device_reports = await account.fetch_location(devices)
             success = True
         except _FETCH_ERRORS as err:
