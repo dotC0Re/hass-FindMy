@@ -6,12 +6,13 @@ entries, and sets entries up and unloads them: the object behind an entry is kep
 """
 
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, cast
 
 from homeassistant.const import Platform
 from homeassistant.helpers import config_validation as cv
 
-from .account import AccountRuntime
+from .account import AccountRuntime, without_password
 from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR, DOMAIN
 from .services import async_register as _async_register_services
 from .storage import RuntimeStorage
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.typing import ConfigType
+
+    from findmy import AccountStateMapping
 
     from .config_flow import EntryData
 
@@ -39,33 +42,64 @@ DEVICE_PLATFORMS = [
 ]
 
 
+def _without_stored_password(data: dict[str, object]) -> dict[str, object]:
+    """Remove the Apple ID password from the data of an account entry (finding S1).
+
+    Data that does not look like account state is returned as it is. Setting the entry up
+    reports that as damaged; a migration that fails would only hide the reason.
+    """
+    account_data = data.get("account_data")
+    if not isinstance(account_data, Mapping):
+        return data
+    credentials = cast("Mapping[str, object]", account_data).get("account")
+    if not isinstance(credentials, Mapping):
+        return data
+    if cast("Mapping[str, object]", credentials).get("password") is None:
+        return data
+    stripped = without_password(cast("AccountStateMapping", account_data))
+    return {**data, "account_data": stripped}
+
+
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Migrate old config entry to the current format."""
-    if config_entry.version >= CONFIG_FLOW_VERSION_MAJOR:
+    """Migrate old config entry to the current format.
+
+    * 1.x -> 2.0: the entry type 'device_rolling' was renamed to 'device_rolling_derived'.
+    * 2.0 -> 2.1: account entries no longer contain the Apple ID password.
+    """
+    stored = (config_entry.version, config_entry.minor_version)
+    current = (CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR)
+    if stored >= current:
+        # Home Assistant also asks for a migration when the stored minor version is the
+        # higher one, after a downgrade. Minor versions are compatible in both directions.
         return True
 
-    _LOGGER.info(
-        "Migrating configuration from version %s.%s to version %s.%s",
-        config_entry.version,
-        config_entry.minor_version,
-        CONFIG_FLOW_VERSION_MAJOR,
-        CONFIG_FLOW_VERSION_MINOR,
-    )
+    _LOGGER.info("Migrating configuration from version %s.%s to version %s.%s", *stored, *current)
 
-    if config_entry.version == 1 and config_entry.data.get("type") == "device_rolling":
-        new_data = {**config_entry.data}
+    data: dict[str, object] = {**config_entry.data}
+
+    if config_entry.version == 1 and data.get("type") == "device_rolling":
         _LOGGER.info(
             "Migrating entry %s from 'device_rolling' to 'device_rolling_derived'",
             config_entry.entry_id,
         )
-        new_data["type"] = "device_rolling_derived"
+        data["type"] = "device_rolling_derived"
 
-        _ = hass.config_entries.async_update_entry(
-            config_entry,
-            data=new_data,
-            version=CONFIG_FLOW_VERSION_MAJOR,
-            minor_version=CONFIG_FLOW_VERSION_MINOR,
-        )
+    if data.get("type") == "account":
+        stripped = _without_stored_password(data)
+        if stripped is not data:
+            _LOGGER.info(
+                "Removing the stored Apple ID password from entry %s", config_entry.entry_id
+            )
+            data = stripped
+
+    # Always, also when the data stayed the same: an entry left at its old version would be
+    # migrated again on every start.
+    _ = hass.config_entries.async_update_entry(
+        config_entry,
+        data=data,
+        version=CONFIG_FLOW_VERSION_MAJOR,
+        minor_version=CONFIG_FLOW_VERSION_MINOR,
+    )
 
     _LOGGER.info(
         "Migration to configuration version %s.%s successful",
