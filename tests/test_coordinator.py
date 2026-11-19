@@ -39,6 +39,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.findmy import coordinator as coordinator_module
 from custom_components.findmy.account import AccountRuntime, FetchStatus
+from custom_components.findmy.budget import account_budget_id
 from custom_components.findmy.coordinator import FindMyCoordinator
 from custom_components.findmy.key_cache import (
     CATCH_UP_INTERVAL,
@@ -49,6 +50,7 @@ from custom_components.findmy.key_cache import (
 from custom_components.findmy.storage import RuntimeStorage
 
 from .conftest import (
+    FetchClock,
     library_mock,
     make_account_state,
     make_mock_account,
@@ -156,8 +158,51 @@ async def test_interval_is_divided_between_accounts(
 
 
 @pytest.mark.asyncio
-async def test_next_fetch_is_15_minutes_after_last_fetch_with_three_accounts(
+async def test_budget_id_comes_from_the_apple_id_then_the_unique_id_then_the_entry_id(
     hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+) -> None:
+    named = await add_account(hass, storage, "a")
+    assert coordinator._budget_id(named) == account_budget_id("a@example.com")
+
+    nameless = make_mock_account(email="b@example.com", reports={})
+    nameless.account_name = None
+    account = await add_account(hass, storage, "b", nameless)
+    assert account.account_name is None
+    entry_of(hass, "b").unique_id = "b@example.com"
+    assert coordinator._budget_id(account) == account_budget_id("b@example.com")
+
+    entry_of(hass, "b").unique_id = None
+    assert coordinator._budget_id(account) == account_budget_id("entry:b")
+
+
+@pytest.mark.asyncio
+async def test_two_entries_of_one_apple_id_share_its_limit(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
+) -> None:
+    first = await add_account(hass, storage, "a")
+    second = await add_account(
+        hass, storage, "b", make_mock_account(email="a@example.com", reports={})
+    )
+    await coordinator.reload()
+    assert coordinator.update_interval == timedelta(minutes=15)
+
+    for _ in range(3):
+        await coordinator.async_refresh()
+        fetch_clock.advance(timedelta(minutes=5))
+
+    assert lib(first).fetch_location.await_count == 1
+    assert lib(second).fetch_location.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_next_fetch_is_15_minutes_after_last_fetch_with_three_accounts(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     """R16: the same account is fetched again after 15 minutes, however many accounts exist."""
     accounts = [await add_account(hass, storage, entry_id) for entry_id in ("a", "b", "c")]
@@ -168,9 +213,12 @@ async def test_next_fetch_is_15_minutes_after_last_fetch_with_three_accounts(
 
     fetched = accounts[0]
     assert fetched.last_fetch is not None
-    assert coordinator.get_account_next_fetch(fetched) == fetched.last_fetch + timedelta(minutes=15)
+    # Counted from the start of the fetch: that is what the budget records.
+    assert coordinator.get_account_next_fetch(fetched) == fetch_clock.now + timedelta(minutes=15)
     assert coordinator.get_account_next_fetch(accounts[1]) is None
     assert fetched.last_fetch_result is FetchStatus.SUCCESS
+    # The next account follows 15/3 minutes later.
+    assert coordinator.update_interval == timedelta(minutes=5)
 
 
 @pytest.mark.asyncio
@@ -198,7 +246,10 @@ async def test_successful_fetch_is_logged_as_success_and_stores_reports(
 
 @pytest.mark.asyncio
 async def test_result_is_ongoing_while_the_fetch_runs(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     """R2: the result must not read SUCCESS before the fetch has returned."""
     account = await add_account(hass, storage, "a")
@@ -212,6 +263,7 @@ async def test_result_is_ongoing_while_the_fetch_runs(
     await coordinator.reload()
 
     await coordinator.async_refresh()
+    fetch_clock.advance()
     await coordinator.async_refresh()
 
     # Also during the second fetch, when a duration of the first one exists.
@@ -230,12 +282,13 @@ async def test_result_is_ongoing_while_the_fetch_runs(
     ],
 )
 @pytest.mark.asyncio
-async def test_library_errors_become_update_failed_and_are_logged_as_error(
+async def test_library_errors_become_update_failed_and_are_logged_as_error(  # noqa: PLR0917
     hass: HomeAssistant,
     storage: RuntimeStorage,
     coordinator: FindMyCoordinator,
     error: Exception,
     expected_message: str,
+    fetch_clock: FetchClock,
 ) -> None:
     """R2: these errors used to be recorded as a successful fetch."""
     account = await add_account(hass, storage, "a")
@@ -272,6 +325,7 @@ async def test_auth_error_starts_reauth_for_that_account_only(
     storage: RuntimeStorage,
     coordinator: FindMyCoordinator,
     error: Exception,
+    fetch_clock: FetchClock,
 ) -> None:
     """R1: the expired account asks for a new sign-in; the other account keeps fetching."""
     expired = await add_account(hass, storage, "a")
@@ -294,6 +348,7 @@ async def test_auth_error_starts_reauth_for_that_account_only(
     assert coordinator.update_interval == timedelta(minutes=15)
 
     for _ in range(3):
+        fetch_clock.advance()
         await coordinator.async_refresh()
 
     assert lib(expired).fetch_location.await_count == 1
@@ -341,7 +396,10 @@ async def test_expired_session_of_an_account_without_password_starts_reauth(
 
 @pytest.mark.asyncio
 async def test_reloaded_entry_returns_to_the_rotation(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     expired = await add_account(hass, storage, "a")
     healthy = await add_account(hass, storage, "b")
@@ -356,7 +414,10 @@ async def test_reloaded_entry_returns_to_the_rotation(
     await coordinator.reload()
 
     assert coordinator.update_interval == timedelta(minutes=7, seconds=30)
+    # The renewed account is the same Apple ID: it waits for 15 minutes after the failed fetch,
+    # which reached Apple too, and the healthy one goes first.
     for _ in range(4):
+        fetch_clock.advance(timedelta(minutes=7, seconds=30))
         await coordinator.async_refresh()
     assert lib(expired).fetch_location.await_count == 1
     assert lib(renewed).fetch_location.await_count == 2
@@ -405,7 +466,10 @@ async def test_unexpected_error_is_logged_as_error_and_fetching_continues(
 
 @pytest.mark.asyncio
 async def test_fetch_state_is_kept_per_account_over_many_fetches(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     """R17: a log that grew with every fetch is replaced by the state of the latest one."""
     accounts = [await add_account(hass, storage, entry_id) for entry_id in ("a", "b")]
@@ -413,6 +477,7 @@ async def test_fetch_state_is_kept_per_account_over_many_fetches(
 
     for _ in range(200):
         await coordinator.async_refresh()
+        fetch_clock.advance(timedelta(minutes=7, seconds=30))
 
     for account in accounts:
         assert lib(account).fetch_location.await_count == 100
@@ -673,7 +738,10 @@ def source_types(account: AccountRuntime) -> list[type]:
 
 @pytest.mark.asyncio
 async def test_accessory_ten_days_behind_the_clock_is_found_again(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     """An accessory below the weekly window must come back on its own, not stay lost."""
     apple = FakeApple()
@@ -704,6 +772,7 @@ async def test_accessory_ten_days_behind_the_clock_is_found_again(
 
     apple.requests = 0
     accessory._last_catch_up = None  # even if a catch-up were due again
+    fetch_clock.advance()
     await coordinator.async_refresh()
 
     # Second cycle: found in the top window, with no catch-up and no extra request.
@@ -790,7 +859,10 @@ async def test_alignment_found_before_a_failure_is_kept(
 
 @pytest.mark.asyncio
 async def test_located_accessory_causes_no_extra_requests(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     apple = FakeApple()
     account = await add_fetching_account(hass, storage, "a", apple)
@@ -801,6 +873,7 @@ async def test_located_accessory_causes_no_extra_requests(
     for _ in range(3):
         apple.requests = 0
         await coordinator.async_refresh()
+        fetch_clock.advance()
 
         assert source_types(account) == [SearchWindow]
         # A week of indices at 290 keys per request.
@@ -809,7 +882,10 @@ async def test_located_accessory_causes_no_extra_requests(
 
 @pytest.mark.asyncio
 async def test_catch_up_costs_at_most_one_window_per_interval(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     """An accessory that nobody sees any more: the extra cost has to stay bounded."""
     apple = FakeApple()
@@ -822,6 +898,7 @@ async def test_catch_up_costs_at_most_one_window_per_interval(
     for _ in range(4):
         apple.requests = 0
         await coordinator.async_refresh()
+        fetch_clock.advance()
         requests.append(apple.requests)
 
     # Three for the top window on every cycle; three more for the one catch-up window.
@@ -842,7 +919,10 @@ async def test_catch_up_costs_at_most_one_window_per_interval(
 
 @pytest.mark.asyncio
 async def test_failed_fetch_searches_the_same_catch_up_window_again(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    fetch_clock: FetchClock,
 ) -> None:
     account = await add_account(hass, storage, "a")
     accessory = make_unlocated_accessory()
@@ -857,12 +937,14 @@ async def test_failed_fetch_searches_the_same_catch_up_window_again(
     assert accessory._catch_up_cursor is None
 
     # Not retried at once: the failed fetch may have sent its requests already.
+    fetch_clock.advance()
     await coordinator.async_refresh()
     assert source_types(account) == [SearchWindow]
 
     assert accessory._last_catch_up is not None
     accessory._last_catch_up -= CATCH_UP_INTERVAL
     lib(account).fetch_location.side_effect = None
+    fetch_clock.advance()
     await coordinator.async_refresh()
 
     retried_window = fetched_sources(account)[1]

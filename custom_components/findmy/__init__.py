@@ -111,7 +111,10 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
 
 async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
-    _ = RuntimeStorage.attach(hass)
+    storage = RuntimeStorage.attach(hass)
+    # Before any entry is set up, so that the first refresh already knows when each account
+    # last fetched, also before this start of Home Assistant.
+    await storage.budget.async_load()
     _async_register_services(hass)
 
     return True

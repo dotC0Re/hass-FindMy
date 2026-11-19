@@ -8,6 +8,9 @@ Accounts live on the FindMy worker thread (see account.py). ``open_account`` put
 library account there the way a config entry would; the thread is stopped together with the
 ``hass`` instance of the test.
 
+An account fetches at most once per 15 minutes (budget.py). Tests that fetch several times in
+a row let that time pass with the ``fetch_clock`` fixture instead of waiting.
+
 pytest-homeassistant-custom-component is deliberately not used; it cannot be loaded on
 Windows (see tests/README.md).
 """
@@ -19,6 +22,7 @@ import os
 import sys
 import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -32,7 +36,9 @@ from homeassistant.config_entries import SOURCE_USER, ConfigEntries, ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
 
+from custom_components.findmy import coordinator as coordinator_module
 from custom_components.findmy.account import AccountRuntime
+from custom_components.findmy.budget import MIN_FETCH_INTERVAL
 from custom_components.findmy.const import (
     CONFIG_FLOW_VERSION_MAJOR,
     CONFIG_FLOW_VERSION_MINOR,
@@ -75,6 +81,32 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     skip = pytest.mark.skip(reason="homeassistant.components.bluetooth is not importable")
     for item in marked:
         item.add_marker(skip)
+
+
+@dataclass
+class FetchClock:
+    """The time the coordinator's fetch budget sees; moves only when a test says so."""
+
+    now: datetime
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, delta: timedelta = MIN_FETCH_INTERVAL) -> None:
+        """Let time pass, by default the 15 minutes after which an account may fetch again."""
+        self.now += delta
+
+
+@pytest.fixture
+def fetch_clock(monkeypatch: pytest.MonkeyPatch) -> FetchClock:
+    """Replace the clock of the fetch budget, starting at the real time.
+
+    Only the budget's decisions follow it. Key derivation and catch-up windows keep using the
+    real time, which is why it starts there.
+    """
+    clock = FetchClock(datetime.now(tz=UTC))
+    monkeypatch.setattr(coordinator_module, "_utcnow", clock)
+    return clock
 
 
 @pytest.fixture(autouse=True)

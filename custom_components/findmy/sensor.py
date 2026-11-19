@@ -369,7 +369,8 @@ class FindMyAccountLastFetchSensor(_FindMyAccountBaseSensor[datetime]):
 
     @override
     def _compute_value(self) -> datetime | None:
-        return self._account.last_fetch
+        # After a restart, the latest fetch before it, until this run fetched.
+        return self._coordinator.get_account_last_fetch(self._account)
 
 
 class FindMyAccountNextFetchSensor(_FindMyAccountBaseSensor[datetime]):

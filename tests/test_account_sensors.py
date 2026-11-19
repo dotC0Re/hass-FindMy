@@ -14,7 +14,7 @@ import pytest
 from custom_components.findmy.const import DOMAIN
 from custom_components.findmy.storage import RuntimeStorage
 
-from .conftest import library_mock, make_mock_account, open_account
+from .conftest import FetchClock, library_mock, make_mock_account, open_account
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -54,7 +54,9 @@ async def test_account_sensors_keep_their_ids(hass: HomeAssistant) -> None:
         }
 
 
-async def test_account_sensors_follow_the_fetch_of_their_account(hass: HomeAssistant) -> None:
+async def test_account_sensors_follow_the_fetch_of_their_account(
+    hass: HomeAssistant, fetch_clock: FetchClock
+) -> None:
     from custom_components.findmy import sensor  # noqa: PLC0415  # needs Bluetooth, see above
 
     storage = RuntimeStorage(hass)
@@ -90,10 +92,12 @@ async def test_account_sensors_follow_the_fetch_of_their_account(hass: HomeAssis
     assert result.native_value == "success"
     assert last_fetch.native_value == account.last_fetch
     assert last_fetch.native_value is not None
-    assert next_fetch.native_value == last_fetch.native_value + timedelta(minutes=15)
+    # Counted from the start of the fetch, see budget.py.
+    assert next_fetch.native_value == fetch_clock.now + timedelta(minutes=15)
     assert duration.native_value is not None
     assert 0 <= duration.native_value < 5
 
+    fetch_clock.advance()
     library_mock(account).fetch_location.side_effect = TimeoutError()
     await coordinator.async_refresh()
 
