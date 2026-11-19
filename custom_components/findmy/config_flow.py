@@ -85,6 +85,13 @@ _LOCAL_TIMEOUT = 30.0
 # Stopping runs the account's close on the worker, itself limited to 10 s by the worker.
 _WORKER_STOP_TIMEOUT = 15.0
 
+# The token FindMy needs to fetch location reports. Since Apple changed its sign-in in
+# October 2026, sign-ins are reported to end without it (FindMy.py issue #278). The
+# handling below follows those reports and the library source only; it could not be
+# verified against Apple.
+_FIND_MY_TOKEN = "searchPartyToken"  # noqa: S105 - the name of a field, not a secret
+_ISSUE_TRACKER_URL = "https://github.com/malmeloo/FindMy.py/issues"
+
 # Flow input that must never reach a log: the account password, the private key
 # of a static tag (it grants location access forever, since static keys never
 # rotate), the one-time 2FA code and the upload id of a key file.
@@ -135,15 +142,43 @@ _FLOW_ERRORS = (
 )
 
 
+def _is_missing_find_my_token(err: BaseException) -> bool:
+    """Whether FindMy failed because Apple's answer lacks the Find My token.
+
+    Only this one key: any other ``KeyError`` is a bug and keeps its traceback.
+    """
+    return isinstance(err, KeyError) and err.args == (_FIND_MY_TOKEN,)
+
+
 def _is_flow_error(err: BaseException) -> bool:
     """Whether a failure is one the user can fix or retry, see ``_error_key``."""
-    return isinstance(err, _FLOW_ERRORS)
+    return isinstance(err, _FLOW_ERRORS) or _is_missing_find_my_token(err)
+
+
+def _has_find_my_token(account_data: Mapping[str, object]) -> bool:
+    """Whether a serialised session carries the token needed to fetch reports.
+
+    Follows the lookup in ``fetch_raw_reports`` of FindMy 0.10.2, which reads the
+    token only when fetching. Without this check the flow would create an entry that
+    fails on every refresh.
+    """
+    node: object = account_data
+    for key in ("login", "data", "mobileme_data", "tokens", _FIND_MY_TOKEN):
+        node = _get_key(node, key)
+    return bool(node)
+
+
+def _get_key(node: object, key: str) -> object:
+    return cast("dict[str, object]", node).get(key) if isinstance(node, dict) else None
 
 
 def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) -> str:
     """Map an expected FindMy failure to a form error key and log it."""
     if isinstance(err, InvalidCredentialsError):
         return "invalid_auth"
+    if _is_missing_find_my_token(err):
+        _LOGGER.warning("Apple did not return the Find My token during %s", action)
+        return "find_my_token_missing"
     if isinstance(err, WorkerNotRunningError):
         _LOGGER.warning("Sign-in was stopped during %s: %s", action, err)
         return "login_incomplete"
@@ -588,11 +623,14 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Show the login form of this flow, which differs for re-authentication."""
+        # Used by the text of the find_my_token_missing error.
+        placeholders = {"issue_tracker_url": _ISSUE_TRACKER_URL}
         if self.source != config_entries.SOURCE_REAUTH:
             return self.async_show_form(
                 step_id="acc_login",
                 data_schema=DATA_SCHEMA_ACC_LOGIN,
                 errors=errors,
+                description_placeholders=placeholders,
             )
 
         # The unique_id is the account email, so the address can be pre-filled
@@ -605,7 +643,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {"email": email},
             ),
             errors=errors,
-            description_placeholders={"account": email},
+            description_placeholders={**placeholders, "account": email},
         )
 
     async def _async_restart_login(self, error: str) -> config_entries.ConfigFlowResult:
@@ -788,6 +826,9 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 error = "2fa_invalid"
             else:
                 error = _error_key(err, "2FA submit")
+            if error == "find_my_token_missing":
+                # The code was accepted; a new attempt starts with signing in.
+                return await self._async_restart_login(error)
             state = await self._async_current_login_state()
         self._login_state = state
 
@@ -827,6 +868,10 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not _is_flow_error(err):
                 raise
             return await self._async_restart_login(_error_key(err, "saving the session"))
+
+        if not _has_find_my_token(account_data):
+            _LOGGER.warning("Apple did not return the Find My token during sign-in")
+            return await self._async_restart_login("find_my_token_missing")
 
         # The entry restores its own session from the stored data; stopping the
         # worker closes the flow's account.

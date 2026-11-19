@@ -314,6 +314,7 @@ LOGIN_ERRORS = [
     # A remote URL that serves something other than Anisette JSON.
     (_HTML_ERROR, "http://ani.example", "invalid_anisette_url"),
     (_HTML_ERROR, None, "protocol_error"),
+    (KeyError("searchPartyToken"), None, "find_my_token_missing"),
 ]
 
 
@@ -1054,3 +1055,84 @@ def test_flow_error_keys_match_translations():
     assert "invalid_auth" in errors, "the pattern must find the error keys"
     assert errors == set(config["error"])
     assert aborts <= set(config["abort"])
+
+
+###########
+### R22 ###
+###########
+
+# None of this could be checked against Apple: the error is modelled on the reports
+# about Apple's sign-in change in October 2026 (FindMy.py issue #278).
+MISSING_TOKEN = KeyError("searchPartyToken")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", [config_entries.SOURCE_USER, config_entries.SOURCE_REAUTH])
+async def test_missing_find_my_token_explains_itself(hass, accounts, source):
+    created, factory_state = accounts
+    factory_state["login_error"] = MISSING_TOKEN
+    if source == config_entries.SOURCE_REAUTH:
+        entry = add_account_entry(hass)
+        flow = make_flow(hass, source, entry_id=entry.entry_id)
+        result = await flow.async_step_reauth_confirm(login_input())
+    else:
+        result = await make_flow(hass).async_step_acc_login(login_input())
+
+    assert result["errors"] == {"base": "find_my_token_missing"}
+    placeholders = result.get("description_placeholders") or {}
+    assert placeholders["issue_tracker_url"] == "https://github.com/malmeloo/FindMy.py/issues"
+    created[0].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_missing_find_my_token_after_2fa_returns_to_login(hass, accounts):
+    flow, account = await _flow_at_2fa_request(hass, accounts)
+    await flow.async_step_acc_2fa_request({"method_id": "0"})
+
+    async def submit(_code):
+        account.login_state = LoginState.AUTHENTICATED
+        raise MISSING_TOKEN
+
+    account.sms.submit.side_effect = submit
+    result = await flow.async_step_acc_2fa_submit({"code": CODE})
+
+    assert result["step_id"] == "acc_login"
+    assert result["errors"] == {"base": "find_my_token_missing"}
+    account.close.assert_awaited_once()
+    account.to_json.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_other_key_errors_are_not_mistaken_for_the_token(hass, accounts):
+    created, factory_state = accounts
+    factory_state["login_error"] = KeyError("dsid")
+
+    with pytest.raises(KeyError, match="dsid"):
+        await make_flow(hass).async_step_acc_login(login_input())
+
+    created[0].close.assert_awaited_once()
+    assert not login_threads()
+
+
+@pytest.mark.asyncio
+async def test_no_entry_for_a_session_without_find_my_token(hass, accounts):
+    _created, factory_state = accounts
+    without_token = {
+        **ACCOUNT_JSON,
+        "login": {"state": LoginState.LOGGED_IN.value, "data": {"mobileme_data": {"tokens": {}}}},
+    }
+
+    def lacking_token(account):
+        account.to_json.side_effect = lambda: without_token
+
+    factory_state["customize"] = lacking_token
+    flow = make_flow(hass)
+
+    result = await flow.async_step_acc_login(login_input())
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "find_my_token_missing"}
+    # A later attempt that gets the token still succeeds.
+    factory_state["customize"] = lambda _account: None
+    result = await flow.async_step_acc_login(login_input())
+    assert result["type"] == "create_entry"
