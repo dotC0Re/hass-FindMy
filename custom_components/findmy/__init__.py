@@ -14,6 +14,7 @@ from homeassistant.helpers import config_validation as cv
 
 from .account import AccountRuntime, without_password
 from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR, DOMAIN
+from .key_checkpoints import KeyCheckpointStore
 from .last_reports import LastReportStore
 from .services import async_register as _async_register_services
 from .storage import RuntimeStorage
@@ -140,6 +141,8 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     await storage.budget.async_load()
     # Likewise, so that the entities of a device start with its last known location.
     await storage.reports.async_load()
+    # And so that the key chain of a rolling-key accessory does not start at its pairing.
+    await storage.key_checkpoints.async_load()
     _async_register_services(hass)
 
     return True
@@ -208,12 +211,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData])
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) -> None:
-    """Forget what is kept for an entry outside of it: the last location of its device."""
+    """Forget what is kept for an entry outside of it.
+
+    That is the last location of its device and the checkpoints of its key chains.
+    """
     if DOMAIN in hass.data:
-        RuntimeStorage.get(hass).reports.forget(entry.entry_id)
+        storage = RuntimeStorage.get(hass)
+        storage.reports.forget(entry.entry_id)
+        storage.key_checkpoints.forget(entry.entry_id)
         return
     # Removed while the integration is not loaded (all its entries disabled, say): the stored
-    # reports still have to forget the device, so open them just for that.
+    # records still have to forget the device, so open them just for that.
     reports = LastReportStore(hass)
     await reports.async_load()
     reports.forget(entry.entry_id)
+    checkpoints = KeyCheckpointStore(hass)
+    await checkpoints.async_load()
+    checkpoints.forget(entry.entry_id)

@@ -338,6 +338,9 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
             if isinstance(device, CachedFindMyAccessory):
                 window = await self.hass.async_add_executor_job(device.search_window, now)
                 sources[window] = target
+                if target.entry_id is not None:
+                    # The window has walked the key chain; the next start can begin there.
+                    await self._storage.async_keep_checkpoints(target.entry_id, device)
                 planned = device.plan_catch_up(now)
                 if planned is not None:
                     _LOGGER.debug("Catching up on key indices %i..%i of %s", *planned, device.name)
