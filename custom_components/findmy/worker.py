@@ -51,16 +51,18 @@ Limits
 * A job must not wait for another job (``run`` from inside a job would deadlock and is
   rejected with ``RuntimeError``).
 
-Intended use
-------------
-The integration owns one worker for all accounts and stops it on the last unload or on
-Home Assistant shutdown (``await worker.async_stop()``, bounded with ``asyncio.timeout``).
-The coordinator creates each ``AsyncAppleAccount`` inside a job, registers
-``account.close`` with :meth:`add_stop_callback` and fetches with
-``await worker.run(lambda: account.fetch_location(devices), timeout=120)``. Only plain
-data (reports, the new alignment) is taken over on Home Assistant's side; library
-objects are never touched outside a job. The config flow runs login, 2FA and file
-import the same way, one job per step.
+How the integration uses it
+---------------------------
+* Stored accounts share one worker, owned by ``RuntimeStorage`` (storage.py). It is
+  started on first use and stopped with Home Assistant, not on the last unload: a worker
+  cannot be restarted. ``AccountRuntime`` (account.py) creates each ``AsyncAppleAccount``
+  inside a job, registers ``account.close`` with :meth:`add_stop_callback` and fetches
+  with a time limit. Only plain data (reports, the new alignment, the serialised
+  session) is taken over on Home Assistant's side.
+* Every account config flow has a worker of its own for sign-in and 2FA
+  (config_flow.py), because the shared one does not exist before the first entry is set
+  up. It is stopped when the flow ends. Key files are parsed in Home Assistant's
+  executor, not here.
 """
 
 from __future__ import annotations

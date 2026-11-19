@@ -9,6 +9,11 @@ No test talks to Apple. Accounts are mocks (`mock_account_factory`); accessories
 pairs are built from random keys (`accessory_factory`, `keypair_factory`). Key derivation and
 matching therefore run for real, without network access.
 
+Stored accounts live on the FindMy worker thread. `open_account(storage, entry_id)` from
+`conftest.py` opens a mocked library account there the way a real one is opened and returns
+the `AccountRuntime` Home Assistant's side works with; `library_mock(runtime)` gives the mock
+behind it. The `hass` fixture stops the worker when the test ends.
+
 ## Why not `pytest-homeassistant-custom-component`
 
 Version 0.13.366, which pins exactly Home Assistant 2026.9.3, was evaluated. On Linux it would
