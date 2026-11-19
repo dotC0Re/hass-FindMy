@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from time import monotonic
@@ -115,9 +116,13 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
             background=True,
         )
         self._local_active = False
-        self._last_local_state_update = 0.0
-        self._last_alignment_update = 0.0
-        self._last_alignment_save = 0.0
+        # Never, rather than 0.0: the monotonic clock counts from the boot of the host. With
+        # 0.0, an accessory heard within the first hour after a boot (Home Assistant starting
+        # after a power cut) had its alignment saved only once the host had been up an hour,
+        # and a restart before that lost what the advertisements had realigned.
+        self._last_local_state_update = -math.inf
+        self._last_alignment_update = -math.inf
+        self._last_alignment_save = -math.inf
 
         # Define entity id
         # Set here instead of in a property because it needs a setter, so this is more convenient.
