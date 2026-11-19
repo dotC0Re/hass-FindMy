@@ -26,6 +26,10 @@ library account itself is a private attribute that only the job functions in thi
 Jobs of all accounts share one worker and run one after another, so a job of this module may
 wait behind a location fetch of another account before it starts.
 
+An account that uses the integrated Anisette provider is restored with the path of the one
+verified library bundle (anisette_libs.py), so that the provider loads it from there instead of
+downloading it on first use after every start.
+
 Every path that drops a library account closes it on the worker first. That matters beyond
 tidiness: FindMy.py closes an account that is garbage collected while still open, on whatever
 event loop is running in the thread that collects it, which could be Home Assistant's. For an
@@ -36,20 +40,31 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Self, cast, final, override
 
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
 
 from findmy import AsyncAppleAccount, LoginState
 
+from .anisette_libs import (
+    AnisetteLibsChecksumError,
+    AnisetteLibsUnavailableError,
+    async_ensure_anisette_libs,
+)
 from .worker import WorkerNotRunningError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from datetime import timedelta
+    from pathlib import Path
 
     from homeassistant.core import HomeAssistant
 
@@ -116,6 +131,43 @@ class _Opened:
     last_name: str | None
 
 
+def _uses_local_anisette(account_data: object) -> bool:
+    """Whether stored account state names the integrated Anisette provider.
+
+    Damaged data counts as "no": restoring it reports the damage, and needs no bundle for it.
+    """
+    if not isinstance(account_data, Mapping):
+        return False
+    anisette: object = cast("Mapping[str, object]", account_data).get("anisette")
+    return isinstance(anisette, Mapping) and (
+        cast("Mapping[str, object]", anisette).get("type") == "aniLocal"
+    )
+
+
+async def async_local_anisette_libs(hass: HomeAssistant, account_data: object) -> Path | None:
+    """Put the library bundle in place if the stored account needs it, and return its path.
+
+    Returns None for an account with a remote Anisette server, and for data that is damaged
+    (:meth:`AccountRuntime.async_load` reports that). For an account with the integrated
+    provider the bundle is verified, and downloaded first if there is none, see
+    anisette_libs.py. This runs on Home Assistant's loop, before the account is restored on
+    the worker: it needs Home Assistant's HTTP session and executor.
+
+    Raises ConfigEntryError if the stored bundle does not match its recorded checksum, which
+    only the user can resolve (the message names the file to delete), and ConfigEntryNotReady
+    if there is no bundle and it could not be downloaded, so that Home Assistant tries the
+    setup again later.
+    """
+    if not _uses_local_anisette(account_data):
+        return None
+    try:
+        return await async_ensure_anisette_libs(hass)
+    except AnisetteLibsChecksumError as err:
+        raise ConfigEntryError(str(err)) from err
+    except AnisetteLibsUnavailableError as err:
+        raise ConfigEntryNotReady(str(err)) from err
+
+
 def _broken_data_error(err: Exception) -> ConfigEntryError:
     # The exception names a field or a type, never a value, so it is safe to show. An
     # AssertionError of the library has no text at all.
@@ -177,9 +229,18 @@ class AccountRuntime:
 
     @classmethod
     async def async_load(
-        cls, worker: FindMyWorker, entry_id: str, account_data: AccountStateMapping | None
+        cls,
+        worker: FindMyWorker,
+        entry_id: str,
+        account_data: AccountStateMapping | None,
+        *,
+        anisette_libs_path: Path | None = None,
     ) -> Self:
         """Restore the account of a config entry on the worker.
+
+        ``anisette_libs_path`` is the library bundle :func:`async_local_anisette_libs` returned
+        for this account data. An account that uses the integrated Anisette provider is not
+        restored without it; an account with a remote Anisette server has no use for it.
 
         Raises ConfigEntryError if the stored data is missing or damaged, and
         ConfigEntryAuthFailed if it restores to an account that is not signed in, so that Home
@@ -196,10 +257,19 @@ class AccountRuntime:
         except _RESTORE_ERRORS as err:
             raise _broken_data_error(err) from err
 
+        if anisette_libs_path is None and _uses_local_anisette(stored):
+            # Restored without the bundle, the provider would download it on its own on first
+            # use: unchecked and with no time limit, which anisette_libs.py is there to
+            # prevent. A caller that gets here skipped async_local_anisette_libs.
+            msg = "an account with the integrated Anisette provider needs anisette_libs_path"
+            raise RuntimeError(msg)
+
         def restore() -> AsyncAppleAccount:
             # A second copy, so that `stored` stays what the entry held whatever the library
             # does with the mapping it was restored from.
-            return AsyncAppleAccount.from_json(copy.deepcopy(stored))
+            return AsyncAppleAccount.from_json(
+                copy.deepcopy(stored), anisette_libs_path=anisette_libs_path
+            )
 
         return await cls._async_open(worker, entry_id, restore, stored)
 
