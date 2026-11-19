@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
@@ -97,7 +98,9 @@ async def run_delayed_refresh(hass: HomeAssistant, coordinator: FindMyCoordinato
     assert coordinator._refresh_handle is not None
     coordinator.schedule_refresh(0)
     await asyncio.sleep(0)
-    await hass.async_block_till_done()
+    # The delayed refresh is a background task, which Home Assistant does not wait for unless
+    # asked to.
+    await hass.async_block_till_done(wait_background_tasks=True)
     # The next manual refresh must not wait for the debouncer's cooldown.
     coordinator._debounced_refresh.async_cancel()
 
@@ -367,3 +370,56 @@ async def test_removing_and_adding_an_account_keeps_its_limit(
 
     assert fetches(apple, "Jane@Example.com") == 1
     assert set(storage.budget.as_dict()) == {account_budget_id("jane@example.com")}
+
+
+async def test_delayed_refresh_does_not_hold_up_home_assistant(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    """G3: Home Assistant waits for its tracked tasks while it starts, but not for a fetch."""
+    storage = await start(hass)
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+
+    async def slow_fetch(sources: list[object]) -> dict[object, None]:
+        # Runs on the worker thread, whose loop cannot wait for an event of this one.
+        loop.call_soon_threadsafe(started.set)
+        _ = await asyncio.to_thread(release.wait, 5)
+        return dict.fromkeys(sources)
+
+    apple["jane@example.com"][0].fetch_location.side_effect = slow_fetch
+    storage.coordinator.schedule_refresh(0)
+    await asyncio.wait_for(started.wait(), 5)
+
+    # Returns while the fetch still runs.
+    await asyncio.wait_for(hass.async_block_till_done(), 5)
+    assert fetches(apple) == 1
+
+    release.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert fetches(apple) == 1
+    assert storage.coordinator.last_update_success is True
+
+
+async def test_error_of_the_delayed_refresh_is_logged(  # noqa: PLR0917
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nobody awaits the background task, so what escapes the refresh must reach the log."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    bug = RuntimeError("bug")
+    monkeypatch.setattr(coordinator, "async_refresh", AsyncMock(side_effect=bug))
+
+    await run_delayed_refresh(hass, coordinator)
+
+    record = next(r for r in caplog.records if "delayed refresh" in r.getMessage())
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    assert record.exc_info[1] is bug

@@ -156,12 +156,26 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
         def _request_refresh() -> None:
             self._refresh_handle = None
-            _ = self.hass.async_create_task(
-                self.async_request_refresh(),
-                name="findmy delayed startup refresh",
+            # A background task, like the refreshes Home Assistant schedules itself: the start
+            # of Home Assistant does not wait for a fetch that the setup of an entry asked for,
+            # and the task is cancelled when Home Assistant stops.
+            _ = self.hass.async_create_background_task(
+                self._async_delayed_refresh(),
+                name="findmy delayed refresh",
             )
 
         self._refresh_handle = self.hass.loop.call_later(delay_seconds, _request_refresh)
+
+    async def _async_delayed_refresh(self) -> None:
+        """Run the delayed refresh; nobody awaits the task, so its errors are logged here."""
+        try:
+            # Not async_request_refresh: its debouncer runs the refresh in a task of its own,
+            # which Home Assistant would track and wait for again. The timer above already
+            # coalesces the setups of several entries into one refresh.
+            await self.async_refresh()
+        except Exception:
+            # The coordinator handles what a fetch raises; whatever gets here is a bug.
+            _LOGGER.exception("The delayed refresh of the location reports failed")
 
     def _fetchable_accounts(self) -> list[AccountRuntime]:
         """Accounts that take part in the rotation: all but those waiting for a new sign-in."""
