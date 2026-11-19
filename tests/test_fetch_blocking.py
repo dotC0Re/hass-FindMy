@@ -39,7 +39,7 @@ from homeassistant.helpers import frame
 from custom_components.findmy.key_cache import CachedFindMyAccessory
 from custom_components.findmy.storage import RuntimeStorage
 
-from .conftest import library_mock, open_account
+from .conftest import FetchClock, library_mock, open_account
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -289,7 +289,9 @@ async def hass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncGenerato
     await instance.async_stop(force=True)
 
 
-async def measure_cold_refresh(hass: HomeAssistant, accessories: int) -> Measurement:
+async def measure_cold_refresh(
+    hass: HomeAssistant, clock: FetchClock, accessories: int
+) -> Measurement:
     """One coordinator refresh for new accessories, whose key caches are still empty."""
     raw_account = FakeAccount()
     fetcher = LocationReportsFetcher(raw_account)  # pyright: ignore[reportArgumentType]
@@ -298,6 +300,9 @@ async def measure_cold_refresh(hass: HomeAssistant, accessories: int) -> Measure
         history = await fetcher.fetch_location_history(devices)
         return dict.fromkeys(history)
 
+    # Every measurement starts Home Assistant anew on the same configuration, whose fetch
+    # budget remembers the measurement before.
+    clock.advance()
     storage = RuntimeStorage(hass)
     account = await open_account(storage, "account")
     library_mock(account).fetch_location.side_effect = fetch_location
@@ -315,7 +320,7 @@ async def measure_cold_refresh(hass: HomeAssistant, accessories: int) -> Measure
 
 @pytest.mark.asyncio
 async def test_first_refresh_after_a_restart_keeps_the_event_loop_free(
-    hass: HomeAssistant,
+    hass: HomeAssistant, fetch_clock: FetchClock
 ) -> None:
     """The whole path through the coordinator, starting with empty caches.
 
@@ -327,7 +332,7 @@ async def test_first_refresh_after_a_restart_keeps_the_event_loop_free(
     plain = FindMyAccessory.from_json(accessory_data(paired_days=400, aligned_hours_ago=1))
 
     plain_fetch = await measure_fetch(plain)
-    refreshes = [await measure_cold_refresh(hass, accessories=3) for _ in range(2)]
+    refreshes = [await measure_cold_refresh(hass, fetch_clock, accessories=3) for _ in range(2)]
     refresh = min(refreshes, key=lambda measured: measured.longest_stall)
 
     print()
@@ -347,13 +352,16 @@ async def burn_cpu(seconds: float) -> None:
         count += 1
 
 
-async def measure_burning_refresh(hass: HomeAssistant) -> Measurement:
+async def measure_burning_refresh(hass: HomeAssistant, clock: FetchClock) -> Measurement:
     """One coordinator refresh whose fetch computes for CPU_BURN seconds in one piece."""
 
     async def fetch_location(devices: list[object]) -> object:
         await burn_cpu(CPU_BURN)
         return dict.fromkeys(devices)
 
+    # Every measurement starts Home Assistant anew on the same configuration, whose fetch
+    # budget remembers the measurement before.
+    clock.advance()
     storage = RuntimeStorage(hass)
     account = await open_account(storage, "account")
     library_mock(account).fetch_location.side_effect = fetch_location
@@ -368,7 +376,9 @@ async def measure_burning_refresh(hass: HomeAssistant) -> Measurement:
 
 
 @pytest.mark.asyncio
-async def test_cpu_bound_fetch_does_not_stall_the_event_loop(hass: HomeAssistant) -> None:
+async def test_cpu_bound_fetch_does_not_stall_the_event_loop(
+    hass: HomeAssistant, fetch_clock: FetchClock
+) -> None:
     """R20 stage 2: decrypting reports and emulating Anisette no longer freeze Home Assistant.
 
     The fetch of the fake account computes for half a second without an await. On the event
@@ -378,7 +388,7 @@ async def test_cpu_bound_fetch_does_not_stall_the_event_loop(hass: HomeAssistant
     """
     on_the_loop = await measure_stall(lambda: burn_cpu(CPU_BURN))
     # The best of three: a pause of the whole machine is not a property of the code.
-    refreshes = [await measure_burning_refresh(hass) for _ in range(3)]
+    refreshes = [await measure_burning_refresh(hass, fetch_clock) for _ in range(3)]
     refresh = min(refreshes, key=lambda measured: measured.longest_stall)
 
     print()

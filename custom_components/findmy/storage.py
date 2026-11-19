@@ -2,7 +2,7 @@
 
 One :class:`RuntimeStorage` exists per Home Assistant instance. It maps config entries to the
 object each of them stands for (an Apple account or a device), and owns what all entries share:
-the coordinator and the FindMy worker thread.
+the coordinator, the FindMy worker thread and the fetch budget of the accounts (budget.py).
 
 Accounts are stored as :class:`~.account.AccountRuntime`. The library account behind one lives
 on the worker thread and is created and closed there, see account.py.
@@ -21,6 +21,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from findmy import FixedRollingKeyPairAccessory, KeyPair
 
 from .account import AccountRuntime
+from .budget import PersistentFetchBudget
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
@@ -57,6 +58,9 @@ class RuntimeStorage:
         self.local_rssi: dict[str, int | None] = {}
 
         self._hass: HomeAssistant = hass
+        # When each Apple account last fetched, kept across restarts. Loaded in async_setup,
+        # and again (a no-op then) by the coordinator before it decides anything.
+        self.budget: PersistentFetchBudget = PersistentFetchBudget(hass)
         self._coordinator: FindMyCoordinator = FindMyCoordinator(self._hass, self)
         self._worker: FindMyWorker | None = None
 

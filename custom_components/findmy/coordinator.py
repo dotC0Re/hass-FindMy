@@ -1,8 +1,10 @@
 """The coordinator that fetches the location reports of all devices.
 
-All config entries share this one coordinator. Each refresh takes the next Apple account in
-turn and asks it for the latest report of every device; the interval is divided between the
-accounts so that each of them is used once per 15 minutes.
+All config entries share this one coordinator. Each refresh asks one Apple account for the
+latest report of every device. Which account, and whether any at all, is up to the fetch budget
+(budget.py): it remembers across restarts when each account last fetched, so that none of them
+fetches more than once per 15 minutes, whatever starts the refresh. The accounts take turns, and
+the schedule spreads them out, so that with n accounts an update arrives every 15/n minutes.
 
 The fetch itself runs on the FindMy worker thread (worker.py, account.py), with a time limit.
 This module is the event loop's side of it: it prepares what the worker searches, waits, and
@@ -22,6 +24,7 @@ from typing import TYPE_CHECKING, final, override
 import aiohttp
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from findmy import (
     FindMyAccessory,
@@ -35,6 +38,7 @@ from findmy import (
 )
 
 from ._entity import account_name
+from .budget import MIN_FETCH_INTERVAL, account_budget_id
 from .const import signal_account_fetch
 from .key_cache import CachedFindMyAccessory, CatchUpWindow, SearchWindow
 from .worker import WorkerNotRunningError
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
     from .account import AccountRuntime, FetchSource
+    from .budget import FetchBudget
     from .storage import RuntimeStorage
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +66,17 @@ _MISSING_CREDENTIALS = "No username or password specified"
 # request that never returns: without it, such a fetch would block every later job on the
 # worker, including those of the other accounts.
 _FETCH_TIMEOUT = 120.0
+
+# Shortest wait the coordinator schedules itself. Home Assistant may run a scheduled refresh up
+# to a second early (it rounds the loop time down), which the budget then turns away; the retry
+# follows at the time the budget names, but never in a tight loop.
+_MIN_SCHEDULE_DELAY = timedelta(seconds=1)
+
+
+def _utcnow() -> datetime:
+    """The time the fetch budget decides on. Tests replace it to let time pass."""
+    return dt_util.utcnow()
+
 
 # What a fetch is known to raise. Anything else is a bug and keeps its traceback in the log.
 _FETCH_ERRORS = (
@@ -117,9 +133,6 @@ def _describe_fetch_error(err: Exception) -> str:
 
 @final
 class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
-    # minimum time (in seconds) between location fetches on an account.
-    _MIN_ACCOUNT_UPDATE_DELAY = 15 * 60
-
     def __init__(self, hass: HomeAssistant, storage: RuntimeStorage) -> None:
         super().__init__(
             hass,
@@ -131,7 +144,6 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
         self._storage = storage
 
-        self._cur_acc_index = 0
         self._refresh_handle: TimerHandle | None = None
 
     def schedule_refresh(self, delay_seconds: float = 10.0) -> None:
@@ -154,48 +166,85 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         # what puts a re-authenticated account back into the rotation.
         return [account for account in self._storage.accounts if not account.reauth_required]
 
-    def get_account(self) -> AccountRuntime | None:
-        accounts = self._fetchable_accounts()
-        if not accounts:
-            return None
+    def _budget_id(self, account: AccountRuntime) -> str:
+        """The id an account is known by in the fetch budget.
 
-        account = accounts[self._cur_acc_index % len(accounts)]
-        self._cur_acc_index += 1
+        From the Apple ID, so that a reloaded, re-authenticated or re-added entry keeps the
+        record of its account. The unique id of an account entry is the lower-cased Apple ID;
+        the entry id is only the last resort, for an account that knows neither.
+        """
+        if account.account_name:
+            return account_budget_id(account.account_name)
+        entry = self.hass.config_entries.async_get_entry(account.entry_id)
+        unique_id = entry.unique_id if entry is not None else None
+        if isinstance(unique_id, str) and unique_id:
+            return account_budget_id(unique_id)
+        return account_budget_id(f"entry:{account.entry_id}")
 
-        return account
+    def _rotation(self) -> dict[str, AccountRuntime]:
+        """The accounts in the rotation by budget id, in the order of the storage."""
+        rotation: dict[str, AccountRuntime] = {}
+        for account in self._fetchable_accounts():
+            # Two entries of one Apple ID share its budget; the first one fetches.
+            _ = rotation.setdefault(self._budget_id(account), account)
+        return rotation
 
     async def reload(self) -> None:
-        """Updates coordinator intervals. Must be called after adding or removing a new account."""
-        self._apply_account_interval()
+        """Plan the next fetch again. Must be called after adding or removing an account."""
+        await self._storage.budget.async_load()
+        self._schedule_next_fetch()
 
-    def _apply_account_interval(self) -> None:
-        # Only accounts in the rotation share the interval. Counting one that is skipped would
-        # fetch the remaining ones more often than once per _MIN_ACCOUNT_UPDATE_DELAY.
-        accounts = self._fetchable_accounts()
-        if not accounts:
-            _LOGGER.debug("Coordinator: disabling updates due to missing account")
+    def _schedule_next_fetch(self) -> None:
+        """Set the interval Home Assistant waits before the next scheduled refresh.
+
+        The next fetch is due when the budget allows one of the accounts in the rotation, but
+        not before 15/n minutes after the latest fetch of any of them (or after now, if none
+        is known): without that spread, n accounts that are due together would fetch one right
+        after the other. Only accounts in the rotation count; counting one that rests would
+        fetch the others too often.
+        """
+        rotation = self._rotation()
+        if not rotation:
+            _LOGGER.debug("No Apple account can fetch; not scheduling any refresh")
             self.update_interval = None
+            # Also a refresh that is already planned: it would find nothing to do (R3).
+            self._async_unsub_refresh()
             return
 
-        cur_interval = self.update_interval.total_seconds() if self.update_interval else None
-        interval = self._MIN_ACCOUNT_UPDATE_DELAY // len(accounts)
-        if cur_interval == interval:
-            return
-
-        _LOGGER.debug(
-            "Coordinator: Updating interval: %i",
-            self._MIN_ACCOUNT_UPDATE_DELAY // len(accounts),
+        budget = self._storage.budget
+        now = _utcnow()
+        due = budget.next_due(rotation, now) or now
+        latest = max(
+            (last for budget_id in rotation if (last := budget.last_fetch(budget_id))),
+            default=now,
         )
-        self.update_interval = timedelta(seconds=self._MIN_ACCOUNT_UPDATE_DELAY // len(accounts))
+        due = max(due, latest + MIN_FETCH_INTERVAL / len(rotation))
+        self.update_interval = max(due - now, _MIN_SCHEDULE_DELAY)
+        _LOGGER.debug("Next scheduled refresh in %s", self.update_interval)
+
+    def get_account_last_fetch(self, account: AccountRuntime) -> datetime | None:
+        """When the account last fetched.
+
+        The end of its latest fetch in this run, or else the start of the latest one before,
+        as the budget remembers it across restarts and reloads.
+        """
+        if account.last_fetch is not None:
+            return account.last_fetch
+        return self._storage.budget.last_fetch(self._budget_id(account))
 
     def get_account_next_fetch(self, account: AccountRuntime) -> datetime | None:
-        """Returns the next time a fetch will be attempted for the given account."""
-        last_fetch = account.last_fetch
-        if last_fetch is None or account.reauth_required:
+        """The earliest time the budget lets the account fetch again.
+
+        None while the account rests until it was re-authenticated, and for an account with no
+        known fetch. Another account that is due as well may still go first.
+        """
+        if account.reauth_required:
             return None
-        # Accounts are fetched round-robin, one per update interval (see reload()),
-        # so the same account is fetched again after _MIN_ACCOUNT_UPDATE_DELAY.
-        return last_fetch + timedelta(seconds=self._MIN_ACCOUNT_UPDATE_DELAY)
+        budget = self._storage.budget
+        budget_id = self._budget_id(account)
+        if budget.last_fetch(budget_id) is None:
+            return None
+        return budget.next_allowed(budget_id, _utcnow())
 
     @property
     def devices(self) -> list[FindMyDevice]:
@@ -293,21 +342,49 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         with credentials Apple already refused, so the account rests until its entry was reloaded.
         """
         account.reauth_required = True
-        self._apply_account_interval()
+        # The schedule follows when the refresh ends (_async_update_data).
         self._start_reauth(account)
 
     @override
     async def _async_update_data(self) -> FindMyLocationData:
-        account = self.get_account()
-        if account is None:
+        budget = self._storage.budget
+        await budget.async_load()
+        try:
+            return await self._async_fetch_with_next_account(budget)
+        finally:
+            # Also after a refresh that raised: Home Assistant plans the next one from this.
+            self._schedule_next_fetch()
+
+    async def _async_fetch_with_next_account(self, budget: FetchBudget) -> FindMyLocationData:
+        """Fetch with the account the budget picks, or keep the data if none may fetch.
+
+        Every refresh comes through here: the scheduled ones, the one after setup, reloads,
+        re-authentication and manual refreshes. That makes this the one place that keeps the
+        15-minute limit of each account.
+        """
+        rotation = self._rotation()
+        if not rotation:
             if self._storage.accounts:
-                # Only reached by a manual refresh: reload() disables the schedule in this state.
+                # Only reached by a manual refresh: no refresh is scheduled in this state.
                 msg = "Every Apple account needs to be re-authenticated"
                 raise UpdateFailed(msg)
             _LOGGER.debug("Skipping data update due to missing accounts")
             return {}
+
+        now = _utcnow()
+        budget_id = budget.pick(rotation, now)
+        if budget_id is None:
+            # Not a failure: the entities keep their data and stay available.
+            _LOGGER.debug(
+                "No Apple account may fetch before %s; keeping the current data",
+                budget.next_due(rotation, now),
+            )
+            return self.data or {}
+        account = rotation[budget_id]
         _LOGGER.debug("Using lookup account: %s", account)
 
+        # Counted from the start, so that a fetch that crashes, hangs or times out counts too.
+        budget.record_fetch(budget_id, now)
         account.fetch_started()
         self._signal_fetch(account)
 
