@@ -77,6 +77,9 @@
             "name": "Advanced options",
             "data": {
               "anisette_url": "Remote Anisette URL (optional)"
+            },
+            "data_description": {
+              "anisette_url": "Filled in with the server this account uses. Clear the field to switch to the integrated Anisette provider."
             }
           }
         }
@@ -93,7 +96,9 @@
       "invalid_anisette_url": "The Anisette URL is invalid or does not point to an Anisette server",
       "invalid_2fa_method": "Please select one of the offered 2FA methods",
       "login_incomplete": "The login did not complete. Please try again",
-      "find_my_token_missing": "Apple did not return the token needed for Find My. This is a known problem since Apple changed its sign-in in October 2026; please check the FindMy.py issue tracker for updates: {issue_tracker_url}"
+      "find_my_token_missing": "Apple did not return the token needed for Find My. This is a known problem since Apple changed its sign-in in October 2026; please check the FindMy.py issue tracker for updates: {issue_tracker_url}",
+      "anisette_libs_unavailable": "The libraries of the integrated Anisette provider could not be downloaded. Please check your network and try again, or use a remote Anisette server",
+      "anisette_libs_changed": "The stored Anisette library bundle does not match the checksum recorded when it was downloaded, so it is not used. To accept a newly downloaded bundle, delete the file {anisette_libs_path} and try again"
     },
     "abort": {
       "unknown_error": "An unexpected error occurred. Please try again later.",
