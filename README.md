@@ -33,8 +33,9 @@ to add additional accounts. These accounts will divide the available time; 2 acc
 7.5 minutes, 3 will update every 5 minutes, etc.
 
 The limit is kept across restarts and reloads. If Home Assistant restarts shortly after a fetch, the first
-fetch waits until 15 minutes have passed since the last one of that account; until then the trackers have
-no location from the Find My network.
+fetch waits until 15 minutes have passed since the last one of that account. Until then the trackers show
+the last location known before the restart, with its original timestamp. That location is kept in
+`.storage/findmy.last_reports` inside your Home Assistant configuration directory.
 
 ## Local Bluetooth tracking
 

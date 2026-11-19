@@ -2,7 +2,8 @@
 
 One :class:`RuntimeStorage` exists per Home Assistant instance. It maps config entries to the
 object each of them stands for (an Apple account or a device), and owns what all entries share:
-the coordinator, the FindMy worker thread and the fetch budget of the accounts (budget.py).
+the coordinator, the FindMy worker thread, the fetch budget of the accounts (budget.py) and the
+latest location report of each device (last_reports.py).
 
 Accounts are stored as :class:`~.account.AccountRuntime`. The library account behind one lives
 on the worker thread and is created and closed there, see account.py.
@@ -25,6 +26,7 @@ from .budget import PersistentFetchBudget
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
+from .last_reports import LastReportStore
 from .worker import FindMyWorker
 
 if TYPE_CHECKING:
@@ -61,6 +63,9 @@ class RuntimeStorage:
         # When each Apple account last fetched, kept across restarts. Loaded in async_setup,
         # and again (a no-op then) by the coordinator before it decides anything.
         self.budget: PersistentFetchBudget = PersistentFetchBudget(hass)
+        # The latest report of each device, kept across restarts so that the entities have a
+        # location before the first fetch. Loaded in async_setup.
+        self.reports: LastReportStore = LastReportStore(hass)
         self._coordinator: FindMyCoordinator = FindMyCoordinator(self._hass, self)
         self._worker: FindMyWorker | None = None
 
@@ -119,6 +124,13 @@ class RuntimeStorage:
 
     def get_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
         return self._entries[entry.entry_id]
+
+    def get_entry_id(self, item: StorageItem) -> str | None:
+        """The id of the config entry an item was stored for, if it still is."""
+        return next(
+            (entry_id for entry_id, stored in self._entries.items() if stored is item),
+            None,
+        )
 
     async def add_entry(self, entry: ConfigEntry) -> StorageItem:
         """Create and store the object a config entry stands for.

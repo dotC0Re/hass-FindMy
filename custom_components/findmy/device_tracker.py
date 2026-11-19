@@ -46,9 +46,8 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-    from findmy import LocationReport
-
     from .config_flow import DeviceEntryData
+    from .last_reports import KnownReport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,7 +96,8 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         self._device: FindMyDevice = device
         self._entry_id: str = entry_id
 
-        self._last_location: LocationReport | None = None
+        # Also before the first fetch of this run: the report restored after a restart.
+        self._last_location: KnownReport | None = (coordinator.data or {}).get(device)
         self._local_observation: LocalObservation | None = None
         self._local_source: str | None = None
         self._local_candidates: CandidateKeyLookup = {}

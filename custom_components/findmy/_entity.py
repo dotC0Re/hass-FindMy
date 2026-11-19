@@ -20,10 +20,9 @@ from .const import DOMAIN
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
-    from findmy import LocationReport
-
     from .account import AccountRuntime
     from .coordinator import FindMyCoordinator, FindMyDevice
+    from .last_reports import KnownReport
 
 
 def device_unique_id(device: FindMyDevice) -> str:
@@ -77,7 +76,7 @@ def build_device_info(device: FindMyDevice) -> DeviceInfo:
 def latest_report(
     coordinator: FindMyCoordinator,
     device: FindMyDevice,
-) -> LocationReport | None:
+) -> KnownReport | None:
     if not coordinator.data:
         return None
     return coordinator.data.get(device)

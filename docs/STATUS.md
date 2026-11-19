@@ -3,7 +3,7 @@
 Where the refactoring stands. The finding IDs (S1, R1, …) come from the
 [code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md).
 
-Last updated: 2026-11-19, after the merge of the fetch budget (`b0f72b1`).
+Last updated: 2026-11-19, after locations became restorable across restarts.
 
 ## Done
 
@@ -29,7 +29,8 @@ Last updated: 2026-11-19, after the merge of the fetch budget (`b0f72b1`).
 | W5 | Dead code removed (see commit `c150e57`). |
 | — | `file_upload` is declared as a dependency (found by hassfest). |
 | — | A malformed nearby advertisement can no longer raise inside the Bluetooth callback. |
-| — | Test suite (388 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
+| — | The latest location of each device is kept in `.storage/findmy.last_reports` (`last_reports.py`) and restored when the device is set up, so trackers and location sensors have a location between a restart and the first fetch the limit allows. Only time, position, accuracy and status byte are stored, no keys. |
+| — | Test suite (422 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
 
@@ -50,7 +51,6 @@ Last updated: 2026-11-19, after the merge of the fetch budget (`b0f72b1`).
 | R18 | The config entry is rewritten on every fetch that moves an alignment. |
 | W1–W4, W6–W10 | Entry type enum, shared entity base classes, Bluetooth manager, documentation, translations. |
 | new | `FindMyDeviceTracker` overrides the deprecated `battery_level` property, which Home Assistant stops supporting in 2027.7. |
-| new | Location data is not restored after a restart. With the stored fetch limit, the trackers have no location until the first allowed fetch, up to 15 minutes after a restart. |
 | new | The account sensors do not show that an account waits for re-authentication. |
 
 ## Not verified

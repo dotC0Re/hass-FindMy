@@ -115,6 +115,8 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     # Before any entry is set up, so that the first refresh already knows when each account
     # last fetched, also before this start of Home Assistant.
     await storage.budget.async_load()
+    # Likewise, so that the entities of a device start with its last known location.
+    await storage.reports.async_load()
     _async_register_services(hass)
 
     return True
@@ -128,6 +130,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) 
     # An account that cannot be restored, or is not signed in, raises ConfigEntryError or
     # ConfigEntryAuthFailed here and stores nothing.
     item = await storage.add_entry(entry)
+
+    if not isinstance(item, AccountRuntime):
+        # Before the entities exist, so that they start with the last known location instead
+        # of none until the first fetch, which the fetch limit may put off by 15 minutes.
+        storage.coordinator.restore_report(item, entry.entry_id)
 
     # only initialize device tracker entities for actual devices
     platforms = ACCOUNT_PLATFORMS if isinstance(item, AccountRuntime) else DEVICE_PLATFORMS
@@ -175,3 +182,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData])
     await storage.coordinator.reload()
 
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) -> None:
+    """Forget what is kept for an entry outside of it: the last location of its device."""
+    if DOMAIN not in hass.data:
+        return
+    RuntimeStorage.get(hass).reports.forget(entry.entry_id)

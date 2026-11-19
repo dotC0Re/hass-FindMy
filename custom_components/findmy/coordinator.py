@@ -50,12 +50,15 @@ if TYPE_CHECKING:
 
     from .account import AccountRuntime, FetchSource
     from .budget import FetchBudget
+    from .last_reports import KnownReport
     from .storage import RuntimeStorage
 
 _LOGGER = logging.getLogger(__name__)
 
 FindMyDevice = KeyPair | FindMyAccessory | FixedRollingKeyPairAccessory
-type FindMyLocationData = dict[FindMyDevice, LocationReport | None]
+# A report is a library object once it was fetched in this run, and plain data while it is the
+# one restored after a restart (last_reports.py). The entities read the same attributes of both.
+type FindMyLocationData = dict[FindMyDevice, KnownReport | None]
 
 # Raised by FindMy.py when a session expired and no password is stored to sign in again. That
 # is the normal end of a session: accounts are restored without their password (account.py).
@@ -245,6 +248,18 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         if budget.last_fetch(budget_id) is None:
             return None
         return budget.next_allowed(budget_id, _utcnow())
+
+    def restore_report(self, device: FindMyDevice, entry_id: str) -> None:
+        """Give a device that is being set up the latest report known from before, if any.
+
+        Must be called before the entities of the device are created: this does not notify
+        listeners. A device that already has a report keeps it.
+        """
+        restored = self._storage.reports.get(entry_id)
+        if restored is None or (self.data or {}).get(device) is not None:
+            return
+        _LOGGER.debug("Restoring the last known location of %s", device)
+        self.data = {**(self.data or {}), device: restored}
 
     @property
     def devices(self) -> list[FindMyDevice]:
@@ -459,6 +474,12 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
             known = fetched.get(device)
             if known is None or report.timestamp >= known.timestamp:
                 fetched[device] = report
+
+        # Kept across restarts, see last_reports.py.
+        for device, report in fetched.items():
+            entry_id = self._storage.get_entry_id(device)
+            if entry_id is not None:
+                self._storage.reports.remember(entry_id, report)
 
         data: FindMyLocationData = (self.data or {}).copy()
         data.update(fetched)
