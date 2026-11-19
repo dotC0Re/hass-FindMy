@@ -197,6 +197,10 @@ class RuntimeStorage:
         item = self._entries.pop(entry.entry_id)
 
         if isinstance(item, AccountRuntime):
+            # A fetch with the account holds the worker for up to two minutes, and the close
+            # would queue behind it. Removed from the entries first, so that no new refresh
+            # picks the account in the meantime.
+            await self._coordinator.async_cancel_fetch(item)
             await item.async_close()
 
         return item

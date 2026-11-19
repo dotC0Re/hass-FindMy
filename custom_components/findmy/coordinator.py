@@ -17,6 +17,7 @@ lead to is applied here afterwards; key_cache.py explains the model and why it w
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, final, override
@@ -59,6 +60,8 @@ FindMyDevice = KeyPair | FindMyAccessory | FixedRollingKeyPairAccessory
 # A report is a library object once it was fetched in this run, and plain data while it is the
 # one restored after a restart (last_reports.py). The entities read the same attributes of both.
 type FindMyLocationData = dict[FindMyDevice, KnownReport | None]
+# What a fetch searched, each source mapped to its device, and what it found.
+type _FetchResult = tuple[dict[FetchSource, FindMyDevice], dict[FetchSource, LocationReport | None]]
 
 # Raised by FindMy.py when a session expired and no password is stored to sign in again. That
 # is the normal end of a session: accounts are restored without their password (account.py).
@@ -148,6 +151,9 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         self._storage = storage
 
         self._refresh_handle: TimerHandle | None = None
+        # The fetch of the refresh that is running, and the account it uses; see
+        # async_cancel_fetch.
+        self._running_fetch: tuple[AccountRuntime, asyncio.Task[_FetchResult]] | None = None
 
     def schedule_refresh(self, delay_seconds: float = 10.0) -> None:
         """Schedule a refresh after a quiet period."""
@@ -347,6 +353,37 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 assert isinstance(source, FindMyAccessory)
                 _apply_copy_alignment(source, device)
 
+    async def async_cancel_fetch(self, account: AccountRuntime) -> None:
+        """Cancel the fetch that is running with an account, and wait until it has ended.
+
+        For an account entry that is unloaded. Its account is closed on the worker, and that
+        job would otherwise wait behind the fetch for up to its time limit. A fetch with any
+        other account is left alone: it goes on to the end, and the close waits for it. That
+        wait is bounded by the time limit and usually takes seconds, while cancelling the
+        fetch would throw away its reports and, once it reached Apple, still cost that
+        account its next 15 minutes. A reload of the entry would wait for that fetch anyway,
+        to open its new account on the worker.
+
+        Nothing of a cancelled fetch is taken over: no report, no alignment (its job may still
+        be unwinding on the worker), no move of a catch-up cursor. It counts against the
+        budget only if its job had started, see _async_fetch.
+        """
+        running = self._running_fetch
+        if running is None or running[0] is not account:
+            return
+        fetch = running[1]
+        _LOGGER.debug("Cancelling the fetch with %s, whose entry is unloaded", account)
+        _ = fetch.cancel()
+        # The refresh it belongs to handles the cancellation; this only waits for its end.
+        _ = await asyncio.wait({fetch})
+
+    async def _async_prepare_and_fetch(
+        self, account: AccountRuntime, budget_id: str, devices: list[FindMyDevice]
+    ) -> _FetchResult:
+        """Prepare the sources of a fetch and run it; the part async_cancel_fetch cancels."""
+        sources = await self._async_fetch_sources(devices)
+        return sources, await self._async_fetch(account, budget_id, sources)
+
     async def _async_fetch(
         self,
         account: AccountRuntime,
@@ -460,11 +497,27 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         devices: list[FindMyDevice] = self.devices
         _LOGGER.debug("Fetching reports for devices: %s", devices)
         success = False
+        # A task of its own, so that unloading the account can cancel the fetch without
+        # cancelling whoever runs this refresh (see async_cancel_fetch). Created inside the try
+        # block, so that a failure still ends the fetch started above.
+        fetch: asyncio.Task[_FetchResult] | None = None
         try:
-            # Inside the try block, so that a failure still ends the fetch started above.
-            sources = await self._async_fetch_sources(devices)
-            device_reports = await self._async_fetch(account, budget_id, sources)
+            fetch = asyncio.create_task(
+                self._async_prepare_and_fetch(account, budget_id, devices),
+                name="findmy location fetch",
+            )
+            self._running_fetch = (account, fetch)
+            sources, device_reports = await fetch
             success = True
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is None or task.cancelling() or fetch is None or not fetch.cancelled():
+                # This refresh itself was cancelled; the fetch went with it.
+                raise
+            # Cancelled by async_cancel_fetch. Not a failure of the coordinator: the other
+            # devices keep their data, and the next fetch uses another account.
+            _LOGGER.debug("The fetch with %s was cancelled", account)
+            return self.data or {}
         except WorkerNotRunningError as err:
             # Home Assistant is stopping; the worker has cancelled the fetch.
             msg = "Fetching location reports was interrupted by the shutdown"
@@ -494,6 +547,8 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
             msg = "Apple account needs to be re-authenticated"
             raise UpdateFailed(msg) from err
         finally:
+            if self._running_fetch is not None and self._running_fetch[1] is fetch:
+                self._running_fetch = None
             account.fetch_finished(success=success)
             self._signal_fetch(account)
             # A fetch may have renewed the session even if it failed afterwards (R5).

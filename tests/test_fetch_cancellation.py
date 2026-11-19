@@ -1,0 +1,273 @@
+"""Entries that are unloaded or reloaded while a fetch runs (G2, G5).
+
+Unloading an account entry closes its account on the worker, and worker jobs run one after the
+other: without cancelling it first, the close waited behind a fetch with that account for up to
+two minutes. A device entry reloaded during a fetch has a new device object by the time the
+fetch ends, and its report has to reach that one.
+
+The entity platforms are mocked and every account is a mock on the worker thread, as in
+test_fetch_budget_paths.py; nothing here talks to Apple.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, final
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from homeassistant.config_entries import ConfigEntry
+
+from custom_components.findmy import async_setup, async_setup_entry, async_unload_entry
+from custom_components.findmy.account import AccountRuntime, FetchStatus
+from custom_components.findmy.budget import account_budget_id
+from custom_components.findmy.key_cache import CachedFindMyAccessory, SearchWindow
+from custom_components.findmy.storage import RuntimeStorage
+
+from .conftest import FetchClock, make_account_state, make_config_entry, make_mock_account
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+# The library accounts opened for account entries, by Apple ID, oldest first.
+type Apple = dict[str, list[MagicMock]]
+
+JANE = "jane@example.com"
+
+
+@pytest.fixture
+def platforms(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Stands in for the entity platforms."""
+    calls = MagicMock()
+    calls.setup = AsyncMock(return_value=None)
+    calls.unload = AsyncMock(return_value=True)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", calls.setup)
+    monkeypatch.setattr(hass.config_entries, "async_unload_platforms", calls.unload)
+    monkeypatch.setattr(ConfigEntry, "async_start_reauth", MagicMock())
+    return calls
+
+
+@pytest.fixture
+def apple(monkeypatch: pytest.MonkeyPatch) -> Apple:
+    """A new library account mock for every setup of an account entry."""
+    opened: Apple = {}
+
+    async def async_load(worker: Any, entry_id: str, account_data: Any) -> AccountRuntime:
+        email = account_data["account"]["username"]
+        mock = make_mock_account(email=email, reports={})
+        opened.setdefault(email, []).append(mock)
+        return await AccountRuntime._async_open(worker, entry_id, lambda: mock, account_data)
+
+    monkeypatch.setattr(AccountRuntime, "async_load", async_load)
+    return opened
+
+
+@final
+class Gate:
+    """Holds a fake fetch on the worker thread until the test lets it go.
+
+    ``started`` is set on the test's loop once the fetch runs; ``cancelled`` once the worker
+    cancelled it.
+    """
+
+    def __init__(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.started = asyncio.Event()
+        self.release = threading.Event()
+        self.cancelled = threading.Event()
+        self.sources: list[object] = []
+
+    async def fetch(self, sources: list[object]) -> dict[object, None]:
+        self.sources = list(sources)
+        self.loop.call_soon_threadsafe(self.started.set)
+        try:
+            _ = await asyncio.to_thread(self.release.wait, 10)
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return dict.fromkeys(sources)
+
+
+async def start(hass: HomeAssistant) -> RuntimeStorage:
+    assert await async_setup(hass, {}) is True
+    return RuntimeStorage.get(hass)
+
+
+def account_entry(hass: HomeAssistant, email: str = JANE) -> ConfigEntry:
+    data = {"type": "account", "account_data": make_account_state(email=email)}
+    return make_config_entry(hass, data)
+
+
+def fetches(apple: Apple, email: str = JANE) -> int:
+    return sum(mock.fetch_location.await_count for mock in apple.get(email, []))
+
+
+def budget_record(storage: RuntimeStorage, email: str = JANE) -> datetime | None:
+    return storage.budget.last_fetch(account_budget_id(email))
+
+
+def unlocated_accessory() -> CachedFindMyAccessory:
+    """A cached accessory with a gap below its top window, so that a catch-up is planned."""
+    now = datetime.now(tz=UTC)
+    accessory = CachedFindMyAccessory.from_json(
+        {
+            "type": "accessory",
+            "master_key": bytes(range(1, 29)).hex(),
+            "skn": bytes(range(32)).hex(),
+            "sks": bytes(range(32, 64)).hex(),
+            "paired_at": (now - timedelta(days=40)).isoformat(),
+            "name": "Unlocated tag",
+            "model": None,
+            "identifier": "unlocated",
+            "group_identifier": None,
+            "serial_number": None,
+            "alignment_date": (now - timedelta(days=10)).isoformat(),
+            "alignment_index": 30 * 96,
+        }
+    )
+    assert isinstance(accessory, CachedFindMyAccessory)
+    return accessory
+
+
+async def test_unloading_an_account_cancels_its_fetch_instead_of_waiting(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    entry = account_entry(hass)
+    assert await async_setup_entry(hass, entry) is True
+    account = storage.get_entry(entry)
+    assert isinstance(account, AccountRuntime)
+    accessory = unlocated_accessory()
+    alignment = accessory.alignment
+    coordinator.async_add_listener(lambda: None, accessory)
+    gate = Gate()
+
+    async def fetch_and_realign(sources: list[object]) -> dict[object, None]:
+        # The reports found so far realign the window; the fetch then hangs.
+        for source in sources:
+            if isinstance(source, SearchWindow):
+                source.update_alignment(datetime.now(tz=UTC), source.highest)
+        return await gate.fetch(sources)
+
+    library = apple[JANE][0]
+    library.fetch_location.side_effect = fetch_and_realign
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    await asyncio.wait_for(gate.started.wait(), 10)
+    cursor = accessory._catch_up_cursor
+
+    # Well below the two minutes of the fetch limit.
+    assert await asyncio.wait_for(async_unload_entry(hass, entry), 5) is True
+    await asyncio.wait_for(refresh, 5)
+
+    assert await asyncio.to_thread(gate.cancelled.wait, 5)
+    # The thread the fake fetch waited in cannot be cancelled; let it end.
+    gate.release.set()
+    library.close.assert_awaited_once()
+    # Not a failure of the coordinator: the other devices keep their data.
+    assert coordinator.last_update_success is True
+    assert account.last_fetch_result is FetchStatus.ERROR
+    # The job had started, so it may have reached Apple and counts.
+    assert budget_record(storage) == fetch_clock.now
+    # Nothing of the cancelled fetch was taken over.
+    assert accessory.alignment == alignment
+    assert accessory._catch_up_cursor == cursor
+    assert coordinator._running_fetch is None
+
+
+async def test_reloading_an_account_during_its_fetch_keeps_its_limit(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    entry = account_entry(hass)
+    assert await async_setup_entry(hass, entry) is True
+    gate = Gate()
+    apple[JANE][0].fetch_location.side_effect = gate.fetch
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    await asyncio.wait_for(gate.started.wait(), 10)
+
+    assert await asyncio.wait_for(async_unload_entry(hass, entry), 5) is True
+    assert await asyncio.wait_for(async_setup_entry(hass, entry), 5) is True
+    await refresh
+    gate.release.set()
+
+    fetch_clock.advance(timedelta(minutes=10))
+    await coordinator.async_refresh()
+    assert fetches(apple) == 1
+    fetch_clock.advance(timedelta(minutes=5))
+    await coordinator.async_refresh()
+    assert fetches(apple) == 2
+    renewed = storage.get_entry(entry)
+    assert isinstance(renewed, AccountRuntime)
+    assert renewed.last_fetch_result is FetchStatus.SUCCESS
+
+
+async def test_fetch_cancelled_while_its_keys_are_derived_does_not_count(
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing was handed to the worker yet, let alone sent to Apple."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    entry = account_entry(hass)
+    assert await async_setup_entry(hass, entry) is True
+    accessory = unlocated_accessory()
+    coordinator.async_add_listener(lambda: None, accessory)
+    deriving = threading.Event()
+    release = threading.Event()
+    original = CachedFindMyAccessory.search_window
+
+    def slow_search_window(self: CachedFindMyAccessory, now: datetime) -> SearchWindow:
+        deriving.set()
+        _ = release.wait(10)
+        return original(self, now)
+
+    monkeypatch.setattr(CachedFindMyAccessory, "search_window", slow_search_window)
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    assert await asyncio.to_thread(deriving.wait, 5)
+
+    assert await asyncio.wait_for(async_unload_entry(hass, entry), 5) is True
+    await asyncio.wait_for(refresh, 5)
+    release.set()
+    await hass.async_block_till_done()
+
+    assert fetches(apple) == 0
+    assert budget_record(storage) is None
+    assert coordinator.last_update_success is True
+
+
+async def test_unloading_another_account_lets_the_running_fetch_finish(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    """The fetch of one account is not thrown away because another one is unloaded."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    fetching = account_entry(hass, "a@example.com")
+    unloaded = account_entry(hass, "b@example.com")
+    assert await async_setup_entry(hass, fetching) is True
+    assert await async_setup_entry(hass, unloaded) is True
+    gate = Gate()
+    apple["a@example.com"][0].fetch_location.side_effect = gate.fetch
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    await asyncio.wait_for(gate.started.wait(), 10)
+
+    unload = asyncio.create_task(async_unload_entry(hass, unloaded))
+    await asyncio.sleep(0.1)
+    # The close of the unloaded account waits for its turn on the worker.
+    assert not unload.done()
+    gate.release.set()
+    assert await asyncio.wait_for(unload, 5) is True
+    await refresh
+
+    assert not gate.cancelled.is_set()
+    assert coordinator.last_update_success is True
+    account = storage.get_entry(fetching)
+    assert isinstance(account, AccountRuntime)
+    assert account.last_fetch_result is FetchStatus.SUCCESS
+    apple["b@example.com"][0].close.assert_awaited_once()
