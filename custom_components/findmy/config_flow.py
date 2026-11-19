@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import logging
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
@@ -13,7 +15,7 @@ import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components.file_upload import process_uploaded_file
-from homeassistant.core import callback
+from homeassistant.core import HassJob, callback
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers.selector import (
     FileSelector,  # pyright: ignore[reportUnknownVariableType]
@@ -46,6 +48,7 @@ from findmy import (
     UnhandledProtocolError,
 )
 
+from .account import without_password
 from .const import (
     CONF_AWAY_TIMEOUT,
     CONFIG_FLOW_VERSION_MAJOR,
@@ -53,17 +56,41 @@ from .const import (
     DEFAULT_AWAY_TIMEOUT_MINUTES,
     DOMAIN,
 )
+from .worker import FindMyWorker, WorkerNotRunningError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping
     from pathlib import Path
     from typing import Any
 
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
 type AsyncSecondFactorMethod = AsyncSmsSecondFactor | AsyncTrustedDeviceSecondFactor
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sign-in, 2FA and the local Anisette emulation (CPU emulation, SRP, plist parsing) do
+# seconds of synchronous work inside FindMy's coroutines. Each account flow therefore
+# runs the library on a thread of its own (finding R20). The shared worker of the
+# integration cannot be used: it does not exist before the first entry is set up.
+_WORKER_NAME = "findmy-login"
+# Limits on the run time of one job on that thread. A synchronous stretch cannot be
+# interrupted, so a job ends at the next await after its limit.
+# The first sign-in with the local Anisette emulation also downloads and provisions it.
+_LOGIN_TIMEOUT = 120.0
+# Requesting or submitting a code; submitting also finishes the sign-in.
+_2FA_TIMEOUT = 60.0
+# Reading or serialising the session, closing its HTTP sessions.
+_LOCAL_TIMEOUT = 30.0
+# Stopping runs the account's close on the worker, itself limited to 10 s by the worker.
+_WORKER_STOP_TIMEOUT = 15.0
+
+# The token FindMy needs to fetch location reports. Since Apple changed its sign-in in
+# October 2026, sign-ins are reported to end without it (FindMy.py issue #278). The
+# handling below follows those reports and the library source only; it could not be
+# verified against Apple.
+_FIND_MY_TOKEN = "searchPartyToken"  # noqa: S105 - the name of a field, not a secret
+_ISSUE_TRACKER_URL = "https://github.com/malmeloo/FindMy.py/issues"
 
 # Flow input that must never reach a log: the account password, the private key
 # of a static tag (it grants location access forever, since static keys never
@@ -110,13 +137,51 @@ _FLOW_ERRORS = (
     aiohttp.ClientError,
     TimeoutError,
     json.JSONDecodeError,
+    # The flow's worker stopped, e.g. because Home Assistant is shutting down.
+    WorkerNotRunningError,
 )
+
+
+def _is_missing_find_my_token(err: BaseException) -> bool:
+    """Whether FindMy failed because Apple's answer lacks the Find My token.
+
+    Only this one key: any other ``KeyError`` is a bug and keeps its traceback.
+    """
+    return isinstance(err, KeyError) and err.args == (_FIND_MY_TOKEN,)
+
+
+def _is_flow_error(err: BaseException) -> bool:
+    """Whether a failure is one the user can fix or retry, see ``_error_key``."""
+    return isinstance(err, _FLOW_ERRORS) or _is_missing_find_my_token(err)
+
+
+def _has_find_my_token(account_data: Mapping[str, object]) -> bool:
+    """Whether a serialised session carries the token needed to fetch reports.
+
+    Follows the lookup in ``fetch_raw_reports`` of FindMy 0.10.2, which reads the
+    token only when fetching. Without this check the flow would create an entry that
+    fails on every refresh.
+    """
+    node: object = account_data
+    for key in ("login", "data", "mobileme_data", "tokens", _FIND_MY_TOKEN):
+        node = _get_key(node, key)
+    return bool(node)
+
+
+def _get_key(node: object, key: str) -> object:
+    return cast("dict[str, object]", node).get(key) if isinstance(node, dict) else None
 
 
 def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) -> str:
     """Map an expected FindMy failure to a form error key and log it."""
     if isinstance(err, InvalidCredentialsError):
         return "invalid_auth"
+    if _is_missing_find_my_token(err):
+        _LOGGER.warning("Apple did not return the Find My token during %s", action)
+        return "find_my_token_missing"
+    if isinstance(err, WorkerNotRunningError):
+        _LOGGER.warning("Sign-in was stopped during %s: %s", action, err)
+        return "login_incomplete"
     if isinstance(err, aiohttp.InvalidURL) or (
         remote_anisette and isinstance(err, json.JSONDecodeError)
     ):
@@ -262,6 +327,102 @@ type EntryData = EntryDataAccount | DeviceEntryData
 
 
 @final
+class _LoginSession:
+    """The FindMy objects of one account flow.
+
+    Every method runs on the flow's worker only, inside a job or as its stop
+    callback, so the account, its HTTP sessions and the Anisette provider are
+    created and used on the worker's event loop. Results are plain data.
+    """
+
+    def __init__(self) -> None:
+        self._account: AsyncAppleAccount | None = None
+        self._methods: list[AsyncSecondFactorMethod] = []
+
+    def _require_account(self) -> AsyncAppleAccount:
+        if self._account is None:
+            msg = "the config flow has no open account"
+            raise RuntimeError(msg)
+        return self._account
+
+    async def async_login(
+        self,
+        email: str,
+        password: str,
+        anisette_url: str | None,
+    ) -> LoginState:
+        # Each attempt needs a fresh account; closing the previous one first keeps
+        # every wrong password from leaking a client session.
+        await self.async_close()
+        if anisette_url is None:
+            anisette = LocalAnisetteProvider()
+        else:
+            anisette = RemoteAnisetteProvider(anisette_url)
+        self._account = AsyncAppleAccount(anisette=anisette)
+        # FindMy's login-state decorator hides the return type from the type checker.
+        _ = cast("LoginState", await self._account.login(email, password))
+        return self._account.login_state
+
+    async def async_login_state(self) -> LoginState:
+        if self._account is None:
+            return LoginState.LOGGED_OUT
+        return self._account.login_state
+
+    async def async_get_2fa_methods(self) -> list[str]:
+        """Remember the usable 2FA methods and return their labels, in order."""
+        methods = cast(
+            "list[AsyncSecondFactorMethod]",
+            await self._require_account().get_2fa_methods(),
+        )
+        self._methods = []
+        labels: list[str] = []
+        for method in methods:
+            if isinstance(method, TrustedDeviceSecondFactorMethod):
+                labels.append("Trusted Device")
+            elif isinstance(method, SmsSecondFactorMethod):  # pyright: ignore[reportUnnecessaryIsInstance]
+                labels.append(f"SMS - {method.phone_number}")
+            else:
+                _LOGGER.warning("Unknown 2FA method: %s", type(method).__name__)
+                continue
+            self._methods.append(method)
+        return labels
+
+    async def async_request_2fa(self, index: int) -> None:
+        await self._methods[index].request()
+
+    async def async_submit_2fa(self, index: int, code: str) -> LoginState:
+        _ = await self._methods[index].submit(code)
+        return self._require_account().login_state
+
+    async def async_serialise(self) -> tuple[AccountStateMapping, str | None]:
+        """Return the session to store, without the password, and the account name."""
+        account = self._require_account()
+        # Config entries are plain text and part of every backup, so the password
+        # is never stored (finding S1); an expired session means re-authentication.
+        # The copy keeps the account's own dicts from crossing the thread boundary.
+        data = copy.deepcopy(without_password(account.to_json()))
+        return data, cast("str | None", account.account_name)
+
+    async def async_close(self) -> None:
+        account, self._account = self._account, None
+        self._methods = []
+        if account is not None:
+            await account.close()
+
+
+async def _async_stop_worker(worker: FindMyWorker | None) -> None:
+    """Stop a flow's worker without letting a stuck close hold up the caller."""
+    if worker is None:
+        return
+    try:
+        async with asyncio.timeout(_WORKER_STOP_TIMEOUT):
+            await worker.async_stop()
+    except TimeoutError:
+        # The worker keeps stopping in the background; its thread is a daemon.
+        _LOGGER.warning("The sign-in thread did not stop within %s s", _WORKER_STOP_TIMEOUT)
+
+
+@final
 class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for initial setup."""
 
@@ -288,38 +449,144 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize."""
         super().__init__(*args, **kwargs)
 
-        self._account: AsyncAppleAccount | None = None
-        self._2fa_method: AsyncSecondFactorMethod | None = None
+        # The sign-in thread and the FindMy objects on it, created on the first
+        # sign-in attempt and stopped when the flow ends.
+        self._worker: FindMyWorker | None = None
+        self._session: _LoginSession | None = None
+        self._remove_shutdown_job: CALLBACK_TYPE | None = None
+        # Set once Home Assistant removed the flow; no worker may be started after it.
+        self._removed = False
 
-        self._2fa_methods: list[AsyncSecondFactorMethod] = []
+        # Plain data copied out of the session's jobs. Home Assistant's side never
+        # touches a FindMy object.
+        self._login_state: LoginState | None = None
+        self._2fa_labels: list[str] = []
+        self._2fa_method_index: int | None = None
         # Kept so the method selection can be shown again after a failed request.
         self._2fa_schema: vol.Schema | None = None
 
     def _log_step(self, step: str, user_input: Mapping[str, object] | None) -> None:
         _LOGGER.debug("%s Step: %s - %s", self.__class__.__name__, step, _redact(user_input))
 
-    async def _async_close_account(self) -> None:
-        """Close the HTTP sessions of the flow's account and forget it.
+    ##########################
+    ### Sign-in worker     ###
+    ##########################
 
-        Every login attempt creates a new account, so the previous one must be
-        closed first; otherwise each wrong password leaks a client session.
-        """
-        account, self._account = self._account, None
-        self._2fa_method = None
-        self._2fa_methods = []
-        if account is not None:
-            await account.close()
+    def _reset_login(self) -> None:
+        self._login_state = None
+        self._2fa_labels = []
+        self._2fa_method_index = None
+        self._2fa_schema = None
+
+    async def _async_ensure_worker(self) -> tuple[FindMyWorker, _LoginSession]:
+        """Return the flow's running worker, starting one on first use."""
+        if self._worker is not None and self._session is not None:
+            if self._worker.is_running:
+                return self._worker, self._session
+            # It stopped without the flow asking, so its account is gone too.
+            await self._async_stop_worker()
+        if self._removed or self.hass.is_stopping:
+            # A thread started now would outlive the flow or Home Assistant.
+            msg = "the config flow has ended"
+            raise WorkerNotRunningError(msg)
+
+        worker = FindMyWorker(_WORKER_NAME)
+        session = _LoginSession()
+        worker.start()
+        # Closing the account on the worker's stop covers every way the flow ends,
+        # including cancellation while a job runs.
+        _ = worker.add_stop_callback(session.async_close)
+        self._worker, self._session = worker, session
+        # Flows are not removed when Home Assistant stops; without this the thread
+        # and its HTTP sessions would live until the process exits.
+        self._remove_shutdown_job = self.hass.async_add_shutdown_job(
+            HassJob(self._async_shutdown, "findmy config flow sign-in shutdown"),
+        )
+        return worker, session
+
+    def _detach_worker(self) -> FindMyWorker | None:
+        """Forget the worker and the session state that lived on it."""
+        worker, self._worker = self._worker, None
+        self._session = None
+        self._reset_login()
+        remove, self._remove_shutdown_job = self._remove_shutdown_job, None
+        if remove is not None:
+            remove()
+        return worker
+
+    async def _async_stop_worker(self) -> None:
+        """Stop the worker; its stop callback closes the account."""
+        await _async_stop_worker(self._detach_worker())
+
+    async def _async_shutdown(self) -> None:
+        # Home Assistant iterates over its shutdown jobs while starting them, so this
+        # job must not unregister itself.
+        self._remove_shutdown_job = None
+        await self._async_stop_worker()
 
     @callback
     @override
     def async_remove(self) -> None:
-        """Close an account left open when the flow ends, e.g. cancelled during 2FA."""
-        account, self._account = self._account, None
-        if account is not None:
+        """Stop the sign-in thread when the flow ends, e.g. cancelled during 2FA.
+
+        A sync callback: the stop is only requested here and awaited in a task, so
+        the event loop is never blocked.
+        """
+        self._removed = True
+        worker = self._detach_worker()
+        if worker is not None:
             _ = self.hass.async_create_task(
-                account.close(),
-                "findmy config flow account cleanup",
+                _async_stop_worker(worker),
+                "findmy config flow sign-in cleanup",
             )
+
+    async def _async_run[T](
+        self,
+        job: Callable[[_LoginSession], Awaitable[T]],
+        timeout: float,  # noqa: ASYNC109
+    ) -> T:
+        """Run ``job(session)`` on the flow's worker and return its plain result."""
+        worker, session = await self._async_ensure_worker()
+        try:
+            return await worker.run(lambda: job(session), timeout=timeout)
+        except Exception as err:
+            if isinstance(err, WorkerNotRunningError) or not _is_flow_error(err):
+                # The session is gone, or a bug left it in an unknown state: drop it
+                # instead of keeping a half-used account open.
+                await self._async_stop_worker()
+            raise
+
+    async def _async_close_account(self) -> None:
+        """Close the flow's account but keep the worker for another attempt."""
+        self._reset_login()
+        if self._worker is None or not self._worker.is_running:
+            # Nothing open: a stopped worker closed its account on the way out.
+            return
+        try:
+            await self._async_run(lambda session: session.async_close(), _LOCAL_TIMEOUT)
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
+            # The worker's stop callback retries when the flow ends.
+            _LOGGER.debug("Could not close the account of the flow: %r", err)
+
+    async def _async_current_login_state(self) -> LoginState:
+        """Read the login state after a failed step; LOGGED_OUT if it is lost."""
+        if self._worker is None or not self._worker.is_running:
+            return LoginState.LOGGED_OUT
+        try:
+            return await self._async_run(
+                lambda session: session.async_login_state(),
+                _LOCAL_TIMEOUT,
+            )
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
+            return LoginState.LOGGED_OUT
+
+    async def _async_abort(self, reason: str) -> config_entries.ConfigFlowResult:
+        await self._async_stop_worker()
+        return self.async_abort(reason=reason)
 
     @override
     async def async_step_user(
@@ -346,10 +613,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         self._log_step("start_acc", user_input)
 
-        return self.async_show_form(
-            step_id="acc_login",
-            data_schema=DATA_SCHEMA_ACC_LOGIN,
-        )
+        return self._show_login_form()
 
     def _reauth_email(self) -> str:
         return self._get_reauth_entry().unique_id or ""
@@ -359,11 +623,14 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Show the login form of this flow, which differs for re-authentication."""
+        # Used by the text of the find_my_token_missing error.
+        placeholders = {"issue_tracker_url": _ISSUE_TRACKER_URL}
         if self.source != config_entries.SOURCE_REAUTH:
             return self.async_show_form(
                 step_id="acc_login",
                 data_schema=DATA_SCHEMA_ACC_LOGIN,
                 errors=errors,
+                description_placeholders=placeholders,
             )
 
         # The unique_id is the account email, so the address can be pre-filled
@@ -376,7 +643,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {"email": email},
             ),
             errors=errors,
-            description_placeholders={"account": email},
+            description_placeholders={**placeholders, "account": email},
         )
 
     async def _async_restart_login(self, error: str) -> config_entries.ConfigFlowResult:
@@ -399,22 +666,22 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if anisette_url is not None and not _is_valid_anisette_url(anisette_url):
             return self._show_login_form({"base": "invalid_anisette_url"})
 
-        await self._async_close_account()
-        if anisette_url is None:
-            anisette = LocalAnisetteProvider()
-        else:
-            anisette = RemoteAnisetteProvider(anisette_url)
-        self._account = AsyncAppleAccount(anisette=anisette)
-
+        email, password = info["email"], info["password"]
+        self._reset_login()
         try:
-            await self._account.login(info["email"], info["password"])
-        except _FLOW_ERRORS as err:
+            self._login_state = await self._async_run(
+                lambda session: session.async_login(email, password, anisette_url),
+                _LOGIN_TIMEOUT,
+            )
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
             error = _error_key(err, "login", remote_anisette=anisette_url is not None)
             return await self._async_restart_login(error)
 
-        _LOGGER.debug("State after login: %s", self._account.login_state)
+        _LOGGER.debug("State after login: %s", self._login_state)
 
-        if self._account.login_state == LoginState.REQUIRE_2FA:
+        if self._login_state == LoginState.REQUIRE_2FA:
             return await self.async_step_acc_2fa_prompt()
         return await self.async_step_acc_done()
 
@@ -439,43 +706,29 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         self._log_step("acc_2fa_prompt", info)
 
-        if self._account is None or self._account.login_state != LoginState.REQUIRE_2FA:
+        if self._login_state != LoginState.REQUIRE_2FA:
             _LOGGER.error("2FA step called but account configured incorrectly")
-            return self.async_abort(reason="unknown_error")
+            return await self._async_abort("unknown_error")
 
         try:
-            self._2fa_methods = cast(
-                "list[AsyncSecondFactorMethod]",
-                await self._account.get_2fa_methods(),
+            labels = await self._async_run(
+                lambda session: session.async_get_2fa_methods(),
+                _2FA_TIMEOUT,
             )
-        except _FLOW_ERRORS as err:
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
             # The account cannot be reused for another login attempt, so the user
             # starts over from the login form.
             return await self._async_restart_login(_error_key(err, "2FA method lookup"))
 
-        menu_options: list[SelectOptionDict] = []
-        for i, method in enumerate(self._2fa_methods):
-            if isinstance(method, TrustedDeviceSecondFactorMethod):
-                menu_options.append(
-                    {
-                        "label": "Trusted Device",
-                        "value": str(i),
-                    },
-                )
-            elif isinstance(method, SmsSecondFactorMethod):  # pyright: ignore[reportUnnecessaryIsInstance]
-                menu_options.append(
-                    {
-                        "label": f"SMS - {method.phone_number}",
-                        "value": str(i),
-                    },
-                )
-            else:
-                _LOGGER.warning("Unknown 2FA method: %s", method)
-                continue
-
-        if not menu_options:
+        if not labels:
             return await self._async_restart_login("2fa_unavailable")
 
+        self._2fa_labels = labels
+        menu_options = [
+            SelectOptionDict(label=label, value=str(i)) for i, label in enumerate(labels)
+        ]
         self._2fa_schema = vol.Schema(
             {
                 "method_id": SelectSelector(
@@ -498,7 +751,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if info is None or self._2fa_schema is None:
             _LOGGER.error("2FA requested but no method ID")
-            return self.async_abort(reason="unknown_error")
+            return await self._async_abort("unknown_error")
 
         try:
             method_id = int(cast("int", info["method_id"]))
@@ -506,22 +759,31 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             method_id = -1
         # A range check instead of catching IndexError: negative ids would
         # silently pick a method from the end of the list.
-        if not 0 <= method_id < len(self._2fa_methods):
+        if not 0 <= method_id < len(self._2fa_labels):
             _LOGGER.warning("Unknown 2FA method ID: %s", info.get("method_id"))
             return self.async_show_form(
                 step_id="acc_2fa_request",
                 data_schema=self._2fa_schema,
                 errors={"base": "invalid_2fa_method"},
             )
-        self._2fa_method = self._2fa_methods[method_id]
+        self._2fa_method_index = method_id
 
         try:
-            await self._2fa_method.request()
-        except _FLOW_ERRORS as err:
+            await self._async_run(
+                lambda session: session.async_request_2fa(method_id),
+                _2FA_TIMEOUT,
+            )
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
+            error = _error_key(err, "2FA code request")
+            if isinstance(err, WorkerNotRunningError):
+                # The account went with the worker; only a fresh login can continue.
+                return await self._async_restart_login(error)
             return self.async_show_form(
                 step_id="acc_2fa_request",
                 data_schema=self._2fa_schema,
-                errors={"base": _error_key(err, "2FA code request")},
+                errors={"base": error},
             )
 
         return self.async_show_form(
@@ -544,22 +806,32 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors={"base": "2fa_invalid"},
             )
 
-        if self._account is None or self._2fa_method is None:
+        method_id = self._2fa_method_index
+        if self._login_state != LoginState.REQUIRE_2FA or method_id is None:
             _LOGGER.error("No active 2FA method in the flow")
-            return self.async_abort(reason="unknown_error")
+            return await self._async_abort("unknown_error")
 
+        error: str | None = None
         try:
-            _ = await self._2fa_method.submit(code)
-        except UnhandledProtocolError:
-            # Apple answers a wrong code with an unexpected status code.
-            _LOGGER.warning("2FA code was rejected", exc_info=True)
-            error = "2fa_invalid"
-        except _FLOW_ERRORS as err:
-            error = _error_key(err, "2FA submit")
-        else:
-            error = None
+            state = await self._async_run(
+                lambda session: session.async_submit_2fa(method_id, code),
+                _2FA_TIMEOUT,
+            )
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
+            if isinstance(err, UnhandledProtocolError):
+                # Apple answers a wrong code with an unexpected status code.
+                _LOGGER.warning("2FA code was rejected", exc_info=True)
+                error = "2fa_invalid"
+            else:
+                error = _error_key(err, "2FA submit")
+            if error == "find_my_token_missing":
+                # The code was accepted; a new attempt starts with signing in.
+                return await self._async_restart_login(error)
+            state = await self._async_current_login_state()
+        self._login_state = state
 
-        state = self._account.login_state
         _LOGGER.debug("State after 2FA: %s", state)
         if state == LoginState.LOGGED_IN:
             return await self.async_step_acc_done()
@@ -578,25 +850,34 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         self._log_step("acc_done", info)
 
-        if self._account is None:
+        if self._session is None:
             _LOGGER.error("No account configured")
-            return self.async_abort(reason="unknown_error")
+            return await self._async_abort("unknown_error")
 
-        if self._account.login_state != LoginState.LOGGED_IN:
+        if self._login_state != LoginState.LOGGED_IN:
             # A half logged-in session would be stored and fail on every refresh.
-            _LOGGER.warning("Login ended in state %s", self._account.login_state)
+            _LOGGER.warning("Login ended in state %s", self._login_state)
             return await self._async_restart_login("login_incomplete")
 
         try:
-            data = EntryDataAccount(
-                type="account",
-                account_data=self._account.to_json(),
+            account_data, account_name = await self._async_run(
+                lambda session: session.async_serialise(),
+                _LOCAL_TIMEOUT,
             )
-            title = f"Account: {self._account.account_name}"
-        finally:
-            # The entry restores its own session from the stored data.
-            await self._async_close_account()
+        except Exception as err:
+            if not _is_flow_error(err):
+                raise
+            return await self._async_restart_login(_error_key(err, "saving the session"))
 
+        if not _has_find_my_token(account_data):
+            _LOGGER.warning("Apple did not return the Find My token during sign-in")
+            return await self._async_restart_login("find_my_token_missing")
+
+        # The entry restores its own session from the stored data; stopping the
+        # worker closes the flow's account.
+        await self._async_stop_worker()
+
+        data = EntryDataAccount(type="account", account_data=account_data)
         if self.source == config_entries.SOURCE_REAUTH:
             # Re-authentication: refresh the stored session on the existing
             # entry rather than creating a duplicate account entry.
@@ -606,7 +887,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
         return self.async_create_entry(
-            title=title,
+            title=f"Account: {account_name}",
             data=data,
         )
 

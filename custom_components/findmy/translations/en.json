@@ -67,7 +67,7 @@
       },
       "reauth_confirm": {
         "title": "Re-authenticate Apple Account",
-        "description": "The session for {account} has expired and Apple requires signing in again. Your saved devices are kept.",
+        "description": "The session for {account} has expired and Apple requires signing in again. Your Apple ID password is not stored by design, so it is needed again each time a session expires. Your saved devices are kept.",
         "data": {
           "email": "E-mail address",
           "password": "Password"
@@ -92,7 +92,8 @@
       "protocol_error": "Apple sent an unexpected response. Please try again later; if this persists, please report it",
       "invalid_anisette_url": "The Anisette URL is invalid or does not point to an Anisette server",
       "invalid_2fa_method": "Please select one of the offered 2FA methods",
-      "login_incomplete": "The login did not complete. Please try again"
+      "login_incomplete": "The login did not complete. Please try again",
+      "find_my_token_missing": "Apple did not return the token needed for Find My. This is a known problem since Apple changed its sign-in in October 2026; please check the FindMy.py issue tracker for updates: {issue_tracker_url}"
     },
     "abort": {
       "unknown_error": "An unexpected error occurred. Please try again later.",
