@@ -23,8 +23,6 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from findmy import FindMyAccessory, FixedRollingKeyPairAccessory, KeyPair
 
-from ._entity import battery_percent as _battery_percent
-from ._entity import latest_status as _latest_status
 from .const import DOMAIN, signal_local_observation
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
@@ -89,6 +87,8 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
     _attr_name = None
 
     _attr_should_poll = False
+    # No battery_level: Home Assistant logs a warning for every tracker class that overrides it
+    # and stops supporting it in 2027.7. The battery sensors of the device carry the value.
 
     def __init__(self, coordinator: FindMyCoordinator, device: FindMyDevice, entry_id: str) -> None:
         super().__init__(coordinator, context=device)
@@ -416,16 +416,6 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         if self._last_location is None:
             return None
         return self._last_location.status
-
-    @property
-    @override
-    def battery_level(self) -> int | None:  # pyright: ignore[reportIncompatibleVariableOverride]
-        """Rough battery % decoded from the status byte (0/50/70/90).
-
-        Drives the battery icon on HA's map card.  Companion sensor entities
-        (from the sensor platform) surface the same value plus a text label
-        and an opt-in mV estimate."""
-        return _battery_percent(_latest_status(self.hass, self.coordinator, self._device))
 
     @property
     def mac_address(self) -> str | None:
