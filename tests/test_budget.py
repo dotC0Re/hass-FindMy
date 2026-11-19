@@ -566,7 +566,12 @@ async def test_corrupt_store_starts_empty(hass: HomeAssistant, caplog) -> None:
 
 
 async def test_failure_while_loading_starts_empty(hass: HomeAssistant, caplog) -> None:
-    """Without the issue registry the corrupt-file path itself fails; setup must still go on."""
+    """A corrupt store file must not stop setup, however Home Assistant deals with it.
+
+    Home Assistant moves a corrupt file aside, reports it and loads nothing. Where that itself
+    fails (on Windows the new file name is not a valid one), the budget catches the error and
+    warns. Either way the problem is logged and the budget starts empty.
+    """
     _write_store(hass, "{not json")
 
     budget = PersistentFetchBudget(hass)
@@ -574,7 +579,10 @@ async def test_failure_while_loading_starts_empty(hass: HomeAssistant, caplog) -
         await budget.async_load()
 
     assert budget.as_dict() == {}
-    assert "Could not load the fetch budget" in caplog.text
+    assert any(
+        record.levelno >= logging.WARNING and "findmy.fetch_budget" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("version", [STORAGE_VERSION + 1, STORAGE_VERSION - 1])
