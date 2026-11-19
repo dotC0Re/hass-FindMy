@@ -384,7 +384,9 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 msg = "Every Apple account needs to be re-authenticated"
                 raise UpdateFailed(msg)
             _LOGGER.debug("Skipping data update due to missing accounts")
-            return {}
+            # Not an empty result: the devices keep what is known about them, such as the
+            # locations restored after a restart. Without an account nothing replaces them.
+            return self.data or {}
 
         now = _utcnow()
         budget_id = budget.pick(rotation, now)

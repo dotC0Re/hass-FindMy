@@ -299,6 +299,39 @@ def test_anisette_url_is_logged_without_credentials(url: str, logged: str) -> No
     assert config_flow._url_without_credentials(url) == logged
 
 
+def test_redaction_strips_credentials_from_the_anisette_url() -> None:
+    """The URL arrives inside the advanced options of the login form."""
+    redacted = config_flow._redact(
+        {
+            "email": "jane@example.com",
+            "password": "hunter2",
+            "advanced_options": {"anisette_url": "https://user:s3cret@ani.example/v3"},
+        }
+    )
+
+    assert "s3cret" not in repr(redacted)
+    assert redacted is not None
+    assert redacted["advanced_options"] == {"anisette_url": "https://**REDACTED**@ani.example/v3"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        aiohttp.InvalidURL("https://user:s3cret@ani.example:port/v3"),
+        aiohttp.ClientConnectionError("Cannot connect to https://user:s3cret@ani.example/v3"),
+    ],
+)
+def test_logged_errors_do_not_quote_url_credentials(
+    caplog: pytest.LogCaptureFixture, error: Exception
+) -> None:
+    """aiohttp puts the request URL into its errors, which were logged as they came."""
+    with caplog.at_level(logging.DEBUG):
+        _ = config_flow._error_key(error, "login", remote_anisette=True)
+
+    assert "s3cret" not in caplog.text
+    assert "ani.example" in caplog.text
+
+
 ###########
 ### R6  ###
 ###########

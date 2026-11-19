@@ -8,6 +8,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from urllib.parse import urlsplit
 
@@ -121,6 +122,9 @@ def _redact(user_input: Mapping[str, object] | None) -> dict[str, object] | None
             redacted[key] = _REDACTED
         elif key == "email" and isinstance(value, str):
             redacted[key] = _mask_email(value)
+        elif key == "anisette_url" and isinstance(value, str):
+            # May carry `user:password@`.
+            redacted[key] = _url_without_credentials(value)
         elif isinstance(value, dict):
             # Form sections (e.g. advanced_options) arrive as nested dicts.
             redacted[key] = _redact(cast("dict[str, object]", value))
@@ -187,13 +191,26 @@ def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) ->
     ):
         # During login only the remote Anisette server answers in JSON (Apple
         # uses plist), so a parse error means the URL points at something else.
-        _LOGGER.warning("Anisette server not usable during %s: %r", action, err)
+        _LOGGER.warning("Anisette server not usable during %s: %s", action, _describe(err))
         return "invalid_anisette_url"
     if isinstance(err, aiohttp.ClientError | TimeoutError):
-        _LOGGER.warning("Connection error during %s: %r", action, err)
+        _LOGGER.warning("Connection error during %s: %s", action, _describe(err))
         return "cannot_connect"
     _LOGGER.error("Unexpected response from Apple during %s", action, exc_info=err)
     return "protocol_error"
+
+
+# `scheme://user:password@host` wherever it appears in a text.
+_URL_CREDENTIALS = re.compile(r"(?<=://)[^/@\s'\"]+@")
+
+
+def _describe(err: Exception) -> str:
+    """An error for the log, without the credentials of a URL it may quote.
+
+    aiohttp puts the request URL into the text of its errors, and the URL of a private
+    Anisette server can carry `user:password@`.
+    """
+    return _URL_CREDENTIALS.sub(f"{_REDACTED}@", f"{type(err).__name__}: {err}")
 
 
 def _url_without_credentials(url: str) -> str:

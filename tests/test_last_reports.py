@@ -21,6 +21,7 @@ import pytest
 from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE
 
 from custom_components.findmy import async_remove_entry, async_setup_entry, async_unload_entry
+from custom_components.findmy.const import DOMAIN
 from custom_components.findmy.last_reports import (
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -418,3 +419,49 @@ async def test_tracker_shows_the_restored_location(
     assert tracker.location_accuracy == 35.0
     assert tracker.detected_at == SEEN_AT
     assert tracker.status == 0x40
+
+
+async def test_restored_location_survives_a_refresh_without_any_account(
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: paths.Apple,
+    fetch_clock: FetchClock,
+    keypair_factory: KeyPairFactory,
+) -> None:
+    """With the account disabled, or its setup failed, a refresh has nothing to fetch with.
+
+    It used to answer that with empty data, which wiped the locations restored ten seconds
+    earlier: exactly the setups the restore is for.
+    """
+    _ = await paths.start(hass)
+    account = paths.account_entry(hass)
+    tag = device_entry(hass, keypair_factory)
+    assert await async_setup_entry(hass, account) is True
+    device = await set_up_device(hass, tag)
+    await fetch_once(hass, apple, device, make_report())
+
+    storage = await paths.restart(hass)
+    # Only the device comes back; the account stays away.
+    device = await set_up_device(hass, tag)
+    await paths.run_delayed_refresh(hass, storage.coordinator)
+
+    assert storage.accounts == []
+    assert storage.coordinator.last_update_success is True
+    assert storage.coordinator.data == {device: restored()}
+
+
+async def test_removed_device_is_forgotten_while_the_integration_is_not_loaded(
+    hass: HomeAssistant,
+) -> None:
+    """Home Assistant also calls the hook when no entry of the integration is set up."""
+    write_store(hass, store_file({"tag": restored().as_dict(), "kept": restored().as_dict()}))
+    entry = make_config_entry(hass, {"type": "device_static", "data": {}}, entry_id="tag")
+    assert DOMAIN not in hass.data
+
+    await async_remove_entry(hass, entry)
+    await final_write(hass)
+
+    again = LastReportStore(hass)
+    await again.async_load()
+    assert again.get("tag") is None
+    assert again.get("kept") == restored()

@@ -21,6 +21,7 @@ from ._entity import (
     build_device_info,
     device_unique_id,
     latest_status,
+    report_available,
     status_available,
 )
 from .const import signal_local_observation
@@ -78,7 +79,8 @@ class FindMyBatteryLowBinarySensor(
         self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
         self._cached: bool | None = None
-        self._attr_available: bool = coordinator.last_update_success
+        # Refined when the first update or observation arrives; see status_available.
+        self._attr_available: bool = report_available(coordinator, device)
 
     @override
     async def async_added_to_hass(self) -> None:

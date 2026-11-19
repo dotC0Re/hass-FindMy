@@ -82,6 +82,17 @@ def latest_report(
     return coordinator.data.get(device)
 
 
+def report_available(coordinator: FindMyCoordinator, device: FindMyDevice) -> bool:
+    """Whether entities that show the location report of a device have a source.
+
+    A fetch that failed says something about the Apple account, which the account sensors
+    show. It takes nothing away from what is known about a device: its latest report stays
+    valid, with the time it was made. Only a device nothing is known about goes unavailable
+    while fetches fail.
+    """
+    return coordinator.last_update_success or latest_report(coordinator, device) is not None
+
+
 def status_available(
     hass: HomeAssistant,
     coordinator: FindMyCoordinator,
@@ -89,14 +100,17 @@ def status_available(
 ) -> bool:
     """Whether entities derived from the status byte have a source.
 
-    The status byte arrives with location reports and in local Offline Finding advertisements, so
-    these entities stay available while location fetches fail, once the accessory has been heard.
+    The status byte arrives with location reports and in local Offline Finding advertisements.
+    An accessory that is only heard through DULT advertisements, which carry no status byte,
+    counts as well: it is there, its battery state is just not known yet.
     """
     from .storage import RuntimeStorage  # noqa: PLC0415  # circular import
 
-    if coordinator.last_update_success:
+    if report_available(coordinator, device):
         return True
-    return device_unique_id(device) in RuntimeStorage.get(hass).local_status
+    storage = RuntimeStorage.get(hass)
+    unique_id = device_unique_id(device)
+    return unique_id in storage.local_status or unique_id in storage.local_observations
 
 
 def latest_status(

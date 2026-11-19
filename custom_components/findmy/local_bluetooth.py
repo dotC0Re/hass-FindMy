@@ -15,6 +15,8 @@ from findmy import (
     SeparatedOfflineFindingDevice,
 )
 
+from .key_cache import CachedFindMyAccessory
+
 if TYPE_CHECKING:
     from findmy import FindMyAccessory
 
@@ -67,7 +69,13 @@ def build_candidate_key_lookup(
     accessory: FindMyAccessory,
     observed_at: datetime,
 ) -> dict[bytes, tuple[CandidateKey, ...]]:
-    """Build a lookup keyed by the first six public-key bytes, without the top two bits."""
+    """Build a lookup keyed by the first six public-key bytes, without the top two bits.
+
+    Holds the keys the accessory may use around ``observed_at`` if its index kept pace with the
+    clock. For an accessory whose index fell behind by more than a week (a battery that was
+    empty for a while) it also holds the keys above its last alignment, as far as they have
+    been derived; see ``CachedFindMyAccessory.local_gap_keys``. Meant for an executor thread.
+    """
     candidates: defaultdict[bytes, list[CandidateKey]] = defaultdict(list)
 
     for index, key in accessory.keys_between(
@@ -82,6 +90,13 @@ def build_candidate_key_lookup(
                 can_align=key.key_type == KeyPairType.PRIMARY,
             ),
         )
+
+    if isinstance(accessory, CachedFindMyAccessory):
+        covered_from = accessory.get_min_index(observed_at - KEY_WINDOW_PAST)
+        for index, adv_key, primary in accessory.local_gap_keys(covered_from):
+            candidates[_lookup_prefix(adv_key)].append(
+                CandidateKey(index=index, adv_key=adv_key, can_align=primary),
+            )
 
     return {partial_key: tuple(keys) for partial_key, keys in candidates.items()}
 

@@ -32,6 +32,7 @@ from ._entity import (
     device_unique_id,
     latest_report,
     latest_status,
+    report_available,
     status_available,
     status_counter,
 )
@@ -118,7 +119,8 @@ class _FindMyDeviceBaseSensor[T](
         self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
         self._cached_value: T | None = None
-        self._attr_available: bool = coordinator.last_update_success
+        # Refined when the first update or observation arrives; see _compute_available.
+        self._attr_available: bool = report_available(coordinator, device)
 
     @override
     async def async_added_to_hass(self) -> None:
@@ -148,9 +150,11 @@ class _FindMyDeviceBaseSensor[T](
             self.async_write_ha_state()
 
     def _compute_available(self) -> bool:
+        # Not the success of the latest fetch: that is shown by the account sensors, and a
+        # failed fetch leaves what is known about the device as it was.
         if self._from_status:
             return status_available(self.hass, self._coordinator, self._device)
-        return self._coordinator.last_update_success
+        return report_available(self._coordinator, self._device)
 
     @cached_property
     @override

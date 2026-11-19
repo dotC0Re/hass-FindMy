@@ -22,8 +22,14 @@ been fixed so far, and what is still open, is listed in [docs/STATUS.md](docs/ST
 ## Your Apple ID password is not stored
 
 The integration keeps the session of your Apple account, not its password. When Apple ends the
-session, Home Assistant asks you to sign in again (re-authentication). Entries created by older
-versions are cleaned automatically on the next start.
+session, Home Assistant asks you to sign in again with password and 2FA code (re-authentication);
+there is no silent sign-in in the background. Entries created by older versions are cleaned
+automatically on the next start, disabled ones included. The session tokens themselves are still
+stored in the config entry, and are part of every backup.
+
+Going back to the original integration: restore a backup made before the switch. Without one the
+entries load there, but an account without a stored password fails for good once its session
+expires and has to be removed and added again.
 
 ## Increasing the update frequency
 
@@ -36,6 +42,10 @@ The limit is kept across restarts and reloads. If Home Assistant restarts shortl
 fetch waits until 15 minutes have passed since the last one of that account. Until then the trackers show
 the last location known before the restart, with its original timestamp. That location is kept in
 `.storage/findmy.last_reports` inside your Home Assistant configuration directory.
+
+A fetch that fails (Apple not reachable, a session that expired) shows in the sensors of the account.
+Trackers and sensors of a device stay available as long as anything is known about it. Calling
+`homeassistant.update_entity` on an entity of this integration does not fetch from Apple.
 
 ## Local Bluetooth tracking
 
@@ -50,6 +60,10 @@ The device tracker exposes the confirmed current address in `mac_address` and ad
 - `local_state` (`nearby` or `separated`)
 - `local_battery` (`Full`, `Medium`, `Low`, or `Very Low`)
 - `local_key_candidates`
+
+An accessory that was without power for more than a week continues with the key it stopped at, far behind
+the clock. It is recognised again from the keys that follow its last sighting, up to 90 days' worth. These
+are derived in the background over a few local refreshes, so it can take a little while until it shows up.
 
 All key matching happens inside Home Assistant. Local presence tracking therefore continues without an internet
 connection after the rolling-key accessory has been imported, although remote Find My network locations still

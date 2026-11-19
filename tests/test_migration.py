@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
+from homeassistant.config_entries import ConfigEntryDisabler
 
-from custom_components.findmy import async_migrate_entry
+from custom_components.findmy import async_migrate_entry, async_setup
 from custom_components.findmy.const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR
 
 from .conftest import make_account_state, make_config_entry
@@ -115,3 +116,44 @@ async def test_current_and_newer_minor_versions_are_not_migrated(
 
     update.assert_not_called()
     assert entry.minor_version == minor_version
+
+
+async def test_setup_removes_the_password_of_a_disabled_account_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Home Assistant never migrates a disabled entry, so the migration alone left its password.
+
+    A disabled account next to devices that are in use is a common setup: the password stayed
+    in the stored entries, and in every backup, for as long as the account stayed disabled.
+    """
+    stored = make_account_state(password="hunter2")
+    untouched = copy.deepcopy(stored)
+    entry = make_config_entry(
+        hass, {"type": "account", "account_data": stored}, version=2, minor_version=0
+    )
+    # The attribute is write-protected; disabling through the registry would try to unload.
+    object.__setattr__(entry, "disabled_by", ConfigEntryDisabler.USER)
+    device_data = {"type": "device_static", "data": {"private_key": "00"}}
+    device = make_config_entry(hass, copy.deepcopy(device_data))
+
+    assert await async_setup(hass, {}) is True
+
+    assert entry.data == {"type": "account", "account_data": make_account_state(password=None)}
+    assert "hunter2" not in repr(entry.data)
+    # The version is left to the migration, which runs once the entry is enabled.
+    assert (entry.version, entry.minor_version) == (2, 0)
+    assert stored == untouched
+    assert device.data == device_data
+
+
+async def test_setup_does_not_rewrite_account_entries_that_are_clean(
+    hass: HomeAssistant,
+) -> None:
+    stored = make_account_state(password=None)
+    entry = make_config_entry(hass, {"type": "account", "account_data": stored})
+    damaged = make_config_entry(hass, {"type": "account", "account_data": "not a mapping"})
+
+    assert await async_setup(hass, {}) is True
+
+    assert entry.data["account_data"] is stored
+    assert damaged.data == {"type": "account", "account_data": "not a mapping"}

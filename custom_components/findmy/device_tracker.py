@@ -81,7 +81,7 @@ async def async_setup_entry(
 
 
 @final
-class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariable, reportIncompatibleVariableOverride]
+class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariable]
     CoordinatorEntity[FindMyCoordinator],
     TrackerEntity,
 ):
@@ -125,6 +125,21 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
             "device_tracker.findmy_{}",
             self.given_name,
             hass=self.coordinator.hass,
+        )
+
+    @property
+    @override
+    def available(self) -> bool:  # pyright: ignore[reportIncompatibleVariableOverride]
+        """Available while anything is known about the device, whatever the latest fetch did.
+
+        The base class follows the success of the coordinator's latest refresh. A fetch that
+        failed (Apple unreachable, a session that expired) would then take away every tracker,
+        including those that are heard locally and those with a known location.
+        """
+        return (
+            self.coordinator.last_update_success
+            or self._last_location is not None
+            or self._local_observation is not None
         )
 
     @override

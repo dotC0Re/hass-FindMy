@@ -14,6 +14,7 @@ from homeassistant.helpers import config_validation as cv
 
 from .account import AccountRuntime, without_password
 from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR, DOMAIN
+from .last_reports import LastReportStore
 from .services import async_register as _async_register_services
 from .storage import RuntimeStorage
 
@@ -110,7 +111,26 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     return True
 
 
+def _remove_stored_passwords(hass: HomeAssistant) -> None:
+    """Remove the Apple ID password from every account entry, whatever its state or version.
+
+    The migration only reaches entries Home Assistant sets up. A disabled account entry is never
+    migrated, and would keep its password in plain text for as long as it stays disabled. Going
+    by content also cleans an entry that got a password again under another version of the
+    integration. The version of an entry is left to the migration.
+    """
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        data: dict[str, object] = {**entry.data}
+        if data.get("type") != "account":
+            continue
+        stripped = _without_stored_password(data)
+        if stripped is not data:
+            _LOGGER.info("Removing the stored Apple ID password from entry %s", entry.entry_id)
+            _ = hass.config_entries.async_update_entry(entry, data=stripped)
+
+
 async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
+    _remove_stored_passwords(hass)
     storage = RuntimeStorage.attach(hass)
     # Before any entry is set up, so that the first refresh already knows when each account
     # last fetched, also before this start of Home Assistant.
@@ -186,6 +206,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData])
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) -> None:
     """Forget what is kept for an entry outside of it: the last location of its device."""
-    if DOMAIN not in hass.data:
+    if DOMAIN in hass.data:
+        RuntimeStorage.get(hass).reports.forget(entry.entry_id)
         return
-    RuntimeStorage.get(hass).reports.forget(entry.entry_id)
+    # Removed while the integration is not loaded (all its entries disabled, say): the stored
+    # reports still have to forget the device, so open them just for that.
+    reports = LastReportStore(hass)
+    await reports.async_load()
+    reports.forget(entry.entry_id)
