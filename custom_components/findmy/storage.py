@@ -6,17 +6,20 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, cast
 
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+
 from findmy import AsyncAppleAccount, FixedRollingKeyPairAccessory, KeyPair
 
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
+from .worker import FindMyWorker
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import Event, HomeAssistant
 
     from .config_flow import EntryData
     from .local_bluetooth import LocalObservation
@@ -39,6 +42,7 @@ class RuntimeStorage:
 
         self._hass: HomeAssistant = hass
         self._coordinator: FindMyCoordinator = FindMyCoordinator(self._hass, self)
+        self._worker: FindMyWorker | None = None
 
     @classmethod
     def attach(cls, hass: HomeAssistant) -> RuntimeStorage:
@@ -62,6 +66,25 @@ class RuntimeStorage:
     @property
     def coordinator(self) -> FindMyCoordinator:
         return self._coordinator
+
+    @property
+    def worker(self) -> FindMyWorker:
+        """The thread that calls into the FindMy library are meant to run on (see worker.py).
+
+        Started on first use, so that nothing that never signs in or fetches pays for a
+        thread, and stopped together with Home Assistant.
+        """
+        if self._worker is None:
+            worker = FindMyWorker()
+            worker.start()
+
+            async def _async_stop_worker(_event: Event) -> None:
+                await worker.async_stop()
+
+            _ = self._hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_worker)
+            self._worker = worker
+
+        return self._worker
 
     @property
     def accounts(self) -> list[AsyncAppleAccount]:
