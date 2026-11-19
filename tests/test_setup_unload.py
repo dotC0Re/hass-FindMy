@@ -53,12 +53,18 @@ def platforms(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> MagicMock
 
 @pytest.fixture
 def closed(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """The threads on which library accounts were closed, one item per call."""
+    """The threads on which library accounts were closed, one item per account.
+
+    FindMy.py calls ``close`` once more when an account object is garbage collected, on
+    whatever thread that happens. For an account that was closed before, which is every
+    account of this integration, that call does nothing, and it is not counted here.
+    """
     threads: list[int] = []
     original = AsyncAppleAccount.close
 
     async def close(self: AsyncAppleAccount) -> None:
-        threads.append(threading.get_ident())
+        if not self._closed:
+            threads.append(threading.get_ident())
         await original(self)
 
     monkeypatch.setattr(AsyncAppleAccount, "close", close)

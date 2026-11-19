@@ -25,6 +25,11 @@ library account itself is a private attribute that only the job functions in thi
 
 Jobs of all accounts share one worker and run one after another, so a job of this module may
 wait behind a location fetch of another account before it starts.
+
+Every path that drops a library account closes it on the worker first. That matters beyond
+tidiness: FindMy.py closes an account that is garbage collected while still open, on whatever
+event loop is running in the thread that collects it, which could be Home Assistant's. For an
+account that was closed before, that last call does nothing.
 """
 
 from __future__ import annotations
