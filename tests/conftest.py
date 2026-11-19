@@ -45,12 +45,21 @@ from custom_components.findmy.const import (
     DOMAIN,
 )
 
+# Imports nothing of the Bluetooth integration until one of its fixtures is used.
+from .ha_platforms import (
+    FakeBluetooth,
+    LibraryAccounts,
+    VirtualClock,
+    async_prepare_platforms,
+)
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from findmy import AccountStateMapping
 
     from custom_components.findmy.storage import RuntimeStorage
+
 
 type AccountFactory = Callable[..., MagicMock]
 type AccessoryFactory = Callable[..., FindMyAccessory]
@@ -141,6 +150,52 @@ async def hass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncGenerato
     yield instance
 
     await instance.async_stop(force=True)
+
+
+@pytest.fixture
+def virtual_clock(monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
+    """Time that passes only when a test says so, see ``tests/ha_platforms.py``.
+
+    Needs the Bluetooth integration to be importable: the entity modules read the clock.
+    """
+
+    clock = VirtualClock()
+    clock.install(monkeypatch)
+    return clock
+
+
+@pytest.fixture
+def fake_bluetooth(monkeypatch: pytest.MonkeyPatch, virtual_clock: VirtualClock) -> FakeBluetooth:
+    """Home Assistant's Bluetooth API, fed with advertisements by the test."""
+
+    bluetooth = FakeBluetooth(virtual_clock)
+    bluetooth.install(monkeypatch)
+    return bluetooth
+
+
+@pytest.fixture
+def library_accounts(monkeypatch: pytest.MonkeyPatch) -> LibraryAccounts:
+    """Account entries restore to mocks; the mocks by Apple ID."""
+
+    accounts = LibraryAccounts(make_mock_account)
+    accounts.install(monkeypatch)
+    return accounts
+
+
+@pytest.fixture
+async def platform_hass(
+    hass: HomeAssistant,
+    fake_bluetooth: FakeBluetooth,
+    library_accounts: LibraryAccounts,
+) -> HomeAssistant:
+    """The ``hass`` fixture, ready to set entries up through the real entity platforms.
+
+    Register entries with :func:`make_config_entry`, then set them up with
+    ``ha_platforms.async_setup_findmy``. Tests using it need ``requires_bluetooth``.
+    """
+
+    await async_prepare_platforms(hass)
+    return hass
 
 
 def make_account_state(
