@@ -67,7 +67,7 @@
       },
       "reauth_confirm": {
         "title": "Re-authenticate Apple Account",
-        "description": "The session for {account} has expired and Apple requires signing in again. Your saved devices are kept.",
+        "description": "The session for {account} has expired and Apple requires signing in again. Your Apple ID password is not stored by design, so it is needed again each time a session expires. Your saved devices are kept.",
         "data": {
           "email": "E-mail address",
           "password": "Password"
