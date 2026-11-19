@@ -1,8 +1,7 @@
 # Implementation status
 
 Where the refactoring stands. The finding IDs (S1, R1, …) come from the
-[code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md); both are
-written in German and predate the decision to keep repository content in English.
+[code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md).
 
 Last updated: 2026-11-19, commit `c150e57`.
 
