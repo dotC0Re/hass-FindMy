@@ -132,6 +132,9 @@ def _remove_stored_passwords(hass: HomeAssistant) -> None:
 async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     _remove_stored_passwords(hass)
     storage = RuntimeStorage.attach(hass)
+    # The coordinator belongs to no config entry, which is what would otherwise shut it down:
+    # no refresh may start, and none stay planned, once Home Assistant stops.
+    await storage.coordinator.async_register_shutdown()
     # Before any entry is set up, so that the first refresh already knows when each account
     # last fetched, also before this start of Home Assistant.
     await storage.budget.async_load()

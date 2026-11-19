@@ -41,7 +41,7 @@ from ._entity import account_name
 from .budget import MIN_FETCH_INTERVAL, account_budget_id
 from .const import signal_account_fetch
 from .key_cache import CachedFindMyAccessory, CatchUpWindow, SearchWindow
-from .worker import WorkerNotRunningError
+from .worker import WorkerNotRunningError, notify_job_start
 
 if TYPE_CHECKING:
     from asyncio import TimerHandle
@@ -153,6 +153,10 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         """Schedule a refresh after a quiet period."""
         if self._refresh_handle is not None:
             self._refresh_handle.cancel()
+            self._refresh_handle = None
+        if self._shutdown_requested:
+            # An entry set up while Home Assistant stops; it would not refresh anyway.
+            return
 
         def _request_refresh() -> None:
             self._refresh_handle = None
@@ -176,6 +180,19 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         except Exception:
             # The coordinator handles what a fetch raises; whatever gets here is a bug.
             _LOGGER.exception("The delayed refresh of the location reports failed")
+
+    @override
+    async def async_shutdown(self) -> None:
+        """Cancel every planned refresh, including the delayed one, and ignore new ones.
+
+        Home Assistant calls this when it stops (see storage.py). The coordinator belongs to
+        no config entry, so nothing else would: without it, a refresh planned before the stop
+        could still start while Home Assistant shuts down.
+        """
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        await super().async_shutdown()
 
     def _fetchable_accounts(self) -> list[AccountRuntime]:
         """Accounts that take part in the rotation: all but those waiting for a new sign-in."""
@@ -331,11 +348,28 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 _apply_copy_alignment(source, device)
 
     async def _async_fetch(
-        self, account: AccountRuntime, sources: dict[FetchSource, FindMyDevice]
+        self,
+        account: AccountRuntime,
+        budget_id: str,
+        sources: dict[FetchSource, FindMyDevice],
     ) -> dict[FetchSource, LocationReport | None]:
         """Run the fetch on the worker and take over the alignments it found."""
+        budget = self._storage.budget
+
+        def count_fetch() -> None:
+            # The fetch counts against the limit of the account once its job starts on the
+            # worker, whatever happens afterwards: from then on it may have reached Apple, and
+            # a fetch that crashes, hangs or times out must not be repeated at once. A fetch
+            # that never got that far did not leave Home Assistant and does not count: one
+            # cancelled while its keys were derived or while it waited for the worker (Home
+            # Assistant stopping, the account being unloaded), or one the stopped worker
+            # turned away. Counting those would make the account wait up to 15 minutes after
+            # a restart or a reload for a fetch that never happened.
+            budget.record_fetch(budget_id, _utcnow())
+
         try:
-            reports = await account.async_fetch(list(sources), timeout=_FETCH_TIMEOUT)
+            with notify_job_start(count_fetch):
+                reports = await account.async_fetch(list(sources), timeout=_FETCH_TIMEOUT)
         except Exception:
             # The job on the worker is over, so the sources are no longer in use there. What
             # the reports of the accessories searched before the failure showed still holds.
@@ -378,6 +412,11 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
     async def _async_update_data(self) -> FindMyLocationData:
         budget = self._storage.budget
         await budget.async_load()
+        if self.hass.is_stopping:
+            # A refresh that was asked for while Home Assistant stops. Scheduled refreshes
+            # and those after the shutdown of this coordinator never get here.
+            _LOGGER.debug("Home Assistant is stopping; not fetching location reports")
+            return self.data or {}
         try:
             return await self._async_fetch_with_next_account(budget)
         finally:
@@ -414,8 +453,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         account = rotation[budget_id]
         _LOGGER.debug("Using lookup account: %s", account)
 
-        # Counted from the start, so that a fetch that crashes, hangs or times out counts too.
-        budget.record_fetch(budget_id, now)
+        # Counted against the budget once the worker starts the fetch, see _async_fetch.
         account.fetch_started()
         self._signal_fetch(account)
 
@@ -425,7 +463,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         try:
             # Inside the try block, so that a failure still ends the fetch started above.
             sources = await self._async_fetch_sources(devices)
-            device_reports = await self._async_fetch(account, sources)
+            device_reports = await self._async_fetch(account, budget_id, sources)
             success = True
         except WorkerNotRunningError as err:
             # Home Assistant is stopping; the worker has cancelled the fetch.

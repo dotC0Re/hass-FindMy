@@ -18,9 +18,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from findmy import KeyPair, UnauthorizedError
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE
+from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import CoreState
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.findmy import async_setup, async_setup_entry, async_unload_entry
+from custom_components.findmy import coordinator as coordinator_module
 from custom_components.findmy.account import AccountRuntime, FetchStatus
 from custom_components.findmy.budget import account_budget_id
 from custom_components.findmy.const import DOMAIN
@@ -423,3 +426,133 @@ async def test_error_of_the_delayed_refresh_is_logged(  # noqa: PLR0917
     assert record.levelno == logging.ERROR
     assert record.exc_info is not None
     assert record.exc_info[1] is bug
+
+
+def budget_record(storage: RuntimeStorage, email: str = "jane@example.com") -> object:
+    """When the budget last counted a fetch of the Apple ID, or None."""
+    return storage.budget.last_fetch(account_budget_id(email))
+
+
+async def test_no_refresh_starts_once_home_assistant_stops(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    """G1: the delayed refresh, the scheduled one and requested ones all stay away."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    listen(coordinator)
+    assert coordinator._refresh_handle is not None
+    assert coordinator._unsub_refresh is not None
+
+    hass.set_state(CoreState.stopping)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done()
+
+    assert coordinator._refresh_handle is None
+    assert coordinator._unsub_refresh is None
+    await coordinator.async_request_refresh()
+    await coordinator.async_refresh()
+    coordinator.schedule_refresh(0)
+    assert coordinator._refresh_handle is None
+    await asyncio.sleep(0.05)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert fetches(apple) == 0
+    assert budget_record(storage) is None
+
+
+async def test_refresh_requested_while_stopping_does_not_fetch(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    """Before the stop event reaches the coordinator, Home Assistant is already stopping."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    hass.set_state(CoreState.stopping)
+
+    await coordinator.async_refresh()
+
+    assert fetches(apple) == 0
+    assert budget_record(storage) is None
+    assert coordinator.last_update_success is True
+
+
+async def test_fetch_turned_away_by_the_stopped_worker_does_not_count(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    await storage.worker.async_stop()
+
+    await coordinator.async_refresh()
+
+    assert isinstance(coordinator.last_exception, UpdateFailed)
+    assert "shutdown" in str(coordinator.last_exception)
+    assert budget_record(storage) is None
+
+
+async def test_fetch_cancelled_while_it_waits_for_the_worker_does_not_count(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    """The job never started, so nothing was sent to Apple."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    entry = account_entry(hass)
+    assert await async_setup_entry(hass, entry) is True
+    account = storage.get_entry(entry)
+    assert isinstance(account, AccountRuntime)
+    gate = threading.Event()
+
+    async def occupy() -> None:
+        _ = await asyncio.to_thread(gate.wait, 5)
+
+    # Another job holds the worker, as a sign-in or the close of another account would.
+    busy = asyncio.create_task(storage.worker.run(occupy))
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    # Long enough for the refresh to hand its job to the worker.
+    await asyncio.sleep(0.05)
+    assert account.last_fetch_result is FetchStatus.ONGOING
+    _ = refresh.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+    gate.set()
+    await busy
+
+    assert fetches(apple) == 0
+    assert budget_record(storage) is None
+    assert account.last_fetch_result is FetchStatus.ERROR
+
+
+@pytest.mark.parametrize("failure", ["crash", "timeout"])
+async def test_fetch_that_reached_the_worker_counts_however_it_ends(  # noqa: PLR0917
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Its requests may have reached Apple before it failed."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    library = apple["jane@example.com"][0]
+    if failure == "crash":
+        library.fetch_location.side_effect = RuntimeError("bug")
+    else:
+        monkeypatch.setattr(coordinator_module, "_FETCH_TIMEOUT", 0.05)
+
+        async def hang(_sources: object) -> None:
+            await asyncio.sleep(60)
+
+        library.fetch_location.side_effect = hang
+    counted_at = fetch_clock.now
+
+    await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is False
+    assert budget_record(storage) == counted_at
+    fetch_clock.advance(timedelta(minutes=14))
+    await coordinator.async_refresh()
+    assert fetches(apple) == 1

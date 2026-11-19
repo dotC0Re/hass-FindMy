@@ -24,7 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from custom_components.findmy.worker import FindMyWorker, WorkerNotRunningError
+from custom_components.findmy.worker import FindMyWorker, WorkerNotRunningError, notify_job_start
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -499,3 +499,85 @@ async def test_aiohttp_session_lives_on_worker_and_is_closed_on_stop() -> None:
         await worker.async_stop()
 
     assert session.closed
+
+
+async def test_job_start_is_reported_before_the_result(worker: FindMyWorker) -> None:
+    events: list[str] = []
+
+    async def job() -> str:
+        return "done"
+
+    with notify_job_start(lambda: events.append("started")):
+        result = await worker.run(job)
+    events.append(result)
+
+    assert events == ["started", "done"]
+
+
+async def test_job_start_is_reported_for_a_job_that_fails(worker: FindMyWorker) -> None:
+    started = asyncio.Event()
+
+    async def job() -> None:
+        msg = "failed"
+        raise ValueError(msg)
+
+    with notify_job_start(started.set), pytest.raises(ValueError, match="failed"):
+        await worker.run(job)
+
+    assert started.is_set()
+
+
+async def test_job_cancelled_in_the_queue_is_never_reported_as_started(
+    worker: FindMyWorker,
+) -> None:
+    gate = threading.Event()
+    reported: list[None] = []
+
+    async def occupy() -> None:
+        await _wait_for(gate)
+
+    async def queued() -> None:
+        pytest.fail("the cancelled job ran")
+
+    busy = asyncio.create_task(worker.run(occupy))
+    with notify_job_start(lambda: reported.append(None)):
+        waiting = asyncio.create_task(worker.run(queued))
+    await asyncio.sleep(0.05)
+    _ = waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    gate.set()
+    await busy
+    # Give a stray report the time to arrive.
+    await asyncio.sleep(0.01)
+
+    assert reported == []
+
+
+async def test_job_rejected_by_a_stopped_worker_is_never_reported_as_started() -> None:
+    worker = FindMyWorker()
+    worker.start()
+    await worker.async_stop()
+    reported: list[None] = []
+
+    async def job() -> None:
+        pytest.fail("the job ran")
+
+    with notify_job_start(lambda: reported.append(None)), pytest.raises(WorkerNotRunningError):
+        await worker.run(job)
+
+    assert reported == []
+
+
+async def test_job_start_is_only_reported_inside_the_block(worker: FindMyWorker) -> None:
+    reported: list[None] = []
+
+    async def job() -> None:
+        return None
+
+    with notify_job_start(lambda: reported.append(None)):
+        pass
+    await worker.run(job)
+    await asyncio.sleep(0.01)
+
+    assert reported == []
