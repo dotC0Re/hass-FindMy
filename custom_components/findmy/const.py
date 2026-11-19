@@ -2,8 +2,9 @@
 
 DOMAIN = "findmy"
 
+# Version of the data stored in config entries; async_migrate_entry lists what changed when.
 CONFIG_FLOW_VERSION_MAJOR = 2
-CONFIG_FLOW_VERSION_MINOR = 0
+CONFIG_FLOW_VERSION_MINOR = 1
 
 CONF_AWAY_TIMEOUT = "away_timeout"
 DEFAULT_AWAY_TIMEOUT_MINUTES = 10

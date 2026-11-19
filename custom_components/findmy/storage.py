@@ -1,3 +1,13 @@
+"""What the integration keeps in memory while Home Assistant runs.
+
+One :class:`RuntimeStorage` exists per Home Assistant instance. It maps config entries to the
+object each of them stands for (an Apple account or a device), and owns what all entries share:
+the coordinator and the FindMy worker thread.
+
+Accounts are stored as :class:`~.account.AccountRuntime`. The library account behind one lives
+on the worker thread and is created and closed there, see account.py.
+"""
+
 # pyright: reportImportCycles=false
 
 from __future__ import annotations
@@ -8,8 +18,9 @@ from typing import TYPE_CHECKING, cast
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
-from findmy import AsyncAppleAccount, FixedRollingKeyPairAccessory, KeyPair
+from findmy import FixedRollingKeyPairAccessory, KeyPair
 
+from .account import AccountRuntime
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
@@ -24,9 +35,14 @@ if TYPE_CHECKING:
     from .config_flow import EntryData
     from .local_bluetooth import LocalObservation
 
-type StorageItem = AsyncAppleAccount | FindMyDevice
+type StorageItem = AccountRuntime | FindMyDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+# Stopping cancels the running job and closes every account, each close limited to a few
+# seconds by the worker. A job that cannot be interrupted must not hold up the shutdown of Home
+# Assistant for longer than this; the worker thread is a daemon and ends with the process.
+_WORKER_STOP_TIMEOUT = 30.0
 
 
 class RuntimeStorage:
@@ -69,17 +85,24 @@ class RuntimeStorage:
 
     @property
     def worker(self) -> FindMyWorker:
-        """The thread that calls into the FindMy library are meant to run on (see worker.py).
+        """The thread every call into the FindMy library of a stored account runs on.
 
         Started on first use, so that nothing that never signs in or fetches pays for a
-        thread, and stopped together with Home Assistant.
+        thread, and stopped together with Home Assistant. It is deliberately not stopped when
+        the last entry is unloaded: a worker cannot be restarted, and callers rely on getting
+        a running one for as long as Home Assistant runs.
         """
         if self._worker is None:
             worker = FindMyWorker()
             worker.start()
 
             async def _async_stop_worker(_event: Event) -> None:
-                await worker.async_stop()
+                try:
+                    async with asyncio.timeout(_WORKER_STOP_TIMEOUT):
+                        await worker.async_stop()
+                except TimeoutError:
+                    # The stop goes on in the background, see FindMyWorker.async_stop.
+                    _LOGGER.warning("The FindMy worker thread did not stop in time")
 
             _ = self._hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_worker)
             self._worker = worker
@@ -87,34 +110,31 @@ class RuntimeStorage:
         return self._worker
 
     @property
-    def accounts(self) -> list[AsyncAppleAccount]:
-        return [item for item in self._entries.values() if isinstance(item, AsyncAppleAccount)]
+    def accounts(self) -> list[AccountRuntime]:
+        return [item for item in self._entries.values() if isinstance(item, AccountRuntime)]
 
     def get_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
         return self._entries[entry.entry_id]
 
-    def get_entry_id(self, item: StorageItem) -> str | None:
-        """Get the id of the config entry an item was stored for."""
-        return next(
-            (entry_id for entry_id, stored in self._entries.items() if stored is item),
-            None,
-        )
-
     async def add_entry(self, entry: ConfigEntry) -> StorageItem:
+        """Create and store the object a config entry stands for.
+
+        For an account entry this raises ConfigEntryError or ConfigEntryAuthFailed if the
+        account cannot be used (see AccountRuntime.async_load); nothing is stored then.
+        """
         data = cast("EntryData", entry.data)  # pyright: ignore[reportInvalidCast]
 
         if data["type"] == "account":
-            loop = asyncio.get_running_loop()
-            account = await loop.run_in_executor(
-                None,
-                AsyncAppleAccount.from_json,
-                data["account_data"],
+            # `get`: an entry without account data is damaged like any other, and is reported
+            # the same way instead of with a KeyError from here.
+            account = await AccountRuntime.async_load(
+                self.worker, entry.entry_id, data.get("account_data")
             )
 
             _LOGGER.debug(
-                "Storing entry %s as account: %s",
+                "Storing entry %s as account: (%s)",
                 entry.entry_id,
-                f"({account.account_name})",  # pyright: ignore[reportUnknownMemberType]
+                account.account_name,
             )
 
             self._entries[entry.entry_id] = account
@@ -157,9 +177,10 @@ class RuntimeStorage:
         raise ValueError(msg)
 
     async def del_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
+        """Forget the object of a config entry; an account is closed on the worker."""
         item = self._entries.pop(entry.entry_id)
 
-        if isinstance(item, AsyncAppleAccount):
-            await item.close()
+        if isinstance(item, AccountRuntime):
+            await item.async_close()
 
         return item

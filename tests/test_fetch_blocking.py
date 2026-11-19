@@ -2,15 +2,19 @@
 # pyright: basic
 """Measures how long a location fetch keeps the event loop busy (R20).
 
-Uses FindMy.py's real `LocationReportsFetcher`, so the measured work is the key handling a real
-fetch does. Only the network is replaced: the account answers every request at once with no
-reports, which makes the fetch walk its whole search window.
+Two things are measured. The first is what the key cache saves: the tests use FindMy.py's real
+`LocationReportsFetcher`, so the measured work is the key handling a real fetch does. Only the
+network is replaced: the account answers every request at once with no reports, which makes the
+fetch walk its whole search window. These fetches run on the measuring loop, to show the cost of
+the library call itself. The second is what the worker thread saves: a fetch through the
+coordinator, including one that computes for half a second without a single await.
 
 How it is measured: a task sleeps 10 ms in a loop and notes how late it wakes up. While the
 fetch computes between two awaits nothing else runs, so the lateness is the length of the stall.
 
 Machines differ a lot in speed, so the tests compare a cached accessory with a plain
-`FindMyAccessory` on the same machine instead of checking against fixed milliseconds. Run with
+`FindMyAccessory` on the same machine instead of checking against fixed milliseconds. The one
+exception is the limit for a fetch on the worker thread, which is what was asked for. Run with
 `-s` to see the numbers.
 """
 
@@ -22,12 +26,12 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import findmy.keys
 import pytest
 import pytest_asyncio
-from findmy import AsyncAppleAccount, FindMyAccessory
+from findmy import FindMyAccessory
 from findmy.reports.reports import LocationReportsFetcher
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
@@ -35,17 +39,25 @@ from homeassistant.helpers import frame
 from custom_components.findmy.key_cache import CachedFindMyAccessory
 from custom_components.findmy.storage import RuntimeStorage
 
+from .conftest import library_mock, open_account
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
     from pathlib import Path
 
     from findmy import FindMyAccessoryMapping, RollingKeyPairSource
 
-# The acceptance criterion: a fetch from warm keys stalls the loop at least this much less.
+    from custom_components.findmy.key_cache import SearchWindow
+
+# The acceptance criterion: a fetch from finished keys stalls the loop at least this much less.
 MIN_SPEEDUP = 10
-# With empty caches the keys are derived in a worker thread while the loop keeps running.
+# With empty caches the keys are derived in an executor thread while the loop keeps running.
 COLD_START_MIN_SPEEDUP = 4
 TICK = 0.01
+# How long the fake fetch computes without yielding, like the decryption of many reports.
+CPU_BURN = 0.5
+# The longest pause of the event loop that is acceptable while a fetch computes on the worker.
+MAX_STALL_DURING_WORKER_FETCH = 0.1
 
 
 class FakeAccount:
@@ -142,14 +154,15 @@ def cached_accessory(data: FindMyAccessoryMapping) -> CachedFindMyAccessory:
     return accessory
 
 
-async def warm(accessory: CachedFindMyAccessory) -> float:
-    """Warm the keys the way the coordinator does, in a worker thread; returns the duration."""
+async def cut_window(accessory: CachedFindMyAccessory) -> tuple[SearchWindow, float]:
+    """Cut the window of a fetch the way the coordinator does, in an executor thread.
+
+    Returns the window, which is what FindMy.py searches, and how long deriving its keys took.
+    """
     now = datetime.now(tz=UTC)
     started = time.perf_counter()
-    _ = await asyncio.get_running_loop().run_in_executor(
-        None, accessory.warm_keys, now - timedelta(days=7), now + accessory.interval
-    )
-    return time.perf_counter() - started
+    window = await asyncio.get_running_loop().run_in_executor(None, accessory.search_window, now)
+    return window, time.perf_counter() - started
 
 
 @pytest.mark.asyncio
@@ -162,13 +175,13 @@ async def test_fetch_from_warm_cache_barely_stalls_the_event_loop() -> None:
     # second one shows what every later fetch costs.
     plain_first = await measure_fetch(plain)
     plain_again = await measure_fetch(plain)
-    warm_up = await warm(cached)
-    cached_fetch = await measure_fetch(cached, runs=3)
+    window, derive = await cut_window(cached)
+    cached_fetch = await measure_fetch(window, runs=3)
 
     print()
     print(f"  plain, first fetch      : {plain_first}")
     print(f"  plain, second fetch     : {plain_again}")
-    print(f"  cached, warm-up (thread): total {warm_up * 1000:7.1f} ms")
+    print(f"  cached, window (thread) : total {derive * 1000:7.1f} ms")
     print(f"  cached, fetch           : {cached_fetch}")
 
     assert cached_fetch.requests == plain_again.requests
@@ -178,9 +191,9 @@ async def test_fetch_from_warm_cache_barely_stalls_the_event_loop() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_from_warm_cache_derives_no_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The cause, independent of timing: no elliptic-curve work is left for the event loop."""
+    """The cause, independent of timing: no elliptic-curve work is left for the fetch."""
     cached = cached_accessory(accessory_data(paired_days=400, aligned_hours_ago=1))
-    _ = await warm(cached)
+    window, _ = await cut_window(cached)
     derivations = 0
     original = findmy.keys.ec.derive_private_key
 
@@ -193,7 +206,7 @@ async def test_fetch_from_warm_cache_derives_no_keys(monkeypatch: pytest.MonkeyP
     account = FakeAccount()
     fetcher = LocationReportsFetcher(account)  # pyright: ignore[reportArgumentType]
 
-    reports = await fetcher._fetch_accessory_reports(cached, only_latest=True)
+    reports = await fetcher._fetch_accessory_reports(window, only_latest=True)
 
     assert reports == []
     assert account.requests > 0
@@ -208,12 +221,12 @@ async def test_accessory_without_recent_location_costs_no_more_than_any_other() 
     cached = cached_accessory(data)
 
     plain_fetch = await measure_fetch(plain)
-    warm_up = await warm(cached)
-    cached_fetch = await measure_fetch(cached, runs=3)
+    window, derive = await cut_window(cached)
+    cached_fetch = await measure_fetch(window, runs=3)
 
     print()
     print(f"  plain, 30 days unlocated : {plain_fetch}")
-    print(f"  cached, warm-up (thread) : total {warm_up * 1000:7.1f} ms")
+    print(f"  cached, window (thread)  : total {derive * 1000:7.1f} ms")
     print(f"  cached, 30 days unlocated: {cached_fetch}")
 
     # A week of indices at 290 keys per request.
@@ -270,7 +283,9 @@ async def hass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncGenerato
     # See test_coordinator.py: the frame helper raises for custom integrations on Windows.
     monkeypatch.setattr(frame, "report_usage", lambda *_args, **_kwargs: None)
     instance.config_entries = MagicMock()
+    instance.config_entries.async_get_entry.return_value = None
     yield instance
+    # Also stops the worker thread the storage of a test started.
     await instance.async_stop(force=True)
 
 
@@ -283,12 +298,9 @@ async def measure_cold_refresh(hass: HomeAssistant, accessories: int) -> Measure
         history = await fetcher.fetch_location_history(devices)
         return dict.fromkeys(history)
 
-    account = MagicMock(spec=AsyncAppleAccount)
-    account.account_name = "test@example.com"
-    account.first_name = account.last_name = "Test"
-    account.fetch_location = AsyncMock(side_effect=fetch_location)
     storage = RuntimeStorage(hass)
-    storage._entries["account"] = account
+    account = await open_account(storage, "account")
+    library_mock(account).fetch_location.side_effect = fetch_location
     coordinator = storage.coordinator
     for _ in range(accessories):
         device = cached_accessory(accessory_data(paired_days=400, aligned_hours_ago=1))
@@ -307,9 +319,10 @@ async def test_first_refresh_after_a_restart_keeps_the_event_loop_free(
 ) -> None:
     """The whole path through the coordinator, starting with empty caches.
 
-    Nothing is warm after a restart, so the keys of every accessory have to be derived. That
-    happens in a worker thread. The event loop still feels it, because both threads share the
-    interpreter lock, but in short pauses instead of one long stall. Hence the lower factor.
+    Nothing is derived yet after a restart, so the keys of every accessory have to be. That
+    happens in an executor thread, and the fetch itself on the FindMy worker thread. The event
+    loop still feels both, because all threads share the interpreter lock, but in short pauses
+    instead of one long stall. Hence the lower factor.
     """
     plain = FindMyAccessory.from_json(accessory_data(paired_days=400, aligned_hours_ago=1))
 
@@ -324,3 +337,57 @@ async def test_first_refresh_after_a_restart_keeps_the_event_loop_free(
     assert refresh.requests >= 3
     # Three accessories from cold caches stall the loop far less than one plain accessory.
     assert refresh.longest_stall * COLD_START_MIN_SPEEDUP <= plain_fetch.longest_stall
+
+
+async def burn_cpu(seconds: float) -> None:
+    """Compute without yielding: no await, and nothing that releases the interpreter lock."""
+    end = time.perf_counter() + seconds
+    count = 0
+    while time.perf_counter() < end:
+        count += 1
+
+
+async def measure_burning_refresh(hass: HomeAssistant) -> Measurement:
+    """One coordinator refresh whose fetch computes for CPU_BURN seconds in one piece."""
+
+    async def fetch_location(devices: list[object]) -> object:
+        await burn_cpu(CPU_BURN)
+        return dict.fromkeys(devices)
+
+    storage = RuntimeStorage(hass)
+    account = await open_account(storage, "account")
+    library_mock(account).fetch_location.side_effect = fetch_location
+    coordinator = storage.coordinator
+    await coordinator.reload()
+
+    measured = await measure_stall(coordinator.async_refresh)
+
+    assert coordinator.last_update_success is True
+    library_mock(account).fetch_location.assert_awaited_once()
+    return measured
+
+
+@pytest.mark.asyncio
+async def test_cpu_bound_fetch_does_not_stall_the_event_loop(hass: HomeAssistant) -> None:
+    """R20 stage 2: decrypting reports and emulating Anisette no longer freeze Home Assistant.
+
+    The fetch of the fake account computes for half a second without an await. On the event
+    loop that is half a second in which Home Assistant does nothing else. On the worker thread
+    the loop keeps running: the interpreter hands over between the threads every few
+    milliseconds.
+    """
+    on_the_loop = await measure_stall(lambda: burn_cpu(CPU_BURN))
+    # The best of three: a pause of the whole machine is not a property of the code.
+    refreshes = [await measure_burning_refresh(hass) for _ in range(3)]
+    refresh = min(refreshes, key=lambda measured: measured.longest_stall)
+
+    print()
+    print(f"  computing on the event loop    : {on_the_loop}")
+    for measured in refreshes:
+        print(f"  refresh, computing on the worker: {measured}")
+
+    # The measurement itself works: the same computation on the loop is seen as one stall.
+    assert on_the_loop.longest_stall >= 0.8 * CPU_BURN
+    # The fetch did compute for that long, on another thread.
+    assert refresh.total >= CPU_BURN
+    assert refresh.longest_stall <= MAX_STALL_DURING_WORKER_FETCH

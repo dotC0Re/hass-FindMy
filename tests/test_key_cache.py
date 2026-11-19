@@ -3,13 +3,15 @@
 
 Checks that the cache hands out exactly the keys FindMy.py derives, derives each of them once,
 stays bounded, survives concurrent use, and is shared by the fetch and the Bluetooth matching.
-Keys are random; nothing here talks to Apple.
+Also covers the search windows a fetch gets instead of the accessory, and that the alignment
+stays consistent between threads. Keys are random; nothing here talks to Apple.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -30,6 +32,7 @@ from custom_components.findmy.key_cache import (
     CachedFindMyAccessory,
     CachedKeyPair,
     CatchUpWindow,
+    SearchWindow,
 )
 from custom_components.findmy.local_bluetooth import build_candidate_key_lookup
 from custom_components.findmy.storage import RuntimeStorage
@@ -129,9 +132,11 @@ def test_a_week_of_keys_is_derived_once_per_key(derivations: list[int]) -> None:
     cached, plain = make_pair()
     now = datetime.now(tz=UTC)
 
-    derived = cached.warm_keys(now - timedelta(days=7), now + cached.interval)
+    window = cached.search_window(now)
+    derived = window.highest - window.lowest + 1
 
     assert derived in (WEEK, WEEK + 1)
+    assert len(cached._key_cache) == derived
     # One primary key per index, and two secondary keys per started day in the window.
     assert len(derivations) <= derived + 2 * (derived // 96 + 2)
 
@@ -142,24 +147,146 @@ def test_a_week_of_keys_is_derived_once_per_key(derivations: list[int]) -> None:
     assert len(derivations) == 3 * WEEK
 
 
-def test_warm_keys_only_derives_what_is_new(derivations: list[int]) -> None:
+def test_search_window_only_derives_what_is_new(derivations: list[int]) -> None:
     cached, _ = make_pair()
     now = datetime.now(tz=UTC)
-    assert cached.warm_keys(now - timedelta(days=7), now) > 0
+    first = cached.search_window(now)
+    assert derivations
     derivations.clear()
 
-    assert cached.warm_keys(now - timedelta(days=7), now) == 0
+    again = cached.search_window(now)
     assert derivations == []
+    assert again._keys == first._keys
 
     # A fetch 15 minutes later needs a single new index.
-    assert cached.warm_keys(now - timedelta(days=7), now + cached.interval) == 1
+    later = cached.search_window(now + cached.interval)
+    assert later.highest == first.highest + 1
     assert 1 <= len(derivations) <= 3
 
 
-def test_reading_warm_keys_derives_nothing(derivations: list[int]) -> None:
+def test_search_window_holds_the_range_and_the_keys_findmy_would_search(
+    derivations: list[int],
+) -> None:
+    cached, plain = make_pair()
+    now = datetime.now(tz=UTC)
+    start = now - timedelta(days=7)
+
+    window = cached.search_window(now)
+
+    assert type(window) is SearchWindow
+    assert window.accessory is cached
+    assert (window.lowest, window.highest) == (plain.get_min_index(start), plain.get_max_index(now))
+    # Whatever moment FindMy.py asks about, the bounds are those the window was cut with.
+    assert window.get_min_index(now - timedelta(days=30)) == window.lowest
+    assert window.get_max_index(now + timedelta(days=30)) == window.highest
+    for ind in (window.lowest, (window.lowest + window.highest) // 2, window.highest):
+        assert describe(window.keys_at(ind)) == describe(plain.keys_at(ind))
+    assert window.keys_at(window.lowest - 1) == set()
+    assert window.keys_at(window.highest + 1) == set()
+
+    # Searching it derives nothing, and the caller owns the sets it gets.
+    derivations.clear()
+    for ind in range(window.highest, window.lowest - 1, -1):
+        window.keys_at(ind).clear()
+        assert len(window.keys_at(ind)) == 3
+    assert derivations == []
+
+
+def test_search_window_is_independent_of_the_accessory_it_was_cut_from() -> None:
+    """R20: the worker thread searches the window while the event loop uses the accessory."""
     cached, _ = make_pair()
     now = datetime.now(tz=UTC)
-    _ = cached.warm_keys(now - timedelta(days=7), now)
+    window = cached.search_window(now)
+    bounds = (window.lowest, window.highest)
+    keys = dict(window._keys)
+    before = cached.alignment
+
+    # The fetch finds reports; FindMy.py reports the alignment to what it searched.
+    nothing_found = window.found_alignment
+    assert nothing_found is None
+    window.update_alignment(now - timedelta(minutes=30), window.highest - 2)
+    window.update_alignment(now - timedelta(minutes=10), window.highest - 1)
+    # Older or lower than what is known: ignored, as FindMyAccessory does.
+    window.update_alignment(now - timedelta(minutes=20), window.highest)
+    window.update_alignment(now, window.highest - 3)
+
+    found = window.found_alignment
+    assert found is not None
+    assert found == (now - timedelta(minutes=10), window.highest - 1)
+    assert cached.alignment == before
+
+    # Meanwhile the Bluetooth matching realigns the accessory and the cache moves on.
+    cached.update_alignment(now, window.highest + 40)
+    for ind in range(window.highest + 1000, window.highest + 2000):
+        _ = cached.keys_at(ind)
+
+    assert (window.lowest, window.highest) == bounds
+    assert window._keys == keys
+    assert len(window.keys_at(window.lowest)) == 3
+    # Applied afterwards, the older alignment of the window does not undo the newer one.
+    cached.update_alignment(*found)
+    assert cached.alignment == (now, bounds[1] + 40)
+
+
+def test_report_that_changes_nothing_is_no_found_alignment() -> None:
+    cached, _ = make_pair()
+    now = datetime.now(tz=UTC)
+    window = cached.search_window(now)
+    date, index = cached.alignment
+
+    window.update_alignment(date - timedelta(hours=1), index + 1)
+    window.update_alignment(date + timedelta(hours=1), index - 1)
+    window.update_alignment(date, index)
+
+    assert window.found_alignment is None
+
+
+def test_alignment_is_never_seen_half_updated_from_another_thread() -> None:
+    """Executor threads compute bounds while the event loop realigns the accessory.
+
+    FindMy.py stores date and index one after the other. Read in between, a new date with an old
+    index gives bounds that are too low by exactly what the index moved. Every pair written here
+    yields the same highest index, so any other value is a torn read.
+    """
+    cached, _ = make_pair()
+    date, index = cached.alignment
+    probe = date + timedelta(days=30)
+    expected = cached.get_max_index(probe)
+    stop = threading.Event()
+    seen: set[int] = set()
+    pairs: set[tuple[datetime, int]] = set()
+
+    def read() -> None:
+        while not stop.is_set():
+            seen.add(cached.get_max_index(probe))
+            pairs.add(cached.alignment)
+            _ = cached.to_json()
+
+    readers = [threading.Thread(target=read) for _ in range(4)]
+    switch_interval = sys.getswitchinterval()
+    # Switch threads as often as possible, so that a reader does get in between the two stores.
+    sys.setswitchinterval(1e-6)
+    for reader in readers:
+        reader.start()
+    try:
+        # Forwards along the line on which the index keeps pace with the clock, and not past
+        # the probed moment.
+        for step in range(1, 2000):
+            cached.update_alignment(date + step * cached.interval, index + step)
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join()
+        sys.setswitchinterval(switch_interval)
+
+    assert seen == {expected}
+    assert all((pair[0] - date) // cached.interval == pair[1] - index for pair in pairs)
+
+
+def test_reading_derived_keys_derives_nothing(derivations: list[int]) -> None:
+    cached, _ = make_pair()
+    now = datetime.now(tz=UTC)
+    _ = cached.search_window(now)
     derivations.clear()
 
     top = cached.get_max_index(now)
@@ -295,7 +422,7 @@ def planned_window(accessory: CachedFindMyAccessory, now: datetime) -> CatchUpWi
     """Plan a catch-up and mark it as searched, without spending time on deriving its keys."""
     planned = accessory.plan_catch_up(now)
     assert planned is not None
-    window = CatchUpWindow(accessory, *planned, {})
+    window = CatchUpWindow(accessory, *planned, {}, accessory.alignment)
     accessory.catch_up_searched(window)
     return window
 
@@ -392,7 +519,7 @@ def test_overlap_grows_with_the_pause_between_two_catch_ups() -> None:
 def test_catch_up_window_has_its_own_keys(derivations: list[int]) -> None:
     cached, plain = make_pair(paired_days=60, aligned_hours_ago=30 * 24)
     now = datetime.now(tz=UTC)
-    _ = cached.warm_keys(now - timedelta(days=7), now)
+    _ = cached.search_window(now)
     top_keys = dict(cached._key_cache)
     top_secondary = dict(cached._secondary_cache)
     planned = cached.plan_catch_up(now)
@@ -431,8 +558,14 @@ def test_report_in_a_catch_up_window_closes_the_gap() -> None:
     true_index = cached.get_max_index(now) - 10 * 96
     window = planned_window(cached, now)
 
-    # What FindMy.py does with a report it found under a key of the window.
+    # What FindMy.py does with a report it found under a key of the window, on the worker
+    # thread, and what the coordinator does with the result on the event loop.
     window.update_alignment(now - timedelta(hours=1), true_index)
+    assert cached._alignment_index != true_index
+    found = window.found_alignment
+    assert found is not None
+    assert found == (now - timedelta(hours=1), true_index)
+    cached.update_alignment(*found)
 
     assert cached._alignment_index == true_index
     assert cached.get_min_index(now - timedelta(days=7)) <= true_index <= cached.get_max_index(now)
@@ -452,7 +585,9 @@ def test_bluetooth_candidates_come_from_the_shared_cache(derivations: list[int])
     # The next refresh, and a fetch of the same range, find the keys instead of deriving them.
     derivations.clear()
     assert build_candidate_key_lookup(cached, now) == from_cache
-    _ = cached.warm_keys(now - timedelta(hours=36), now)
+    newest = cached.get_max_index(now)
+    for ind in range(newest, newest - 36 * 4, -1):
+        _ = cached.keys_at(ind)
     assert derivations == []
 
 

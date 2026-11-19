@@ -9,7 +9,7 @@ updates.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from homeassistant.helpers.device_registry import DeviceInfo
 
@@ -20,8 +20,9 @@ from .const import DOMAIN
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
-    from findmy import AsyncAppleAccount, LocationReport
+    from findmy import LocationReport
 
+    from .account import AccountRuntime
     from .coordinator import FindMyCoordinator, FindMyDevice
 
 
@@ -43,17 +44,17 @@ def device_name(device: FindMyDevice) -> str:
     return device.name or "Unknown"
 
 
-def account_name(account: AsyncAppleAccount) -> str:
-    email = cast("str | None", account.account_name) or ""
-    fname = cast("str | None", account.first_name) or ""
-    lname = cast("str | None", account.last_name) or ""
+def account_name(account: AccountRuntime) -> str:
+    email = account.account_name or ""
+    fname = account.first_name or ""
+    lname = account.last_name or ""
 
     return f"Apple: {fname} {lname} <{email}>".strip()
 
 
-def account_unique_id(account: AsyncAppleAccount) -> str:
+def account_unique_id(account: AccountRuntime) -> str:
     """Stable identifier used for the device registry entry for an Apple account."""
-    email = cast("str | None", account.account_name) or ""
+    email = account.account_name or ""
 
     if not email:
         msg = "Account has no email address to derive a unique ID from"
@@ -62,7 +63,7 @@ def account_unique_id(account: AsyncAppleAccount) -> str:
     return email
 
 
-def account_entity_id(account: AsyncAppleAccount) -> str:
+def account_entity_id(account: AccountRuntime) -> str:
     return account_unique_id(account).split("@")[0]
 
 
