@@ -19,12 +19,22 @@ been fixed so far, and what is still open, is listed in [docs/STATUS.md](docs/ST
       might start throwing errors after a while, so private servers are preferred. Google is your friend.
 3. Enjoy!
 
+## Your Apple ID password is not stored
+
+The integration keeps the session of your Apple account, not its password. When Apple ends the
+session, Home Assistant asks you to sign in again (re-authentication). Entries created by older
+versions are cleaned automatically on the next start.
+
 ## Increasing the update frequency
 
 By default, the integration will only use your account to fetch for updates once per 15 minutes. This is to
 reduce the risk of being banned by Apple. If you want to increase the tracker update frequency, it is possible
 to add additional accounts. These accounts will divide the available time; 2 accounts will generate updates every
 7.5 minutes, 3 will update every 5 minutes, etc.
+
+The limit is kept across restarts and reloads. If Home Assistant restarts shortly after a fetch, the first
+fetch waits until 15 minutes have passed since the last one of that account; until then the trackers have
+no location from the Find My network.
 
 ## Local Bluetooth tracking
 
