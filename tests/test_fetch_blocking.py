@@ -401,3 +401,192 @@ async def test_cpu_bound_fetch_does_not_stall_the_event_loop(
     # The fetch did compute for that long, on another thread.
     assert refresh.total >= CPU_BURN
     assert refresh.longest_stall <= MAX_STALL_DURING_WORKER_FETCH
+
+
+# --- Throughput of the event loop while keys are derived (M4) ------------------------------
+#
+# The stall measured above is the wake-up delay of one short sleep. It does not show what the
+# interpreter lock costs a loop that does I/O: every socket call releases the lock, and getting
+# it back next to a thread that computes can take a whole switch interval (5 ms). A loop that
+# serves many short requests then manages a fraction of its usual rate.
+
+# Accessories of the measured refresh, and how long ago they were paired: old enough that
+# deriving the secret chain from index 0 is a large part of the work after a restart.
+THROUGHPUT_ACCESSORIES = 4
+THROUGHPUT_PAIRED_DAYS = 900
+
+
+@dataclass(frozen=True)
+class Throughput:
+    round_trips: int
+    seconds: float
+
+    @property
+    def per_second(self) -> float:
+        return self.round_trips / self.seconds if self.seconds else 0.0
+
+    def __str__(self) -> str:
+        return (
+            f"{self.per_second:9.0f} round trips/s ({self.round_trips} in"
+            f" {self.seconds * 1000:7.1f} ms)"
+        )
+
+
+async def measure_throughput(work: Callable[[], Awaitable[object]]) -> Throughput:
+    """Count the round trips of a local TCP ping-pong on this loop while `work` runs."""
+    stop = asyncio.Event()
+
+    async def echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while data := await reader.read(64):
+            writer.write(data)
+            await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(echo, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    round_trips = 0
+
+    async def ping() -> None:
+        nonlocal round_trips
+        while not stop.is_set():
+            writer.write(b"x")
+            await writer.drain()
+            _ = await reader.readexactly(1)
+            round_trips += 1
+
+    pinger = asyncio.create_task(ping())
+    try:
+        # Warm up the connection, then count only what happens while the work runs.
+        await asyncio.sleep(0.02)
+        round_trips = 0
+        started = time.perf_counter()
+        _ = await work()
+        seconds = time.perf_counter() - started
+        counted = round_trips
+    finally:
+        stop.set()
+        await pinger
+        writer.close()
+        await writer.wait_closed()
+        server.close()
+        await server.wait_closed()
+    return Throughput(counted, seconds)
+
+
+def old_accessory_data() -> FindMyAccessoryMapping:
+    return accessory_data(paired_days=THROUGHPUT_PAIRED_DAYS, aligned_hours_ago=1)
+
+
+async def derive_like_the_library(data: list[FindMyAccessoryMapping]) -> None:
+    """The reference: the same keys, derived by FindMy.py's own code in one executor thread."""
+    now = datetime.now(tz=UTC)
+
+    def derive() -> None:
+        for mapping in data:
+            plain = FindMyAccessory.from_json(mapping)
+            for _ in plain.keys_between(now - timedelta(days=7), now):
+                pass
+
+    await asyncio.get_running_loop().run_in_executor(None, derive)
+
+
+async def cold_refresh(
+    hass: HomeAssistant, clock: FetchClock, accessories: list[CachedFindMyAccessory]
+) -> Callable[[], Awaitable[None]]:
+    """Prepare a coordinator refresh for accessories whose key caches are empty."""
+    raw_account = FakeAccount()
+    fetcher = LocationReportsFetcher(raw_account)  # pyright: ignore[reportArgumentType]
+
+    async def fetch_location(devices: list[FindMyAccessory]) -> object:
+        history = await fetcher.fetch_location_history(devices)
+        return dict.fromkeys(history)
+
+    clock.advance()
+    storage = RuntimeStorage(hass)
+    account = await open_account(storage, "account")
+    library_mock(account).fetch_location.side_effect = fetch_location
+    coordinator = storage.coordinator
+    for accessory in accessories:
+        coordinator.async_add_listener(lambda: None, accessory)
+    await coordinator.reload()
+
+    async def refresh() -> None:
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is True
+
+    return refresh
+
+
+def restarted(accessories: list[CachedFindMyAccessory]) -> list[CachedFindMyAccessory]:
+    """New objects of the accessories, as after a restart that kept their chain checkpoints."""
+    fresh: list[CachedFindMyAccessory] = []
+    for accessory in accessories:
+        again = cached_accessory(accessory.to_json())
+        assert again.restore_chain_checkpoints(accessory.chain_checkpoints())
+        fresh.append(again)
+    return fresh
+
+
+# What the event loop keeps of its throughput while a restart derives keys, at least. Measured
+# values are far higher (see the test); the bounds only catch a return of the lock convoy, which
+# took the loop down to the reference.
+MIN_SHARE_OF_IDLE_THROUGHPUT = 0.05
+MIN_FACTOR_OVER_THE_REFERENCE = 10
+
+
+@pytest.mark.asyncio
+async def test_event_loop_keeps_serving_io_while_a_restart_derives_keys(
+    hass: HomeAssistant, fetch_clock: FetchClock
+) -> None:
+    """The first refresh after a restart, with I/O on the loop the whole time (M4).
+
+    Four accessories paired 900 days ago. The reference derives the same keys with FindMy.py's
+    own code in one thread. Measured on a Ryzen 7 9800X3D under Windows, Python 3.14, best of
+    two runs; the duration is that of the refresh alone, without the ping-pong:
+
+    ========================================  ==============  ========
+    work next to the ping-pong                round trips/s   duration
+    ========================================  ==============  ========
+    none (idle loop)                          about 30,000
+    reference, FindMy.py in a thread          10 to 13        4.0 s
+    refresh before M4                         11              1.7 s
+    refresh, paced, chain from the pairing    about 9,900     3.2 s
+    refresh, paced, chain from checkpoints    about 9,700     2.2 s
+    ========================================  ==============  ========
+
+    Without the pauses, the loop waits for the interpreter lock every time it gave it up for a
+    socket call and serves a dozen round trips per second, which is what the review measured on
+    Linux too (29,000 idle, 12 to 13 next to a computing thread). With them it keeps about a
+    third of its throughput, the share of time the pauses take, and the refresh takes longer.
+    The checkpoints take the walk of the chain off a restart (1.2 s instead of 1.7 s without
+    pauses); what is left is one elliptic-curve derivation per key of the week searched.
+    Run with `-s` for the numbers on this machine.
+    """
+    idle = await measure_throughput(lambda: asyncio.sleep(0.3))
+    references: list[Throughput] = []
+    colds: list[Throughput] = []
+    restarts: list[Throughput] = []
+    for _ in range(2):
+        data = [old_accessory_data() for _ in range(THROUGHPUT_ACCESSORIES)]
+        references.append(await measure_throughput(lambda data=data: derive_like_the_library(data)))
+        accessories = [cached_accessory(mapping) for mapping in data]
+        colds.append(await measure_throughput(await cold_refresh(hass, fetch_clock, accessories)))
+        fresh = restarted(accessories)
+        restarts.append(await measure_throughput(await cold_refresh(hass, fetch_clock, fresh)))
+    reference = max(references, key=lambda measured: measured.per_second)
+    cold = max(colds, key=lambda measured: measured.per_second)
+    restart = max(restarts, key=lambda measured: measured.per_second)
+
+    print()
+    print(f"  idle loop                                   : {idle}")
+    for measured in references:
+        print(f"  reference, FindMy.py derives in a thread    : {measured}")
+    for measured in colds:
+        print(f"  refresh, chain walked from the pairing      : {measured}")
+    for measured in restarts:
+        print(f"  refresh, chain walked from checkpoints      : {measured}")
+
+    for measured in (cold, restart):
+        assert measured.per_second >= MIN_SHARE_OF_IDLE_THROUGHPUT * idle.per_second
+        assert measured.per_second >= MIN_FACTOR_OVER_THE_REFERENCE * reference.per_second

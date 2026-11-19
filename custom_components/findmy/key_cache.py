@@ -11,11 +11,37 @@ stored. For a location fetch it cuts search windows: fixed ranges of indices wit
 It also limits how many key indices are searched per fetch, and plans the catch-up windows that
 make up for that limit (see MAX_SEARCH_INDICES and CatchUpWindow).
 
-Scope: this module only holds keys in memory and decides which indices to look at. It stores
-nothing on disk (keys are derived again after a restart, and a catch-up starts over), talks to
-nobody, and does not decide when to derive or to fetch; the coordinator and the device tracker
-do that. The proper home of the cache is FindMy.py itself (FindMy.py #285). Once the library
-keeps its key pairs, that part of this module can be removed.
+Scope: this module only holds keys in memory and decides which indices to look at. It writes
+nothing to disk itself (keys are derived again after a restart, and a catch-up starts over),
+talks to nobody, and does not decide when to derive or to fetch; the coordinator and the device
+tracker do that. The proper home of the cache is FindMy.py itself (FindMy.py #285). Once the
+library keeps its key pairs, that part of this module can be removed.
+
+The secret chain
+----------------
+FindMy.py derives the secret of key index ``i`` by applying a key derivation function ``i`` times
+to the initial secret of the accessory, and keeps some of these secrets in its key generator so
+that it walks the chain once per run. After a restart it walks it again from index 0: 96 steps
+per day since pairing, close to half a second on a desktop for an accessory paired two and a half
+years ago, several times that on a small server. :meth:`CachedFindMyAccessory.chain_checkpoints`
+hands out a few of those secrets, which key_checkpoints.py keeps across restarts, and
+:meth:`CachedFindMyAccessory.restore_chain_checkpoints` gives them back to a new generator, which
+then walks from there.
+
+FindMy.py has no public way to do either, so both use private attributes of its key generator.
+:func:`_chain_access_works` checks once per run, on a throwaway accessory, that they still mean
+what this module assumes; if not, no checkpoint is read or restored, and the chain is walked
+from 0 as before, only slower. The checkpoints are also tied to the FindMy.py version that made
+them (key_checkpoints.py).
+
+Sharing the interpreter
+-----------------------
+Key derivation is CPU-bound and holds the interpreter lock while it runs. Next to it, the event
+loop gets the lock back only every few milliseconds, each time it gave it up for a socket call:
+a loop that serves many small requests falls to a few dozen per second. Derivation therefore
+runs in short slices and pauses after every few milliseconds of work (``_PACER``), and the chain
+is walked in slices as well. That makes a cold start a little slower and keeps the event loop at
+a fair share of its usual throughput; tests/test_fetch_blocking.py measures both.
 
 Threads
 -------
@@ -43,8 +69,9 @@ loop only, exactly as it was before the worker existed.
 
 What is left to guard, and how:
 
-* The caches and FindMy.py's key generators, used by executor threads and the event loop:
-  ``_DERIVE_LOCK``, held for one index at a time. Finished keys are read without it.
+* The caches and FindMy.py's key generators, used by executor threads: ``_DERIVE_LOCK``, held
+  for one index, or one slice of the secret chain, at a time, and through the pause that may
+  follow. Finished keys are read without it.
 * The alignment, a pair of attributes that FindMy.py writes one after the other. It is written
   on the event loop and read in executor threads, which could see a new date with an old index.
   A per-accessory lock covers the write and every read of the pair; it is held for a few
@@ -54,16 +81,22 @@ What is left to guard, and how:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hashlib
 import logging
 import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, final, override
+from typing import TYPE_CHECKING, cast, final, override
 
 from findmy import FindMyAccessory, KeyPair, RollingKeyPairSource
 
 if TYPE_CHECKING:
     import io
+    from collections.abc import Callable, Generator, Mapping
     from pathlib import Path
 
     from findmy import FindMyAccessoryMapping, KeyPairType
@@ -139,9 +172,153 @@ _MAX_CACHED_SECONDARY_SPANS = MAX_CACHED_INDICES // _SECONDARY_KEY_SPAN + 2
 # Guards every derivation and every change of a cache. FindMy.py's key generators keep state
 # (the chain of secrets) that must not be advanced by two threads at once. One lock for all
 # accessories, because deriving is CPU-bound: several executor threads deriving at the same time,
-# as after a restart with many accessories, would compete with the event loop for the CPU. The
-# lock is held for a single index only, so the event loop waits one derivation at most.
+# as after a restart with many accessories, would compete with the event loop for the CPU, and
+# the pauses of one would be the working time of another. It is held for one index, or one slice
+# of the secret chain (_CHAIN_SLICE), and through the pause that may follow (_PACER). Nothing on
+# the event loop derives keys, so the loop never waits for it.
 _DERIVE_LOCK = threading.Lock()
+
+# Steps of the secret chain walked per slice: about a millisecond on a desktop.
+_CHAIN_SLICE = 256
+
+# Work done under _DERIVE_LOCK before a pause, and the length of the pause, in seconds. The
+# pause hands the interpreter lock to the event loop, which otherwise waits up to a switch
+# interval (5 ms) for it every time it gave it up for a socket call. Measured in
+# tests/test_fetch_blocking.py: a third of the time as pauses keeps the loop at a fair share
+# of its throughput, at the cost of a slower cold start.
+_WORK_SLICE = 0.002
+_PAUSE = 0.001
+
+# Distance between two checkpoints of the secret chain that are kept across restarts, in key
+# indices: a week. Walking from the nearest one below takes a few milliseconds.
+_CHECKPOINT_SPACING = 7 * 96
+
+# Names of the two secret chains of an accessory, and the attribute of FindMy.py's accessory
+# that holds the key generator of each.
+PRIMARY_CHAIN = "primary"
+SECONDARY_CHAIN = "secondary"
+_GENERATOR_ATTRIBUTES = {PRIMARY_CHAIN: "_primary_gen", SECONDARY_CHAIN: "_secondary_gen"}
+_SECRET_LENGTH = 32
+
+type ChainCheckpoints = dict[str, dict[int, bytes]]
+
+
+def _on_event_loop() -> bool:
+    try:
+        _ = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+@final
+class _Pacer:
+    """Pauses derivation after every _WORK_SLICE of work. Used with _DERIVE_LOCK held."""
+
+    def __init__(self) -> None:
+        self._busy = 0.0
+        self._last_end = 0.0
+
+    def account(self, started: float) -> None:
+        """Count a piece of work that began at ``started`` and ends now; pause if it is time."""
+        now = time.perf_counter()
+        if started - self._last_end > _PAUSE:
+            # The lock was free for a while since the last piece; the loop had its turn.
+            self._busy = 0.0
+        self._busy += now - started
+        self._last_end = now
+        # A test, or anything else, that derives on an event loop must not sleep on it.
+        if self._busy < _WORK_SLICE or _on_event_loop():
+            return
+        # Still holding _DERIVE_LOCK, so that no other thread derives in the meantime.
+        _sleep(_PAUSE)
+        self._busy = 0.0
+        self._last_end = time.perf_counter()
+
+
+_PACER = _Pacer()
+# Replaced by tests that count the pauses.
+_sleep = time.sleep
+
+
+@contextmanager
+def _deriving() -> Generator[None]:
+    """Hold _DERIVE_LOCK for one piece of derivation, and pause afterwards if it is time."""
+    with _DERIVE_LOCK:
+        started = time.perf_counter()
+        yield
+        _PACER.account(started)
+
+
+# --- Access to the secret chain of FindMy.py's key generators -------------------------------
+#
+# Private attributes of FindMy.py 0.10.2 (findmy/accessory.py, _AccessoryKeyGenerator): the
+# generator keeps chain secrets by index in the dicts of `_sk_caches`, adds one with
+# `_update_caches(index, secret)` (only at indices its cache tiers keep: multiples of 4), and
+# walks the chain with `_get_sk(index)` from the highest secret it holds below. _SecretChain is
+# the one place that touches them. It is only made for a generator that has all three, and
+# _chain_access_works checks once per run that they still mean this.
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _SecretChain:
+    """The parts of one of FindMy.py's key generators that checkpoints need."""
+
+    walk_to: Callable[[int], object]
+    add: Callable[[int, bytes], object]
+    caches: list[object]
+
+    @classmethod
+    def of(cls, accessory: FindMyAccessory, chain: str) -> _SecretChain | None:
+        """The secret chain of an accessory, or None if FindMy.py keeps it differently."""
+        generator: object = getattr(accessory, _GENERATOR_ATTRIBUTES[chain], None)
+        walk_to: object = getattr(generator, "_get_sk", None)
+        add: object = getattr(generator, "_update_caches", None)
+        caches: object = getattr(generator, "_sk_caches", None)
+        if not callable(walk_to) or not callable(add) or not isinstance(caches, list):
+            return None
+        return cls(
+            walk_to=cast("Callable[[int], object]", walk_to),
+            add=cast("Callable[[int, bytes], object]", add),
+            caches=cast("list[object]", caches),
+        )
+
+    def known(self) -> dict[int, bytes] | None:
+        """Every secret the generator holds, by index; None if it holds them differently."""
+        secrets: dict[int, bytes] = {}
+        for cache in self.caches:
+            if not isinstance(cache, dict):
+                return None
+            for ind, secret in list(cast("dict[object, object]", cache).items()):
+                if not isinstance(ind, int) or not isinstance(secret, bytes):
+                    return None
+                secrets[ind] = secret
+        return secrets
+
+    def seed(self, secrets: Mapping[int, bytes]) -> bool:
+        """Give the generator secrets; False if it did not keep every one of them."""
+        for ind, secret in sorted(secrets.items()):
+            _ = self.add(ind, secret)
+        known = self.known()
+        return known is not None and all(
+            known.get(ind) == secret for ind, secret in secrets.items()
+        )
+
+
+@functools.cache
+def _chain_access_works() -> bool:
+    """Whether checkpoints can be read and restored with this version of FindMy.py.
+
+    Compares, on throwaway accessories with fixed keys, a key derived from a restored checkpoint
+    with the same key derived by FindMy.py from index 0, and checks that a wrong checkpoint does
+    change the result, so that the generator really continues from what it was given.
+    """
+    try:
+        return CachedFindMyAccessory.probe_chain_access()
+    except Exception:
+        _LOGGER.debug("Cannot use FindMy.py's key generator for checkpoints", exc_info=True)
+        return False
 
 
 def _evict_farthest[T](cache: dict[int, T], newest: int, limit: int) -> None:
@@ -274,6 +451,9 @@ class CachedFindMyAccessory(FindMyAccessory):
         self._gap_anchor: int | None = None
         self._gap_primary: dict[int, bytes] = {}
         self._gap_secondary: dict[int, tuple[bytes, bytes]] = {}
+        # Highest index of the primary secret chain known to have been reached, from a restored
+        # checkpoint or a walk; see _walk_primary_chain.
+        self._primary_reach = 0
 
     @property
     def alignment(self) -> tuple[datetime, int]:
@@ -312,13 +492,127 @@ class CachedFindMyAccessory(FindMyAccessory):
         # This is the only path taken once a range was derived.
         keys = self._key_cache.get(ind)
         if keys is None:
-            with _DERIVE_LOCK:
+            self._walk_primary_chain(ind)
+            with _deriving():
                 keys = self._key_cache.get(ind)
                 if keys is None:
                     keys = (self._derive_primary(ind), *self._secondary_keys(ind))
                     self._key_cache[ind] = keys
                     _evict_farthest(self._key_cache, ind, MAX_CACHED_INDICES)
         return keys
+
+    @staticmethod
+    def probe_chain_access() -> bool:
+        """The check behind _chain_access_works; raises whatever a changed FindMy.py raises."""
+
+        def throwaway() -> CachedFindMyAccessory:
+            return CachedFindMyAccessory(
+                master_key=bytes(range(1, 29)),
+                skn=bytes(range(32)),
+                sks=bytes(range(32, 64)),
+                paired_at=datetime(2020, 1, 1, tzinfo=UTC),
+            )
+
+        reference = throwaway()
+        expected = reference._primary_key_at(9).private_key_bytes  # noqa: SLF001
+        chain = _SecretChain.of(reference, PRIMARY_CHAIN)
+        secrets = None if chain is None else chain.known()
+        if not secrets or 8 not in secrets:  # noqa: PLR2004  # FindMy.py keeps every 4th index
+            return False
+
+        restored = throwaway()
+        restored_chain = _SecretChain.of(restored, PRIMARY_CHAIN)
+        if restored_chain is None or not restored_chain.seed({8: secrets[8]}):
+            return False
+        if restored._primary_key_at(9).private_key_bytes != expected:  # noqa: SLF001
+            return False
+
+        wrong = throwaway()
+        wrong_chain = _SecretChain.of(wrong, PRIMARY_CHAIN)
+        if wrong_chain is None or not wrong_chain.seed({8: bytes(_SECRET_LENGTH)}):
+            return False
+        return wrong._primary_key_at(9).private_key_bytes != expected  # noqa: SLF001
+
+    def _walk_primary_chain(self, ind: int) -> None:
+        """Walk the primary secret chain up to an index in slices of _CHAIN_SLICE steps.
+
+        FindMy.py would walk it in one go on the first key it is asked for, holding the
+        interpreter lock for as long as that takes. Without access to its generator (see
+        _chain_access_works) that is what happens.
+        """
+        reach = self._primary_reach
+        if ind - reach <= _CHAIN_SLICE or not _chain_access_works():
+            return
+        chain = _SecretChain.of(self, PRIMARY_CHAIN)
+        if chain is None:
+            return
+        for step in range(reach + _CHAIN_SLICE, ind, _CHAIN_SLICE):
+            with _deriving():
+                _ = chain.walk_to(step)
+        # Several threads may walk at once; each walk is correct, only the record is shared.
+        self._primary_reach = max(self._primary_reach, ind)
+
+    def chain_checkpoints(self) -> ChainCheckpoints:
+        """Secrets of both chains that let a new object of this accessory skip most of them.
+
+        Taken from what FindMy.py's key generators hold: the highest secret at or below the
+        lowest index a fetch or the Bluetooth matching can ask for (a week below the last
+        alignment), and above it one secret per _CHECKPOINT_SPACING indices that were reached.
+        Empty without access to the generators (see _chain_access_works).
+
+        Meant to be run in an executor thread.
+        """
+        if not _chain_access_works():
+            return {}
+        with self._alignment_lock:
+            anchor = self._alignment_index
+        floor = max(0, anchor - MAX_SEARCH_INDICES - 1)
+        # Secondary secrets advance once per _SECONDARY_KEY_SPAN primary indices.
+        floors = {PRIMARY_CHAIN: floor, SECONDARY_CHAIN: floor // _SECONDARY_KEY_SPAN + 1}
+        checkpoints: ChainCheckpoints = {}
+        with _DERIVE_LOCK:
+            for chain, low in floors.items():
+                secret_chain = _SecretChain.of(self, chain)
+                secrets = None if secret_chain is None else secret_chain.known()
+                if not secrets:
+                    continue
+                chosen = {
+                    ind: secret
+                    for ind, secret in secrets.items()
+                    if ind > low and ind % _CHECKPOINT_SPACING == 0
+                }
+                below = max((ind for ind in secrets if 0 < ind <= low), default=None)
+                if below is not None:
+                    chosen[below] = secrets[below]
+                if chosen:
+                    checkpoints[chain] = chosen
+        return checkpoints
+
+    def restore_chain_checkpoints(self, checkpoints: Mapping[str, Mapping[int, bytes]]) -> bool:
+        """Give the key generators secrets that chain_checkpoints of an earlier object returned.
+
+        Must be called before the accessory is used by anything else. Returns whether they were
+        taken; without access to the generators nothing changes and the chain is walked from 0.
+        """
+        if not checkpoints or not _chain_access_works():
+            return False
+        taken = False
+        for chain, secrets in checkpoints.items():
+            secret_chain = _SecretChain.of(self, chain) if chain in _GENERATOR_ATTRIBUTES else None
+            valid = {
+                ind: secret
+                for ind, secret in secrets.items()
+                if ind > 0 and len(secret) == _SECRET_LENGTH
+            }
+            if secret_chain is None or not valid:
+                continue
+            if not secret_chain.seed(valid):
+                _LOGGER.debug("FindMy.py did not keep the checkpoints of %s", self.name)
+                continue
+            taken = True
+            if chain == PRIMARY_CHAIN:
+                self._primary_reach = max(self._primary_reach, *valid)
+        return taken
 
     @override
     def keys_at(self, ind: int) -> set[KeyPair]:
@@ -416,7 +710,8 @@ class CachedFindMyAccessory(FindMyAccessory):
                 if derived >= LOCAL_GAP_STEP:
                     break
                 span = ind // _SECONDARY_KEY_SPAN
-                with _DERIVE_LOCK:
+                self._walk_primary_chain(ind)
+                with _deriving():
                     self._gap_primary[ind] = self._primary_key_at(ind).adv_key_bytes
                     if span not in self._gap_secondary:
                         key_1, key_2 = self._secondary_keys_at(ind)
@@ -497,7 +792,8 @@ class CachedFindMyAccessory(FindMyAccessory):
         keys: dict[int, tuple[CachedKeyPair, ...]] = {}
         secondary: dict[int, tuple[CachedKeyPair, CachedKeyPair]] = {}
         for ind in range(max(lowest, 0), highest + 1):
-            with _DERIVE_LOCK:
+            self._walk_primary_chain(ind)
+            with _deriving():
                 span = ind // _SECONDARY_KEY_SPAN
                 if span not in secondary:
                     secondary[span] = self._derive_secondary(ind)
