@@ -1,4 +1,9 @@
-"""A custom integration for Home Assistant to track your Find My-enabled devices."""
+"""A custom integration for Home Assistant to track your Find My-enabled devices.
+
+Every config entry stands for one Apple account or one device. This module migrates stored
+entries, and sets entries up and unloads them: the object behind an entry is kept in
+:class:`~.storage.RuntimeStorage`, its entities come from the platforms listed below.
+"""
 
 import logging
 from typing import TYPE_CHECKING
@@ -6,10 +11,8 @@ from typing import TYPE_CHECKING
 from homeassistant.const import Platform
 from homeassistant.helpers import config_validation as cv
 
-from findmy import AsyncAppleAccount
-
+from .account import AccountRuntime
 from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR, DOMAIN
-from .coordinator import FindMyDevice
 from .services import async_register as _async_register_services
 from .storage import RuntimeStorage
 
@@ -85,18 +88,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData]) 
 
     storage = RuntimeStorage.get(hass)
 
+    # An account that cannot be restored, or is not signed in, raises ConfigEntryError or
+    # ConfigEntryAuthFailed here and stores nothing.
     item = await storage.add_entry(entry)
 
-    if isinstance(item, AsyncAppleAccount):
-        await hass.config_entries.async_forward_entry_setups(entry, ACCOUNT_PLATFORMS)
-    elif isinstance(item, FindMyDevice):  # pyright: ignore[reportUnnecessaryIsInstance]
-        # only initialize device tracker entities for actual devices
-        await hass.config_entries.async_forward_entry_setups(entry, DEVICE_PLATFORMS)
-    else:
-        _LOGGER.warning(
-            "Could not determine platforms to load for entry %s; no entities will be created",
-            entry.entry_id,
-        )
+    # only initialize device tracker entities for actual devices
+    platforms = ACCOUNT_PLATFORMS if isinstance(item, AccountRuntime) else DEVICE_PLATFORMS
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, platforms)
+    except Exception:
+        # Home Assistant does not unload an entry whose setup failed. Without this, the item
+        # would stay in the storage (an account would keep being fetched, and would never be
+        # closed) although the entry has no entities.
+        _ = await storage.del_entry(entry)
+        raise
 
     await storage.coordinator.reload()
     # All entries share one coordinator. Delay the first refresh so multiple setup calls can
@@ -111,7 +116,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData])
 
     storage = RuntimeStorage.get(hass)
     try:
-        item = await storage.del_entry(entry)
+        item = storage.get_entry(entry)
     except KeyError:
         _LOGGER.warning(
             "Entry %s not found in storage during unload",
@@ -119,19 +124,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[EntryData])
         )
         return False
 
+    # The entities go first, while what they show still exists. If they cannot be unloaded,
+    # the entry stays loaded as a whole.
+    platforms = ACCOUNT_PLATFORMS if isinstance(item, AccountRuntime) else DEVICE_PLATFORMS
+    if not await hass.config_entries.async_unload_platforms(entry, platforms):
+        return False
+
+    # Closes an account on the worker.
+    _ = await storage.del_entry(entry)
+
     # The interval is shared between the accounts. Without this, the accounts that remain after
     # one was removed would keep being fetched more often than once per 15 minutes.
     await storage.coordinator.reload()
-
-    if isinstance(item, AsyncAppleAccount):
-        _ = await hass.config_entries.async_unload_platforms(entry, ACCOUNT_PLATFORMS)
-    elif isinstance(item, FindMyDevice):  # pyright: ignore[reportUnnecessaryIsInstance]
-        _ = await hass.config_entries.async_unload_platforms(entry, DEVICE_PLATFORMS)
-    else:
-        _LOGGER.warning(
-            "Could not determine platforms to unload for entry %s",
-            entry.entry_id,
-        )
-        return False
 
     return True

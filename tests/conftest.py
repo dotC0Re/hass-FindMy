@@ -4,6 +4,10 @@ Provides a minimal ``hass`` instance and factories for FindMy library objects. N
 talks to Apple: accounts are mocks, and accessories and key pairs use random key material so
 that key derivation and matching run for real.
 
+Accounts live on the FindMy worker thread (see account.py). ``open_account`` puts a mocked
+library account there the way a config entry would; the thread is stopped together with the
+``hass`` instance of the test.
+
 pytest-homeassistant-custom-component is deliberately not used; it cannot be loaded on
 Windows (see tests/README.md).
 """
@@ -16,19 +20,31 @@ import sys
 import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from findmy import AsyncAppleAccount, FindMyAccessory, KeyPair, KeyPairType, LoginState
 from homeassistant import core as ha_core
 from homeassistant import loader
-from homeassistant.config_entries import ConfigEntries
+from homeassistant.config_entries import SOURCE_USER, ConfigEntries, ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
 
+from custom_components.findmy.account import AccountRuntime
+from custom_components.findmy.const import (
+    CONFIG_FLOW_VERSION_MAJOR,
+    CONFIG_FLOW_VERSION_MINOR,
+    DOMAIN,
+)
+
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from findmy import AccountStateMapping
+
+    from custom_components.findmy.storage import RuntimeStorage
 
 type AccountFactory = Callable[..., MagicMock]
 type AccessoryFactory = Callable[..., FindMyAccessory]
@@ -95,33 +111,132 @@ async def hass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncGenerato
     await instance.async_stop(force=True)
 
 
-@pytest.fixture
-def mock_account_factory() -> AccountFactory:
-    """Create ``AsyncAppleAccount`` mocks that are logged in and return no reports.
+def make_account_state(
+    *,
+    email: str = "user@example.com",
+    password: str | None = None,
+    first_name: str = "Jane",
+    last_name: str = "Doe",
+    login_state: LoginState = LoginState.LOGGED_IN,
+    token: str = "search-party-token",  # noqa: S107  # dummy value in test data
+) -> AccountStateMapping:
+    """Serialised account state as a config entry stores it; FindMy.py can restore it.
+
+    The Anisette provider is a remote one, which opens no connection until it is used.
+    """
+    return {
+        "type": "account",
+        "ids": {"uid": "uid", "devid": "devid"},
+        "account": {
+            "username": email,
+            "password": password,
+            "info": {
+                "account_name": email,
+                "first_name": first_name,
+                "last_name": last_name,
+                "trusted_device_2fa": False,
+            },
+        },
+        "login": {
+            "state": login_state.value,
+            "data": {"dsid": "1234", "mobileme_data": {"tokens": {"searchPartyToken": token}}},
+        },
+        "anisette": {"type": "aniRemote", "url": "http://anisette.invalid"},
+    }
+
+
+def make_mock_account(
+    *,
+    email: str = "user@example.com",
+    first_name: str | None = "Jane",
+    last_name: str | None = "Doe",
+    login_state: LoginState = LoginState.LOGGED_IN,
+    reports: object = None,
+) -> MagicMock:
+    """An ``AsyncAppleAccount`` mock that is logged in and returns no reports.
 
     The spec makes typos in attribute names fail loudly. Tests set the return values of
-    ``fetch_location`` and friends as needed.
+    ``fetch_location`` and friends as needed; ``reports`` is what both return at first. A real
+    account answers a list of sources with a dict, which is what the coordinator needs.
     """
+    account = MagicMock(spec=AsyncAppleAccount)
+    account.account_name = email
+    account.first_name = first_name
+    account.last_name = last_name
+    account.login_state = login_state
+    account.login = AsyncMock(return_value=login_state)
+    account.fetch_location = AsyncMock(return_value=reports)
+    account.fetch_location_history = AsyncMock(return_value=reports)
+    account.close = AsyncMock(return_value=None)
+    account.to_json.return_value = make_account_state(email=email, login_state=login_state)
+    return account
 
-    def create(
-        *,
-        email: str | None = "user@example.com",
-        first_name: str | None = "Jane",
-        last_name: str | None = "Doe",
-        login_state: LoginState = LoginState.LOGGED_IN,
-    ) -> MagicMock:
-        account = MagicMock(spec=AsyncAppleAccount)
-        account.account_name = email
-        account.first_name = first_name
-        account.last_name = last_name
-        account.login_state = login_state
-        account.login = AsyncMock(return_value=login_state)
-        account.fetch_location = AsyncMock(return_value=None)
-        account.fetch_location_history = AsyncMock(return_value=None)
-        account.close = AsyncMock(return_value=None)
-        return account
 
-    return create
+@pytest.fixture
+def mock_account_factory() -> AccountFactory:
+    """Create ``AsyncAppleAccount`` mocks, see :func:`make_mock_account`."""
+    return make_mock_account
+
+
+async def open_account(
+    storage: RuntimeStorage, entry_id: str, account: MagicMock | None = None
+) -> AccountRuntime:
+    """Store a mocked library account under an entry id, opened on the worker like a real one.
+
+    Returns what Home Assistant's side holds; the mock is reachable as ``._account``.
+    """
+    account = account or make_mock_account(email=f"{entry_id}@example.com", reports={})
+    runtime = await AccountRuntime._async_open(
+        storage.worker,
+        entry_id,
+        lambda: account,
+        # What the entry of this account would hold, see make_config_entry.
+        account.to_json.return_value,
+    )
+    storage._entries[entry_id] = runtime
+    return runtime
+
+
+def library_mock(account: AccountRuntime) -> MagicMock:
+    """The mocked library account behind an account stored with :func:`open_account`."""
+    return cast("MagicMock", account._account)
+
+
+def worker_thread_id(storage: RuntimeStorage) -> int:
+    """The id of the FindMy worker thread, to tell where something ran."""
+    thread = storage.worker._thread
+    assert thread is not None
+    assert thread.ident is not None
+    return thread.ident
+
+
+def make_config_entry(
+    hass: HomeAssistant,
+    data: dict[str, Any],
+    *,
+    version: int = CONFIG_FLOW_VERSION_MAJOR,
+    minor_version: int = CONFIG_FLOW_VERSION_MINOR,
+    entry_id: str | None = None,
+) -> ConfigEntry:
+    """Register a config entry of the integration without setting it up.
+
+    Needs the ``hass`` fixture of this module, whose config entry registry is a real one.
+    """
+    entry = ConfigEntry(
+        data=data,
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id=entry_id,
+        minor_version=minor_version,
+        options={},
+        source=SOURCE_USER,
+        subentries_data=None,
+        title="Test entry",
+        unique_id=None,
+        version=version,
+    )
+    hass.config_entries._entries[entry.entry_id] = entry
+    return entry
 
 
 @pytest.fixture

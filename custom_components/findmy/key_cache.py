@@ -5,17 +5,51 @@ on every call. A location fetch walks a week of indices per accessory on the eve
 keys per index, and the local Bluetooth matching walks two days of them every 15 minutes. Between
 two such passes a single index is new; everything else was derived again and again.
 
-The accessory below derives every key once, hands out key pairs whose public key and hash are
-stored, and can be warmed up from a worker thread so that the event loop only reads finished keys.
+The accessory below derives every key once and hands out key pairs whose public key and hash are
+stored. For a location fetch it cuts search windows: fixed ranges of indices with finished keys.
 
 It also limits how many key indices are searched per fetch, and plans the catch-up windows that
 make up for that limit (see MAX_SEARCH_INDICES and CatchUpWindow).
 
 Scope: this module only holds keys in memory and decides which indices to look at. It stores
 nothing on disk (keys are derived again after a restart, and a catch-up starts over), talks to
-nobody, and does not decide when to warm up or to fetch; the coordinator and the device tracker
+nobody, and does not decide when to derive or to fetch; the coordinator and the device tracker
 do that. The proper home of the cache is FindMy.py itself (FindMy.py #285). Once the library
 keeps its key pairs, that part of this module can be removed.
+
+Threads
+-------
+Three kinds of threads use an accessory:
+
+* Home Assistant's event loop: Bluetooth matching and realignment (device_tracker.py), planning
+  of catch-up windows, serialising the accessory into its config entry.
+* Executor threads: everything that derives keys (Bluetooth candidates, search windows).
+* The FindMy worker thread (worker.py), on which FindMy.py fetches and decrypts reports.
+
+The chosen model: **the worker thread never gets an accessory.** It gets a
+:class:`SearchWindow` per accessory, an object made for that one fetch with its own key table,
+fixed bounds and its own copy of the alignment. FindMy.py reads keys from the window and reports
+alignments to it; nothing the event loop uses changes under it, and nothing the worker uses
+changes under the worker. When the fetch is over, the coordinator applies the alignment a window
+found to the accessory, on the event loop. The key pairs themselves are shared between a window
+and the cache, which is safe because they are never changed after they were derived.
+
+Why not share the accessory and lock it: FindMy.py's fetch asks an accessory for its bounds
+again on every index and realigns it between two requests, while the device tracker reads the
+alignment, updates it and compares the result in one synchronous stretch. Each single access can
+be made safe with a lock, the sequences cannot, short of holding a lock across awaits. With
+windows there is nothing to get wrong: the alignment of an accessory is written on the event
+loop only, exactly as it was before the worker existed.
+
+What is left to guard, and how:
+
+* The caches and FindMy.py's key generators, used by executor threads and the event loop:
+  ``_DERIVE_LOCK``, held for one index at a time. Finished keys are read without it.
+* The alignment, a pair of attributes that FindMy.py writes one after the other. It is written
+  on the event loop and read in executor threads, which could see a new date with an old index.
+  A per-accessory lock covers the write and every read of the pair; it is held for a few
+  attribute accesses and never across an await.
+* The catch-up cursor: event loop only, no lock.
 """
 
 from __future__ import annotations
@@ -29,7 +63,10 @@ from typing import TYPE_CHECKING, final, override
 from findmy import FindMyAccessory, KeyPair, RollingKeyPairSource
 
 if TYPE_CHECKING:
-    from findmy import KeyPairType
+    import io
+    from pathlib import Path
+
+    from findmy import FindMyAccessoryMapping, KeyPairType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -84,7 +121,7 @@ _MAX_CACHED_SECONDARY_SPANS = MAX_CACHED_INDICES // _SECONDARY_KEY_SPAN + 2
 
 # Guards every derivation and every change of a cache. FindMy.py's key generators keep state
 # (the chain of secrets) that must not be advanced by two threads at once. One lock for all
-# accessories, because deriving is CPU-bound: several worker threads deriving at the same time,
+# accessories, because deriving is CPU-bound: several executor threads deriving at the same time,
 # as after a restart with many accessories, would compete with the event loop for the CPU. The
 # lock is held for a single index only, so the event loop waits one derivation at most.
 _DERIVE_LOCK = threading.Lock()
@@ -167,10 +204,10 @@ class CachedKeyPair(KeyPair):
 class CachedFindMyAccessory(FindMyAccessory):
     """A :class:`FindMyAccessory` whose keys are derived once per index.
 
-    :meth:`keys_at` and :meth:`warm_keys` may be called from the event loop and from worker
-    threads at the same time. The alignment is still only updated from the event loop. A worker
-    thread that reads it in that moment may warm a range that is off by a few indices; the
-    missing ones are then derived when they are asked for.
+    Everything that reads keys or the alignment may be called from the event loop and from
+    executor threads at the same time. The alignment is only updated from the event loop, and
+    the accessory is never handed to the FindMy worker thread: a fetch searches the windows cut
+    by :meth:`search_window` and :meth:`catch_up_window` instead. See the module docstring.
     """
 
     def __init__(  # noqa: PLR0913
@@ -210,20 +247,45 @@ class CachedFindMyAccessory(FindMyAccessory):
         # Highest index that the catch-up windows of the current sweep have not covered yet.
         self._catch_up_cursor: int | None = None
         self._last_catch_up: datetime | None = None
+        # Makes the alignment, which FindMy.py keeps in two attributes, one value for readers
+        # in other threads. Reentrant, because the bounds below are computed from one another.
+        self._alignment_lock = threading.RLock()
+
+    @property
+    def alignment(self) -> tuple[datetime, int]:
+        """The moment and the key index of the latest sighting the accessory was aligned to."""
+        with self._alignment_lock:
+            return self._alignment_date, self._alignment_index
+
+    @override
+    def update_alignment(self, dt: datetime, index: int) -> None:
+        # Must be called on the event loop; see the module docstring.
+        with self._alignment_lock:
+            super().update_alignment(dt, index)
+
+    @override
+    def get_max_index(self, dt: datetime) -> int:
+        with self._alignment_lock:
+            return super().get_max_index(dt)
 
     @override
     def get_min_index(self, dt: datetime) -> int:
-        # Never further down than the search limit allows, see MAX_SEARCH_INDICES.
-        newest = self.get_max_index(datetime.now(tz=UTC))
-        return max(super().get_min_index(dt), newest - MAX_SEARCH_INDICES + 1)
+        with self._alignment_lock:
+            # Never further down than the search limit allows, see MAX_SEARCH_INDICES.
+            newest = self.get_max_index(datetime.now(tz=UTC))
+            return max(super().get_min_index(dt), newest - MAX_SEARCH_INDICES + 1)
 
     @override
-    def keys_at(self, ind: int) -> set[KeyPair]:
-        if ind < 0:
-            return set()
+    def to_json(self, path: str | Path | io.TextIOBase | None = None, /) -> FindMyAccessoryMapping:
+        # The lock keeps the alignment written to the config entry a pair that existed. Nothing
+        # in this integration passes a path, so no file is written while it is held.
+        with self._alignment_lock:
+            return super().to_json(path)
 
+    def _keys(self, ind: int) -> tuple[CachedKeyPair, ...]:
+        """The finished keys of an index, derived first if nobody asked for them before."""
         # Reading one dict entry is atomic, so finished keys are handed out without the lock.
-        # This is the only path the event loop takes after a warm-up.
+        # This is the only path taken once a range was derived.
         keys = self._key_cache.get(ind)
         if keys is None:
             with _DERIVE_LOCK:
@@ -232,32 +294,45 @@ class CachedFindMyAccessory(FindMyAccessory):
                     keys = (self._derive_primary(ind), *self._secondary_keys(ind))
                     self._key_cache[ind] = keys
                     _evict_farthest(self._key_cache, ind, MAX_CACHED_INDICES)
+        return keys
+
+    @override
+    def keys_at(self, ind: int) -> set[KeyPair]:
+        if ind < 0:
+            return set()
         # A new set per call: the caller owns what it gets.
-        return set(keys)
+        return set(self._keys(ind))
 
-    def warm_keys(self, start: datetime, end: datetime) -> int:
-        """Derive the keys possibly in use between two moments; returns the derived index count.
+    def search_window(self, now: datetime) -> SearchWindow:
+        """Cut the window a location fetch searches: the indices possibly in use this week.
 
-        Meant to be run in a worker thread before the same range is read on the event loop.
+        Derives whatever the cache does not hold yet, which is everything after a restart and a
+        single index 15 minutes after the previous fetch. Meant to be run in an executor
+        thread; the returned window is then handed to the FindMy worker thread.
         """
-        max_index = self.get_max_index(end)
-        min_index = max(self.get_min_index(start), max_index - MAX_CACHED_INDICES + 1, 0)
+        with self._alignment_lock:
+            alignment = self.alignment
+            highest = self.get_max_index(now)
+            lowest = self.get_min_index(now - REPORT_WINDOW)
 
         derived = 0
-        # Newest first: this is the order in which a location fetch asks for the keys.
-        for ind in range(max_index, min_index - 1, -1):
+        keys: dict[int, tuple[CachedKeyPair, ...]] = {}
+        # Newest first, so that an eviction, if the range ever outgrows the cache, drops the
+        # old end. The window keeps its keys either way.
+        for ind in range(highest, max(lowest, 0) - 1, -1):
             if ind not in self._key_cache:
-                _ = self.keys_at(ind)
                 derived += 1
+            keys[ind] = self._keys(ind)
 
         if derived:
             _LOGGER.debug(
-                "Derived keys for %i indices of %s (%i indices cached)",
+                "Derived keys for %i of %i indices of %s (%i indices cached)",
                 derived,
+                len(keys),
                 self.name,
                 len(self._key_cache),
             )
-        return derived
+        return SearchWindow(self, lowest, highest, keys, alignment)
 
     def _derive_primary(self, ind: int) -> CachedKeyPair:
         """Derive the primary key of an index. The caller holds the lock."""
@@ -329,7 +404,7 @@ class CachedFindMyAccessory(FindMyAccessory):
     def catch_up_window(self, lowest: int, highest: int) -> CatchUpWindow:
         """Derive the keys of a range planned by :meth:`plan_catch_up`.
 
-        Meant to be run in a worker thread. The keys go into the returned window only: the
+        Meant to be run in an executor thread. The keys go into the returned window only: the
         cache of the top window, which every fetch needs, stays as it is.
         """
         keys: dict[int, tuple[CachedKeyPair, ...]] = {}
@@ -340,7 +415,7 @@ class CachedFindMyAccessory(FindMyAccessory):
                 if span not in secondary:
                     secondary[span] = self._derive_secondary(ind)
                 keys[ind] = (self._derive_primary(ind), *secondary[span])
-        return CatchUpWindow(self, lowest, highest, keys)
+        return CatchUpWindow(self, lowest, highest, keys, self.alignment)
 
     def catch_up_searched(self, window: CatchUpWindow) -> None:
         """Move the cursor below a window that a fetch has searched.
@@ -351,18 +426,16 @@ class CachedFindMyAccessory(FindMyAccessory):
         self._catch_up_cursor = window.lowest - 1
 
 
-@final
-class CatchUpWindow(RollingKeyPairSource):
-    """A fixed range of older key indices of an accessory, searched like an accessory itself.
+class SearchWindow(RollingKeyPairSource):
+    """A fixed range of key indices of an accessory with finished keys, made for one fetch.
 
     FindMy.py searches whatever lies between the lowest and the highest index a key source
-    reports. This view reports the bounds of its range instead of those of the accessory, and is
-    handed to the fetch next to the accessory. The alternative, widening the range of the
-    accessory itself now and then, would send the top window a second time and put its keys
-    and those of the range through the same cache.
+    reports. A window reports the bounds it was cut with and hands out the keys it was given,
+    so searching it derives nothing and reads nothing that another thread may change.
 
-    A report found in the range realigns the accessory. Its keys were derived when the window
-    was made, so searching it leaves no key derivation to the event loop.
+    A window is used by one thread at a time: it is made in an executor thread, searched on the
+    FindMy worker thread and read on the event loop when the fetch is over. The accessory it
+    was cut from is not touched in between; :attr:`accessory` only says whose reports these are.
     """
 
     def __init__(
@@ -371,11 +444,17 @@ class CatchUpWindow(RollingKeyPairSource):
         lowest: int,
         highest: int,
         keys: dict[int, tuple[CachedKeyPair, ...]],
+        alignment: tuple[datetime, int],
     ) -> None:
-        self._accessory = accessory
-        self._lowest = lowest
-        self._highest = highest
-        self._keys = keys
+        self._accessory: CachedFindMyAccessory = accessory
+        self._lowest: int = lowest
+        self._highest: int = highest
+        self._keys: dict[int, tuple[CachedKeyPair, ...]] = keys
+        # The alignment of the accessory when the window was cut, moved on by the reports the
+        # fetch finds. Always replaced as a whole, so every value read from it is a pair that
+        # was really observed.
+        self._initial_alignment: tuple[datetime, int] = alignment
+        self._alignment: tuple[datetime, int] = alignment
 
     @property
     def accessory(self) -> CachedFindMyAccessory:
@@ -392,6 +471,14 @@ class CatchUpWindow(RollingKeyPairSource):
         """Highest key index of the window."""
         return self._highest
 
+    @property
+    def found_alignment(self) -> tuple[datetime, int] | None:
+        """The alignment the reports of this window lead to, or None if they changed nothing.
+
+        To be passed to ``update_alignment`` of the accessory on the event loop.
+        """
+        return None if self._alignment == self._initial_alignment else self._alignment
+
     @override
     def get_min_index(self, dt: datetime) -> int:
         return self._lowest
@@ -402,8 +489,13 @@ class CatchUpWindow(RollingKeyPairSource):
 
     @override
     def update_alignment(self, dt: datetime, index: int) -> None:
-        # This is what closes the gap: the accessory moves its top window to where it was seen.
-        self._accessory.update_alignment(dt, index)
+        # Same rule as FindMyAccessory.update_alignment, which FindMy.py calls once per report
+        # and index: only ever forwards. The accessory applies the rule again to the result, so
+        # an alignment it got from Bluetooth in the meantime is not overwritten by an older one.
+        date, current = self._alignment
+        if dt < date or index < current:
+            return
+        self._alignment = (dt, index)
 
     @override
     def keys_at(self, ind: int) -> set[KeyPair]:
@@ -411,4 +503,17 @@ class CatchUpWindow(RollingKeyPairSource):
 
     @override
     def __repr__(self) -> str:
-        return f"CatchUpWindow({self._accessory.name!r}, {self._lowest}..{self._highest})"
+        return f"{type(self).__name__}({self._accessory.name!r}, {self._lowest}..{self._highest})"
+
+
+@final
+class CatchUpWindow(SearchWindow):
+    """A search window over older key indices, below the range every fetch searches.
+
+    Handed to the fetch next to the top window of the same accessory. The alternative, widening
+    the top window now and then, would send its indices a second time and put its keys and
+    those of the older range through the same cache.
+
+    A report found here is what closes the gap: applied to the accessory, its alignment moves
+    the top window to where the accessory was seen.
+    """

@@ -19,7 +19,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import generate_entity_id
 
-from findmy import AsyncAppleAccount, FindMyAccessory
+from findmy import FindMyAccessory
 
 from ._entity import (
     account_entity_id,
@@ -35,8 +35,9 @@ from ._entity import (
     status_available,
     status_counter,
 )
+from .account import AccountRuntime, FetchStatus
 from .const import DOMAIN, signal_account_fetch, signal_local_observation
-from .coordinator import CoordinatorFetchStatus, FindMyCoordinator, FindMyDevice
+from .coordinator import FindMyCoordinator, FindMyDevice
 from .presence import FindMySignalStrengthSensor
 from .storage import RuntimeStorage
 
@@ -77,7 +78,7 @@ async def async_setup_entry(
         # Only accessories with derived rolling keys are matched against local advertisements.
         entities.extend((FindMySignalStrengthSensor(item),))
 
-    if isinstance(item, AsyncAppleAccount):
+    if isinstance(item, AccountRuntime):
         # account status sensors
         entities.extend(
             (
@@ -289,10 +290,10 @@ class _FindMyAccountBaseSensor[T](
     def __init__(
         self,
         coordinator: FindMyCoordinator,
-        account: AsyncAppleAccount,
+        account: AccountRuntime,
     ) -> None:
         self._coordinator: FindMyCoordinator = coordinator
-        self._account: AsyncAppleAccount = account
+        self._account: AccountRuntime = account
 
         self._cached_value: T | None = None
         # Use generate_entity_id to properly slugify and validate the entity_id
@@ -353,9 +354,9 @@ class FindMyAccountStateSensor(_FindMyAccountBaseSensor[str]):
 
     @override
     def _compute_value(self) -> str | None:
-        state = self._coordinator.get_account_last_fetch_result(self._account)
+        state = self._account.last_fetch_result
 
-        if state == CoordinatorFetchStatus.ONGOING:
+        if state == FetchStatus.ONGOING:
             return "fetching"
 
         return "idle"
@@ -368,7 +369,7 @@ class FindMyAccountLastFetchSensor(_FindMyAccountBaseSensor[datetime]):
 
     @override
     def _compute_value(self) -> datetime | None:
-        return self._coordinator.get_account_last_fetch(self._account)
+        return self._account.last_fetch
 
 
 class FindMyAccountNextFetchSensor(_FindMyAccountBaseSensor[datetime]):
@@ -388,12 +389,12 @@ class FindMyAccountLastFetchResultSensor(_FindMyAccountBaseSensor[str]):
 
     @override
     def _compute_value(self) -> str | None:
-        res = self._coordinator.get_account_last_fetch_result(self._account)
-        if res == CoordinatorFetchStatus.ONGOING:
+        res = self._account.last_fetch_result
+        if res == FetchStatus.ONGOING:
             return "ongoing"
-        if res == CoordinatorFetchStatus.SUCCESS:
+        if res == FetchStatus.SUCCESS:
             return "success"
-        if res == CoordinatorFetchStatus.ERROR:
+        if res == FetchStatus.ERROR:
             return "error"
 
         return None
@@ -408,7 +409,7 @@ class FindMyAccountLastFetchDurationSensor(_FindMyAccountBaseSensor[float]):
 
     @override
     def _compute_value(self) -> float | None:
-        dur = self._coordinator.get_account_last_fetch_duration(self._account)
+        dur = self._account.last_fetch_duration
         if dur is None:
             return None
 
