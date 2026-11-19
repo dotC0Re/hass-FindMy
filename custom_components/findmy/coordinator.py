@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, final, override
 
@@ -60,8 +61,23 @@ FindMyDevice = KeyPair | FindMyAccessory | FixedRollingKeyPairAccessory
 # A report is a library object once it was fetched in this run, and plain data while it is the
 # one restored after a restart (last_reports.py). The entities read the same attributes of both.
 type FindMyLocationData = dict[FindMyDevice, KnownReport | None]
-# What a fetch searched, each source mapped to its device, and what it found.
-type _FetchResult = tuple[dict[FetchSource, FindMyDevice], dict[FetchSource, LocationReport | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """What a source of a fetch stands for: a device, and the entry it was stored for.
+
+    A device entry may be reloaded while a fetch runs. Its device is then a new object by the
+    time the fetch ends, and what the fetch found belongs to that one: the entry id finds it.
+    """
+
+    device: FindMyDevice
+    # None for a device the storage does not know, which only tests register.
+    entry_id: str | None
+
+
+# What a fetch searched, each source mapped to what it stands for, and what it found.
+type _FetchResult = tuple[dict[FetchSource, _Target], dict[FetchSource, LocationReport | None]]
 
 # Raised by FindMy.py when a session expired and no password is stored to sign in again. That
 # is the normal end of a session: accounts are restored without their password (account.py).
@@ -303,9 +319,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         """Returns a list of all devices that have been registered with the coordinator."""
         return list({ctx for ctx in self.async_contexts() if isinstance(ctx, FindMyDevice)})  # pyright: ignore[reportAny]
 
-    async def _async_fetch_sources(
-        self, devices: list[FindMyDevice]
-    ) -> dict[FetchSource, FindMyDevice]:
+    async def _async_fetch_sources(self, devices: list[FindMyDevice]) -> dict[FetchSource, _Target]:
         """Prepare what the worker searches, each source mapped to the device it stands for.
 
         A cached accessory is searched through its top window, cut in an executor thread
@@ -317,39 +331,52 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         older indices are searched bit by bit through catch-up windows, see key_cache.py.
         """
         now = datetime.now(tz=UTC)
-        sources: dict[FetchSource, FindMyDevice] = {}
+        sources: dict[FetchSource, _Target] = {}
         for device in devices:
+            # Taken now: an entry reloaded during the fetch has a new object afterwards.
+            target = _Target(device, self._storage.get_entry_id(device))
             if isinstance(device, CachedFindMyAccessory):
                 window = await self.hass.async_add_executor_job(device.search_window, now)
-                sources[window] = device
+                sources[window] = target
                 planned = device.plan_catch_up(now)
                 if planned is not None:
                     _LOGGER.debug("Catching up on key indices %i..%i of %s", *planned, device.name)
                     catch_up = await self.hass.async_add_executor_job(
                         device.catch_up_window, *planned
                     )
-                    sources[catch_up] = device
+                    sources[catch_up] = target
             elif isinstance(device, FindMyAccessory):
-                sources[_fetch_copy(device)] = device
+                sources[_fetch_copy(device)] = target
             else:
                 # Static key pairs and accessories with pre-generated keys: the fetch only
                 # reads them and nothing ever changes them, so they are safe to share.
-                sources[device] = device
+                sources[device] = target
         return sources
 
-    def _apply_alignments(self, sources: dict[FetchSource, FindMyDevice]) -> None:
+    def _current_device(self, target: _Target) -> FindMyDevice | None:
+        """The device that stands for a target now; None while its entry is not loaded."""
+        if target.entry_id is None:
+            return target.device
+        item = self._storage.get_item(target.entry_id)
+        return item if isinstance(item, FindMyDevice) else None
+
+    def _apply_alignments(self, sources: dict[FetchSource, _Target]) -> None:
         """Realign the accessories with what the reports of a finished fetch showed.
 
         FindMy.py reports alignments to the source it searched, on the worker thread. The
         accessories themselves are only ever realigned here, on the event loop, where the
-        Bluetooth matching reads and updates the same alignment (device_tracker.py).
+        Bluetooth matching reads and updates the same alignment (device_tracker.py). An
+        accessory whose entry was reloaded meanwhile gets the alignment as its new object.
         """
-        for source, device in sources.items():
+        for source, target in sources.items():
+            device = self._current_device(target)
+            if not isinstance(device, FindMyAccessory):
+                continue
             if isinstance(source, SearchWindow):
                 found = source.found_alignment
                 if found is not None:
-                    source.accessory.update_alignment(*found)
-            elif source is not device and isinstance(device, FindMyAccessory):
+                    device.update_alignment(*found)
+            elif source is not target.device:
                 assert isinstance(source, FindMyAccessory)
                 _apply_copy_alignment(source, device)
 
@@ -388,7 +415,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         self,
         account: AccountRuntime,
         budget_id: str,
-        sources: dict[FetchSource, FindMyDevice],
+        sources: dict[FetchSource, _Target],
     ) -> dict[FetchSource, LocationReport | None]:
         """Run the fetch on the worker and take over the alignments it found."""
         budget = self._storage.budget
@@ -558,21 +585,30 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
     def _take_over_reports(
         self,
-        sources: dict[FetchSource, FindMyDevice],
+        sources: dict[FetchSource, _Target],
         device_reports: dict[FetchSource, LocationReport | None],
     ) -> FindMyLocationData:
-        """Merge the reports of a fetch that worked into the data of the coordinator."""
+        """Merge the reports of a fetch that worked into the data of the coordinator.
+
+        A report belongs to the device that is loaded for its entry when the fetch ends, which
+        is a new object if the entry was reloaded meanwhile. It is remembered for the entry as
+        long as the entry exists, also while it is not loaded: its next setup restores it.
+        """
         # Only after a fetch that worked, so that a failed one searches the same windows again.
-        for source in sources:
-            if isinstance(source, CatchUpWindow):
+        # A reloaded accessory starts a sweep of its own.
+        for source, target in sources.items():
+            if (
+                isinstance(source, CatchUpWindow)
+                and self._current_device(target) is source.accessory
+            ):
                 source.accessory.catch_up_searched(source)
 
-        fetched: dict[FindMyDevice, LocationReport] = {}
+        fetched: dict[_Target, LocationReport] = {}
         for source, report in device_reports.items():
             _LOGGER.debug("Got reports for device: %s - %s", source, report)
             # A report from a window or a copy is a report of the accessory it was made from.
-            device = sources.get(source)
-            if device is None:
+            target = sources.get(source)
+            if target is None:
                 _LOGGER.warning("Got a report for something that was not asked for: %s", source)
                 continue
             if not report:
@@ -580,16 +616,17 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
             # The top window and a catch-up window of an accessory can both bring a report;
             # the newer one counts.
-            known = fetched.get(device)
+            known = fetched.get(target)
             if known is None or report.timestamp >= known.timestamp:
-                fetched[device] = report
-
-        # Kept across restarts, see last_reports.py.
-        for device, report in fetched.items():
-            entry_id = self._storage.get_entry_id(device)
-            if entry_id is not None:
-                self._storage.reports.remember(entry_id, report)
+                fetched[target] = report
 
         data: FindMyLocationData = (self.data or {}).copy()
-        data.update(fetched)
+        for target, report in fetched.items():
+            entry_id = target.entry_id
+            if entry_id is not None and self.hass.config_entries.async_get_entry(entry_id):
+                # Kept across restarts, see last_reports.py.
+                self._storage.reports.remember(entry_id, report)
+            device = self._current_device(target)
+            if device is not None:
+                data[device] = report
         return data

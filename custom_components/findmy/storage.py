@@ -125,6 +125,10 @@ class RuntimeStorage:
     def get_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
         return self._entries[entry.entry_id]
 
+    def get_item(self, entry_id: str) -> StorageItem | None:
+        """The object stored for a config entry, or None while the entry is not loaded."""
+        return self._entries.get(entry_id)
+
     def get_entry_id(self, item: StorageItem) -> str | None:
         """The id of the config entry an item was stored for, if it still is."""
         return next(

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, final
 from unittest.mock import AsyncMock, MagicMock
@@ -271,3 +272,81 @@ async def test_unloading_another_account_lets_the_running_fetch_finish(
     assert isinstance(account, AccountRuntime)
     assert account.last_fetch_result is FetchStatus.SUCCESS
     apple["b@example.com"][0].close.assert_awaited_once()
+
+
+@dataclass(frozen=True)
+class FakeReport:
+    """What the coordinator and the stored reports read from a location report."""
+
+    timestamp: datetime
+    latitude: float = 52.520008
+    longitude: float = 13.404954
+    horizontal_accuracy: int = 10
+    status: int = 0
+
+
+@pytest.mark.parametrize("equality", ["by keys", "by identity"])
+async def test_report_of_a_device_reloaded_during_the_fetch_reaches_its_new_object(  # noqa: PLR0917
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+    equality: str,
+) -> None:
+    """G5: the report and the alignment went to the old object, and were never stored.
+
+    In FindMy.py 0.10.2 two objects of one accessory compare equal, by their keys. The
+    coordinator must not rely on that: with identity as equality, the report still has to
+    reach the object that is loaded for the entry when the fetch ends.
+    """
+    if equality == "by identity":
+        monkeypatch.setattr(CachedFindMyAccessory, "__eq__", object.__eq__)
+        monkeypatch.setattr(CachedFindMyAccessory, "__hash__", object.__hash__)
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    tag = make_config_entry(
+        hass, {"type": "device_rolling_derived", "data": unlocated_accessory().to_json()}
+    )
+    assert await async_setup_entry(hass, tag) is True
+    old = storage.get_entry(tag)
+    assert isinstance(old, CachedFindMyAccessory)
+    remove_listener = coordinator.async_add_listener(lambda: None, old)
+    gate = Gate()
+    seen_at = datetime.now(tz=UTC) - timedelta(minutes=5)
+    report = FakeReport(seen_at)
+    found: list[tuple[datetime, int]] = []
+
+    async def fetch(sources: list[object]) -> dict[object, object]:
+        _ = await gate.fetch(sources)
+        reports: dict[object, object] = {}
+        for source in sources:
+            reports[source] = None
+            if type(source) is SearchWindow:
+                source.update_alignment(seen_at, source.highest)
+                found.append((seen_at, source.highest))
+                reports[source] = report
+        return reports
+
+    apple[JANE][0].fetch_location.side_effect = fetch
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    await asyncio.wait_for(gate.started.wait(), 10)
+
+    # The reload: the entities of the old object go, those of the new one come.
+    assert await async_unload_entry(hass, tag) is True
+    remove_listener()
+    assert await async_setup_entry(hass, tag) is True
+    new = storage.get_entry(tag)
+    assert isinstance(new, CachedFindMyAccessory)
+    assert new is not old
+    _ = coordinator.async_add_listener(lambda: None, new)
+    gate.release.set()
+    await refresh
+
+    assert coordinator.last_update_success is True
+    assert (coordinator.data or {}).get(new) == report
+    stored = storage.reports.get(tag.entry_id)
+    assert stored is not None
+    assert stored.timestamp == seen_at
+    assert new.alignment == found[0]
