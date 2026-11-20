@@ -43,15 +43,19 @@ What the checksum covers
 The files in the bundle, not the bytes of the bundle: for every regular file in the archive one
 line ``<SHA-256 of the file>  <its name>``, sorted by name, and the SHA-256 of these lines is
 the checksum (:func:`_content_sha256`). That includes the index ``fs.json``, without which the
-package would not find the libraries and would download them on its own. How the archive is
-packed does not count. This matters because the bundle does not stay the file that was stored:
+package would not find the libraries and would download them on its own. The names count as
+they are written in the archive, ``./libs/...`` and ``fs.json``: the package looks the files
+up by exactly these names, so a bundle that holds the same files as ``libs/...`` would give
+a provider no libraries at all (review finding K-1). How the archive is packed otherwise does
+not count. This matters because the bundle does not stay the file that was stored:
 FindMy.py writes it again on every start (see below), and a newer anisette package, or a newer
 Python with other defaults in ``tarfile`` or ``bz2``, may pack the same files differently. A
 checksum of the file would then lock the account until somebody deletes the bundle by hand
 (review finding A-1).
 
-Version 2026.11.0 recorded the SHA-256 of the file. Such a record is still honoured: if the
-file matches it, the record is replaced by one of the content.
+Records of earlier versions are still honoured: 2026.11.0 recorded the SHA-256 of the file,
+2026.11.1 a checksum of the files that left a leading ``./`` out of their names. If the bundle
+matches such a record, the record is replaced by one of the current kind.
 
 What cannot be prevented
 ------------------------
@@ -80,6 +84,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import hashlib
 import io
 import logging
@@ -111,10 +116,21 @@ _LOGGER = logging.getLogger(__name__)
 BUNDLE_FILE: Final = "findmy.anisette_libs"
 CHECKSUM_FILE: Final = f"{BUNDLE_FILE}.sha256"
 
-# What a record of the checksum starts with, see "What the checksum covers". A record without
-# it was written by version 2026.11.0 and is the SHA-256 of the file.
-_CONTENT_PREFIX: Final = "content-sha256:"
 _READ_SIZE = 1024 * 1024
+
+
+class _Scheme(enum.Enum):
+    """What a recorded checksum was taken of. The value is what its record starts with."""
+
+    # Version 2026.11.0: the SHA-256 of the file as a whole.
+    FILE = ""
+    # Version 2026.11.1: of the files in the bundle, their names without a leading `./`.
+    NORMALISED_NAMES = "content-sha256:"
+    # Of the files in the bundle under the names they have, see "What the checksum covers".
+    MEMBERS = "members-sha256:"
+
+
+_CURRENT_SCHEME: Final = _Scheme.MEMBERS
 
 # The whole download: connecting, the response and its body.
 _DOWNLOAD_TIMEOUT = 60.0
@@ -165,18 +181,21 @@ class _Recorded:
     """The checksum on record and what it was taken of."""
 
     digest: str
-    # False for a record of version 2026.11.0: the SHA-256 of the file as a whole.
-    of_content: bool = True
+    scheme: _Scheme = _CURRENT_SCHEME
 
     def of_file(self, bundle: Path) -> str:
         """The checksum of a stored bundle, taken the way the recorded one was."""
-        return _content_sha256_of_file(bundle) if self.of_content else _sha256(bundle)
+        with bundle.open("rb") as file:
+            return self._of(file)
 
     def of_bytes(self, data: bytes) -> str:
         """The checksum of a bundle in memory, taken the way the recorded one was."""
-        if not self.of_content:
-            return hashlib.sha256(data).hexdigest()
-        return _content_sha256(io.BytesIO(data))
+        return self._of(io.BytesIO(data))
+
+    def _of(self, source: BinaryIO) -> str:
+        if self.scheme is _Scheme.FILE:
+            return _sha256_of(source)
+        return _content_sha256(source, exact_names=self.scheme is _Scheme.MEMBERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,11 +294,6 @@ async def _async_download(hass: HomeAssistant) -> bytes:
     return b"".join(chunks)
 
 
-def _sha256(path: Path) -> str:
-    with path.open("rb") as file:
-        return _sha256_of(file)
-
-
 def _sha256_of(file: IO[bytes]) -> str:
     digest = hashlib.sha256()
     while chunk := file.read(_READ_SIZE):
@@ -287,17 +301,15 @@ def _sha256_of(file: IO[bytes]) -> str:
     return digest.hexdigest()
 
 
-def _content_sha256_of_file(bundle: Path) -> str:
-    with bundle.open("rb") as file:
-        return _content_sha256(file)
-
-
-def _content_sha256(source: BinaryIO) -> str:
+def _content_sha256(source: BinaryIO, *, exact_names: bool = True) -> str:
     """The checksum of the files a bundle holds, however it is packed.
 
     See "What the checksum covers" in the module docstring. Nothing is unpacked to disk and no
     file of the bundle is held in memory as a whole. Raises whatever the archive modules raise
     for a file that is cut off or not an archive.
+
+    ``exact_names=False`` leaves a leading ``./`` out of the names, as version 2026.11.1 did;
+    only for comparing with a record of that version.
     """
     lines: list[str] = []
     # Any compression: the package reads its bundles the same way.
@@ -307,8 +319,9 @@ def _content_sha256(source: BinaryIO) -> str:
             content = archive.extractfile(member) if member.isfile() else None
             if content is None:
                 continue
+            name = member.name if exact_names else member.name.removeprefix("./")
             with content:
-                lines.append(f"{_sha256_of(content)}  {member.name.removeprefix('./')}\n")
+                lines.append(f"{_sha256_of(content)}  {name}\n")
     return hashlib.sha256("".join(sorted(lines)).encode()).hexdigest()
 
 
@@ -324,11 +337,16 @@ def _read_checksum(checksum: Path) -> _Recorded | None:
     except OSError, ValueError:
         return None
     recorded = fields[0].lower() if fields else ""
-    of_content = recorded.startswith(_CONTENT_PREFIX)
-    digest = recorded.removeprefix(_CONTENT_PREFIX)
+    # FILE has no prefix and therefore comes last.
+    scheme = next(
+        scheme
+        for scheme in (_Scheme.MEMBERS, _Scheme.NORMALISED_NAMES, _Scheme.FILE)
+        if recorded.startswith(scheme.value)
+    )
+    digest = recorded.removeprefix(scheme.value)
     if len(digest) != hashlib.sha256().digest_size * 2 or not _is_hex(digest):
         return None
-    return _Recorded(digest, of_content=of_content)
+    return _Recorded(digest, scheme)
 
 
 def _write_checksum(checksum: Path, digest: str, bundle: Path) -> None:
@@ -336,7 +354,8 @@ def _write_checksum(checksum: Path, digest: str, bundle: Path) -> None:
     checksum_tmp = _temporary(checksum)
     try:
         # Laid out like a line of `sha256sum`, but it is not one: see _content_sha256.
-        _write(checksum_tmp, f"{_CONTENT_PREFIX}{digest}  {bundle.name}\n".encode("ascii"))
+        record = f"{_CURRENT_SCHEME.value}{digest}  {bundle.name}\n"
+        _write(checksum_tmp, record.encode("ascii"))
         _ = checksum_tmp.replace(checksum)
     finally:
         with contextlib.suppress(OSError):
@@ -344,11 +363,17 @@ def _write_checksum(checksum: Path, digest: str, bundle: Path) -> None:
 
 
 def _record_content(bundle: Path, checksum: Path, recorded: _Recorded) -> None:
-    """Replace a record of version 2026.11.0 once the bundle is known to match it."""
-    if recorded.of_content:
+    """Replace a record of an earlier version once the bundle is known to match it.
+
+    A record of 2026.11.1 is matched by a bundle whose files lost the leading ``./`` of their
+    names as well, which no provider can load. Only somebody repacking the bundle by hand
+    gets there; the record of such a bundle is renewed like any other and it then takes
+    deleting the file, as before.
+    """
+    if recorded.scheme is _CURRENT_SCHEME:
         return
     try:
-        _write_checksum(checksum, _content_sha256_of_file(bundle), bundle)
+        _write_checksum(checksum, _Recorded("").of_file(bundle), bundle)
     except Exception:
         # Not needed now: the old record still describes the file. The next check tries again.
         _LOGGER.debug("Could not renew the checksum record of %s", bundle, exc_info=True)
@@ -487,8 +512,8 @@ def _convert_and_store(archive: bytes, bundle: Path, checksum: Path) -> str:
     digest = _content_sha256(io.BytesIO(data))
 
     previous = _read_checksum(checksum)
-    # A record of the file as a whole (version 2026.11.0) cannot be compared with this one.
-    if previous is not None and previous.of_content and previous.digest != digest:
+    # A record of an earlier kind cannot be compared with this one.
+    if previous is not None and previous.scheme is _CURRENT_SCHEME and previous.digest != digest:
         # The user deleted the old bundle, and the server now sends another one. That is what
         # deleting it asks for, but it should not happen without a trace.
         _LOGGER.warning(

@@ -1013,3 +1013,36 @@ async def test_translated_error_keeps_its_traceback_in_the_debug_log(
     assert records[0].exc_info[0] is KeyError
     # The frame that raised, on the worker thread, is part of what gets logged.
     assert 'return {}["searchPartyToken"]' in caplog.text
+
+
+@dataclass(frozen=True)
+class PositionReport:
+    """A report whose text shows its position, as that of a real LocationReport does."""
+
+    timestamp: datetime
+    latitude: float = 52.123456
+    longitude: float = 13.654321
+
+
+@pytest.mark.asyncio
+async def test_debug_log_of_a_fetch_holds_no_position(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review finding K-4: debug logs are shared in issues; where a tag was is nobody's business."""
+    account = await add_account(hass, storage, "a")
+    accessory = make_accessory()
+    report = PositionReport(datetime(2026, 11, 20, 9, 30, tzinfo=UTC))
+    lib(account).fetch_location.return_value = {accessory: report}
+    await coordinator.reload()
+    listen(coordinator, accessory)
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.findmy"):
+        await coordinator.async_refresh()
+
+    assert coordinator.data == {accessory: report}
+    assert "a report from 2026-11-20T09:30:00+00:00" in caplog.text
+    assert "52.123456" not in caplog.text
+    assert "13.654321" not in caplog.text

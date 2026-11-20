@@ -74,6 +74,13 @@ def test_url_is_logged_without_credentials(url: str, logged: str) -> None:
         "https://user:pa#s3cret@ani.example/v3",
         "https://user:pa?s3cret@ani.example/v3",
         "https://ani.example:port/v3",
+        # Review finding K-3: where a URL ends in a log line, so the redaction stops there.
+        "https://user:pa's3cret@ani.example/v3",
+        'https://user:pa"s3cret@ani.example/v3',
+        "https://user:pa<s3cret@ani.example/v3",
+        "https://user:pa>s3cret@ani.example/v3",
+        "https://user:pa s3cret@ani.example/v3",
+        "https://us er:s3cret@ani.example/v3",
     ],
 )
 def test_url_whose_credentials_cannot_be_recognised_is_refused(url: str) -> None:
@@ -88,10 +95,16 @@ def test_url_whose_credentials_cannot_be_recognised_is_refused(url: str) -> None
         "https://user:s3cret@ani.example:6969/v3",
         "https://user:p@s3cret@ani.example",
         "https://user:pa%2Fs3cret@ani.example/v3",
+        "https://user:pa%27s3%20cret@ani.example/v3",
+        "https://token@[2001:db8::1]:6969/v3",
+        # Such characters only matter in the credentials.
+        "https://ani.example/v3?name='a b'",
     ],
 )
 def test_usual_urls_are_accepted(url: str) -> None:
     assert config_flow._is_valid_anisette_url(url) is True
+    # Whatever is accepted is a URL the redaction handles.
+    assert SECRET not in redact_url_credentials(f"Fetching anisette data from {url}")
 
 
 def response_error(url: str) -> aiohttp.ClientResponseError:
@@ -219,7 +232,9 @@ def test_debug_logging_does_not_reach_the_anisette_package() -> None:
         # What `logger: default: debug` does.
         assert logging.getLogger("anisette._adi").isEnabledFor(logging.DEBUG) is False
         assert logging.getLogger("anisette._fs").isEnabledFor(logging.DEBUG) is False
-        assert logging.getLogger("anisette._adi").isEnabledFor(logging.INFO) is True
+        # Home Assistant's own default: no progress lines such as "Provisioning...".
+        assert logging.getLogger("anisette.anisette").isEnabledFor(logging.INFO) is False
+        assert logging.getLogger("anisette._adi").isEnabledFor(logging.WARNING) is True
     finally:
         root.setLevel(previous)
 

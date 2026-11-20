@@ -71,7 +71,9 @@ def storage_files(hass: HomeAssistant) -> set[str]:
     return {path.name for path in directory.iterdir() if path.name.startswith(BUNDLE_FILE)}
 
 
-CONTENT = "content-sha256:"
+CONTENT = "members-sha256:"
+# What version 2026.11.1 wrote.
+NORMALISED = "content-sha256:"
 
 
 def recorded_checksum(hass: HomeAssistant) -> str:
@@ -95,10 +97,13 @@ def bundle_files(path: Path) -> dict[str, bytes]:
     return files
 
 
-def content_sha256(path: Path) -> str:
-    """The checksum of what a bundle holds, worked out here as the module documents it."""
+def content_sha256(path: Path, *, exact_names: bool = True) -> str:
+    """The checksum of what a bundle holds, worked out here as the module documents it.
+
+    ``exact_names=False`` is what version 2026.11.1 recorded.
+    """
     lines = sorted(
-        f"{hashlib.sha256(data).hexdigest()}  {name.removeprefix('./')}\n"
+        f"{hashlib.sha256(data).hexdigest()}  {name if exact_names else name.removeprefix('./')}\n"
         for name, data in bundle_files(path).items()
     )
     return hashlib.sha256("".join(lines).encode()).hexdigest()
@@ -406,8 +411,19 @@ async def test_changed_bundle_of_full_size_is_treated_like_a_damaged_one(
         lambda files: {
             name.replace("libCoreADI", "libOther"): data for name, data in files.items()
         },
+        # Review finding K-1: the package looks the files up as `./libs/...` and `fs.json`.
+        # Under any other spelling it finds nothing, although the content is the same.
+        lambda files: {name.removeprefix("./"): data for name, data in files.items()},
+        lambda files: {f"./{name.removeprefix('./')}": data for name, data in files.items()},
     ],
-    ids=["no index", "changed index", "added file", "renamed library"],
+    ids=[
+        "no index",
+        "changed index",
+        "added file",
+        "renamed library",
+        "names without ./",
+        "index as ./fs.json",
+    ],
 )
 async def test_any_change_of_the_files_in_the_bundle_is_a_mismatch(
     hass: HomeAssistant,
@@ -605,6 +621,8 @@ async def test_bundle_without_recorded_checksum_is_not_trusted(
         "abc123  findmy.anisette_libs\n",
         "content-sha256:abc123  findmy.anisette_libs\n",
         f"content-sha256:{'g' * 64}  findmy.anisette_libs\n",
+        "members-sha256:abc123  findmy.anisette_libs\n",
+        f"members-sha256:{'g' * 64}  findmy.anisette_libs\n",
     ],
 )
 async def test_unreadable_checksum_record_counts_as_none(
@@ -739,9 +757,9 @@ async def test_files_are_read_and_written_off_the_event_loop(
     def spy(name: str) -> None:
         original = getattr(anisette_libs, name)
 
-        def wrapper(*args: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             ran_on[name] = threading.get_ident()
-            return original(*args)
+            return original(*args, **kwargs)
 
         monkeypatch.setattr(anisette_libs, name, wrapper)
 
@@ -770,3 +788,36 @@ async def test_error_messages_carry_no_traceback_details_of_the_archive(
 
     assert "incomplete or not a library bundle" in str(raised.value)
     assert "nothing was stored" in str(raised.value)
+
+
+async def test_record_of_version_2026_11_1_is_honoured_and_renewed(
+    hass: HomeAssistant, download: FakeDownload
+) -> None:
+    """That version left a leading ``./`` out of the names it hashed."""
+    path = await async_ensure_anisette_libs(hass)
+    record = path.with_name(CHECKSUM_FILE)
+    old = f"{NORMALISED}{content_sha256(path, exact_names=False)}  {BUNDLE_FILE}\n"
+    assert old != record.read_text(encoding="ascii")
+    record.write_text(old, encoding="ascii")
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert len(download.requests) == 1
+    assert record.read_text(encoding="ascii") == f"{CONTENT}{content_sha256(path)}  {BUNDLE_FILE}\n"
+
+
+async def test_damaged_bundle_with_a_record_of_version_2026_11_1_is_repaired(
+    hass: HomeAssistant, download: FakeDownload
+) -> None:
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    record = path.with_name(CHECKSUM_FILE)
+    old = f"{NORMALISED}{content_sha256(path, exact_names=False)}  {BUNDLE_FILE}\n"
+    record.write_text(old, encoding="ascii")
+    _ = damage(path)
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert len(download.requests) == 2
+    assert path.read_bytes() == original
+    assert record.read_text(encoding="ascii") == f"{CONTENT}{content_sha256(path)}  {BUNDLE_FILE}\n"

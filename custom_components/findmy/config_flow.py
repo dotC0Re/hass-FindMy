@@ -88,6 +88,7 @@ from .const import (
     DOMAIN,
 )
 from .redaction import REDACTED as _REDACTED
+from .redaction import credentials_are_recognised
 from .redaction import describe_error as _describe
 from .redaction import url_without_credentials as _url_without_credentials
 from .worker import FindMyWorker, WorkerNotRunningError
@@ -240,13 +241,18 @@ def _is_valid_anisette_url(url: str) -> bool:
     of it reads as ``user:<not a port>``, and the rest of the password lands in the path. Such
     a URL would fail at the first request, and the redaction of redaction.py would not
     recognise its credentials. Asking for the port is what finds it.
+
+    Credentials with an unencoded quote, angle bracket or space are refused for the same
+    reason: the redaction would stop at that character (review finding K-3). All of these can
+    be entered percent-encoded.
     """
     try:
         parsed = urlsplit(url)
         _ = parsed.port
+        recognised = credentials_are_recognised(url)
     except ValueError:
         return False
-    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname) and recognised
 
 
 # What restoring an account from a prepared identity can still raise: a provisioning state

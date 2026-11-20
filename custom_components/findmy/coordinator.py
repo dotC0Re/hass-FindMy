@@ -636,7 +636,12 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
         fetched: dict[_Target, LocationReport] = {}
         for source, report in device_reports.items():
-            _LOGGER.debug("Got reports for device: %s - %s", source, report)
+            # Not the report itself: it would put the position into a log that may be shared.
+            _LOGGER.debug(
+                "Got %s for device: %s",
+                f"a report from {report.timestamp.isoformat()}" if report else "no report",
+                source,
+            )
             # A report from a window or a copy is a report of the accessory it was made from.
             target = sources.get(source)
             if target is None:

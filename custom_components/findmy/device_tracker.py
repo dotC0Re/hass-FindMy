@@ -505,7 +505,13 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         self._last_location = (self.coordinator.data or {}).get(self._device)
-        _LOGGER.debug("Updated data from coordinator: %s", self._last_location)
+        # Without the position, which does not belong in a log that may be shared.
+        _LOGGER.debug(
+            "Updated data from coordinator: %s",
+            "no report"
+            if self._last_location is None
+            else f"report from {self._last_location.timestamp.isoformat()}",
+        )
 
         self.async_write_ha_state()
 

@@ -77,7 +77,8 @@ the file; deleting it accepts a newly downloaded bundle.
 ## Debug logs
 
 "Enable debug logging" covers the integration and the FindMy.py library. The credentials of a
-remote Anisette URL (`https://user:password@...`) are removed from their log lines. The `anisette`
+remote Anisette URL (`https://user:password@...`) are removed from their log lines, and the lines
+about a fetch name the device and the time of a report, not its position. The `anisette`
 package behind the integrated provider is left out on purpose: its debug lines contain the
 provisioning secrets of the emulated device. Do not set its logger to debug for a log you share.
 

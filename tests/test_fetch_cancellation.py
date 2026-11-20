@@ -22,7 +22,12 @@ import pytest
 from findmy import KeyPair
 from homeassistant.config_entries import ConfigEntry
 
-from custom_components.findmy import async_setup, async_setup_entry, async_unload_entry
+from custom_components.findmy import (
+    async_remove_entry,
+    async_setup,
+    async_setup_entry,
+    async_unload_entry,
+)
 from custom_components.findmy.account import AccountRuntime, FetchStatus
 from custom_components.findmy.budget import account_budget_id
 from custom_components.findmy.key_cache import CachedFindMyAccessory, SearchWindow
@@ -576,3 +581,84 @@ async def test_next_fetch_is_possible_however_the_last_one_ended(
     await coordinator.async_refresh()
     assert fetches(apple) == 2
     assert coordinator.last_update_success is True
+
+
+def device_entry(hass: HomeAssistant) -> ConfigEntry:
+    data = {"type": "device_rolling_derived", "data": unlocated_accessory().to_json()}
+    return make_config_entry(hass, data)
+
+
+async def loaded_accessory(
+    hass: HomeAssistant, storage: RuntimeStorage, entry: ConfigEntry
+) -> CachedFindMyAccessory:
+    """Set a device entry up and make the coordinator fetch for it, as its entities do."""
+    assert await async_setup_entry(hass, entry) is True
+    accessory = storage.get_entry(entry)
+    assert isinstance(accessory, CachedFindMyAccessory)
+    storage.coordinator.async_add_listener(lambda: None, accessory)
+    return accessory
+
+
+async def test_fetch_keeps_the_checkpoints_of_the_chains_it_walked(
+    hass: HomeAssistant, platforms: MagicMock, apple: Apple, fetch_clock: FetchClock
+) -> None:
+    """The usual case: the next start can begin where this fetch got to."""
+    storage = await start(hass)
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    entry = device_entry(hass)
+    _ = await loaded_accessory(hass, storage, entry)
+    assert storage.key_checkpoints.get(entry.entry_id) == {}
+
+    await storage.coordinator.async_refresh()
+
+    assert fetches(apple) == 1
+    assert storage.key_checkpoints.get(entry.entry_id) != {}
+
+
+@pytest.mark.parametrize("slow", ["search_window", "chain_checkpoints"])
+async def test_device_removed_while_a_fetch_walks_its_chain_leaves_no_checkpoints(  # noqa: PLR0917
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+    slow: str,
+) -> None:
+    """Review findings A-5 and N-2: the fetch still holds the accessory when the entry is gone.
+
+    Removing the device forgets its record. The fetch, held up in the executor while it cut the
+    window or collected the checkpoints, must not write the record again afterwards.
+    """
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    assert await async_setup_entry(hass, account_entry(hass)) is True
+    entry = device_entry(hass)
+    accessory = await loaded_accessory(hass, storage, entry)
+    held = threading.Event()
+    release = threading.Event()
+    original = getattr(CachedFindMyAccessory, slow)
+    calls = 0
+
+    def held_up(self: CachedFindMyAccessory, *args: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        result = original(self, *args)
+        if calls == 1:
+            # The chain is walked; the fetch has not written anything yet.
+            held.set()
+            _ = release.wait(10)
+        return result
+
+    monkeypatch.setattr(CachedFindMyAccessory, slow, held_up)
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    assert await asyncio.to_thread(held.wait, 5)
+
+    assert await asyncio.wait_for(async_unload_entry(hass, entry), 5) is True
+    await async_remove_entry(hass, entry)
+    assert storage.key_checkpoints.get(entry.entry_id) == {}
+    release.set()
+    await asyncio.wait_for(refresh, 10)
+    await hass.async_block_till_done()
+
+    assert accessory.chain_checkpoints() != {}
+    assert storage.key_checkpoints.get(entry.entry_id) == {}

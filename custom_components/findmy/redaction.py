@@ -19,8 +19,9 @@ What this module does
 * :func:`protect_logs` is called once, when the integration is imported. It puts a filter on
   the loggers of FindMy.py and of this integration that redacts the credentials in every
   record, including the traceback of an attached exception, and it keeps the ``anisette``
-  package at info level. The manifest does not list ``anisette`` under ``loggers`` either, so
-  "Enable debug logging" on the integration page does not switch it on.
+  package at warning level, which is Home Assistant's default (its info lines only report
+  progress, such as "Provisioning..."). The manifest does not list ``anisette`` under
+  ``loggers`` either, so "Enable debug logging" on the integration page does not switch it on.
 
 Limits
 ------
@@ -32,9 +33,12 @@ Limits
   configuration or with its service, gets these lines. That is a decision of its own and is
   left alone; only the general switches (the default level, the button on the integration
   page) no longer reach it.
-* Credentials are found by the shape ``scheme://userinfo@``. A password with an unencoded
-  ``/``, ``?`` or ``#`` does not have that shape; such a URL is refused when it is entered
-  (see ``_is_valid_anisette_url`` in config_flow.py), so it never gets as far as a request.
+* Credentials are found by the shape ``scheme://userinfo@``, where the user info has no
+  ``/``, ``?``, ``#``, quote, angle bracket or white space: in a log line, these are where a
+  URL ends. A URL whose credentials contain one of them unencoded is refused when it is
+  entered (:func:`credentials_are_recognised`, used by the config flow), so it never gets as
+  far as a request. An entry created before this check existed keeps its URL until the account
+  signs in again.
 """
 
 from __future__ import annotations
@@ -67,6 +71,19 @@ _ANISETTE_LOGGER = "anisette"
 def redact_url_credentials(text: str) -> str:
     """Replace the ``user:password`` of every URL in a text."""
     return _URL_CREDENTIALS.sub(f"{REDACTED}@", text)
+
+
+def credentials_are_recognised(url: str) -> bool:
+    """Whether the redaction finds the credentials of this URL, or it has none.
+
+    Raises ValueError for a URL that cannot be taken apart.
+    """
+    parsed = urlsplit(url)
+    if parsed.username is None and parsed.password is None:
+        return True
+    # What must be left of the host part once the credentials are gone.
+    host = parsed.netloc.rpartition("@")[2]
+    return f"://{REDACTED}@{host}" in redact_url_credentials(url)
 
 
 def describe_error(err: BaseException) -> str:
@@ -143,4 +160,4 @@ def protect_logs(package: str, package_path: list[str]) -> None:
     anisette = logging.getLogger(_ANISETTE_LOGGER)
     if anisette.level == logging.NOTSET:
         # Its modules inherit this. A level somebody set by name stays as it is.
-        anisette.setLevel(logging.INFO)
+        anisette.setLevel(logging.WARNING)
