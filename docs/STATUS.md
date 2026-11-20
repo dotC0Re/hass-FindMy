@@ -54,7 +54,7 @@ Last updated: 2026-11-20, after the fixes from the third external review (findin
 | review N-2 | The fix for A-5 is tested through the coordinator: a fetch keeps the checkpoints of the chains it walked, and a device removed while the fetch is held up in the executor leaves none. |
 | review A-5 | A fetch that was cutting the search window of a device while the device was removed no longer brings its key chain checkpoints back. |
 | review A-9, A-15, A-18, A-19 | Wording: disabled entries lose their stored password once any entry of the integration is loaded; checkpoints change hourly with an account; the event loop does take the derivation lock briefly; the checkpoint file together with one recorded advertisement is enough to recognise the accessory later. |
-| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.1`), so that it can be told apart from the original integration (`v0.0.1`). |
+| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.2`), so that it can be told apart from the original integration (`v0.0.1`). |
 | — | Test suite (678 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
