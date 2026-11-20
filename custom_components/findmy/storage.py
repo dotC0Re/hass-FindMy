@@ -2,8 +2,9 @@
 
 One :class:`RuntimeStorage` exists per Home Assistant instance. It maps config entries to the
 object each of them stands for (an Apple account or a device), and owns what all entries share:
-the coordinator, the FindMy worker thread, the fetch budget of the accounts (budget.py) and the
-latest location report of each device (last_reports.py).
+the coordinator, the FindMy worker thread, the fetch budget of the accounts (budget.py), the
+latest location report of each device (last_reports.py) and the checkpoints of the key chains
+of rolling-key accessories (key_checkpoints.py).
 
 Accounts are stored as :class:`~.account.AccountRuntime`. The library account behind one lives
 on the worker thread and is created and closed there, see account.py.
@@ -26,6 +27,7 @@ from .budget import PersistentFetchBudget
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
 from .key_cache import CachedFindMyAccessory
+from .key_checkpoints import KeyCheckpointStore
 from .last_reports import LastReportStore
 from .worker import FindMyWorker
 
@@ -66,8 +68,15 @@ class RuntimeStorage:
         # The latest report of each device, kept across restarts so that the entities have a
         # location before the first fetch. Loaded in async_setup.
         self.reports: LastReportStore = LastReportStore(hass)
+        # Where the key chain of each rolling-key accessory may start after a restart instead
+        # of at its pairing. Loaded in async_setup; kept up to date by the coordinator after
+        # every fetch, and here when an accessory is unloaded or Home Assistant stops.
+        self.key_checkpoints: KeyCheckpointStore = KeyCheckpointStore(hass)
         self._coordinator: FindMyCoordinator = FindMyCoordinator(self._hass, self)
         self._worker: FindMyWorker | None = None
+        # Also what the Bluetooth matching derived, in a setup without any account. Written by
+        # the delayed save that Home Assistant flushes at its final write.
+        _ = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_keep_all_checkpoints)
 
     @classmethod
     def attach(cls, hass: HomeAssistant) -> RuntimeStorage:
@@ -125,6 +134,20 @@ class RuntimeStorage:
     def get_entry(self, entry: ConfigEntry[EntryData]) -> StorageItem:
         return self._entries[entry.entry_id]
 
+    async def async_keep_checkpoints(self, entry_id: str, accessory: CachedFindMyAccessory) -> None:
+        """Remember where the key chains of an accessory may start after a restart."""
+        checkpoints = await self._hass.async_add_executor_job(accessory.chain_checkpoints)
+        self.key_checkpoints.remember(entry_id, checkpoints)
+
+    async def _async_keep_all_checkpoints(self, _event: Event) -> None:
+        for entry_id, item in list(self._entries.items()):
+            if isinstance(item, CachedFindMyAccessory):
+                await self.async_keep_checkpoints(entry_id, item)
+
+    def get_item(self, entry_id: str) -> StorageItem | None:
+        """The object stored for a config entry, or None while the entry is not loaded."""
+        return self._entries.get(entry_id)
+
     def get_entry_id(self, item: StorageItem) -> str | None:
         """The id of the config entry an item was stored for, if it still is."""
         return next(
@@ -167,6 +190,16 @@ class RuntimeStorage:
         if data["type"] == "device_rolling_derived":
             # Derived keys are kept between fetches and local refreshes, see key_cache.py.
             accessory = CachedFindMyAccessory.from_json(data["data"])
+            # Before anything derives a key, so that the key chain starts close to where its
+            # keys are needed instead of at the pairing.
+            checkpoints = self.key_checkpoints.get(entry.entry_id)
+            if checkpoints and isinstance(accessory, CachedFindMyAccessory):
+                if accessory.restore_chain_checkpoints(checkpoints):
+                    _LOGGER.debug("Restored the key chain checkpoints of %s", accessory.name)
+                else:
+                    # Not taken, as for checkpoints that do not belong to the accessory: the
+                    # record goes, and the next save writes the accessory's own ones.
+                    self.key_checkpoints.forget(entry.entry_id)
 
             _LOGGER.debug(
                 "Storing entry %s as rolling (derived) tag: %s",
@@ -197,6 +230,13 @@ class RuntimeStorage:
         item = self._entries.pop(entry.entry_id)
 
         if isinstance(item, AccountRuntime):
+            # A fetch with the account holds the worker for up to two minutes, and the close
+            # would queue behind it. Removed from the entries first, so that no new refresh
+            # picks the account in the meantime.
+            await self._coordinator.async_cancel_fetch(item)
             await item.async_close()
+        elif isinstance(item, CachedFindMyAccessory):
+            # A reload sets the accessory up again from its config entry.
+            await self.async_keep_checkpoints(entry.entry_id, item)
 
         return item

@@ -31,6 +31,9 @@ Guarantees
 * Cancelling the caller cancels the job on the worker (or removes it from the queue).
   The caller is released right away; the next job starts only after the cancelled one
   has finished unwinding.
+* A caller can learn whether its job ever started, see :func:`notify_job_start`. A job
+  that was cancelled in the queue, or rejected because the worker was not running, never
+  ran any of its code.
 * Stopping cancels the running job and all queued jobs, runs the registered stop
   callbacks (e.g. closing aiohttp sessions) on the worker, shuts down async generators
   and the worker loop's default executor, closes the loop and ends the thread. The
@@ -73,10 +76,12 @@ import enum
 import itertools
 import logging
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, final
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Generator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +92,31 @@ _STOP_CALLBACK_TIMEOUT = 10.0
 
 class WorkerNotRunningError(RuntimeError):
     """The worker was not started yet, or is stopping or stopped."""
+
+
+# What to call when a job submitted from the current context starts, see notify_job_start.
+_job_start_callback: ContextVar[Callable[[], object] | None] = ContextVar(
+    "findmy_worker_job_start", default=None
+)
+
+
+@contextmanager
+def notify_job_start(callback: Callable[[], object]) -> Generator[None]:
+    """Call ``callback`` when a job submitted inside this block starts on the worker.
+
+    The callback runs on the event loop that submitted the job, soon after the job got its
+    turn and before its result arrives there. It is not called for a job that never started:
+    cancelled while it waited in the queue, or rejected because the worker was not running.
+
+    A context variable instead of a parameter of :meth:`FindMyWorker.run`, so that it also
+    reaches the job of a caller that submits it through another layer (account.py). It does
+    not reach jobs submitted from tasks created inside the block before the block was left.
+    """
+    token = _job_start_callback.set(callback)
+    try:
+        yield
+    finally:
+        _job_start_callback.reset(token)
 
 
 class _State(enum.Enum):
@@ -165,9 +195,10 @@ class FindMyWorker:
         semantics of ``timeout``, cancellation and stopping.
         """
         self._reject_worker_thread("run")
+        started = self._start_notifier(_job_start_callback.get())
         with self._state_lock:
             loop = self._require_running()
-            job = self._execute(factory, timeout)
+            job = self._execute(factory, timeout, started)
             try:
                 future = asyncio.run_coroutine_threadsafe(job, loop)
             except BaseException:
@@ -263,9 +294,35 @@ class FindMyWorker:
             msg = f"{method}() called from inside a job of {self._name} would deadlock"
             raise RuntimeError(msg)
 
-    async def _execute[T](self, factory: Callable[[], Awaitable[T]], limit: float | None) -> T:
-        async with self._job_lock, asyncio.timeout(limit):
-            return await factory()
+    @staticmethod
+    def _start_notifier(callback: Callable[[], object] | None) -> Callable[[], None] | None:
+        """Make the function the worker calls to hand ``callback`` to the caller's loop."""
+        if callback is None:
+            return None
+        caller = asyncio.get_running_loop()
+
+        def started() -> None:
+            try:
+                _ = caller.call_soon_threadsafe(callback)
+            except RuntimeError:
+                # The caller's loop is closed; there is nobody left to tell.
+                _LOGGER.debug("Could not report the start of a job to a closed loop")
+
+        return started
+
+    async def _execute[T](
+        self,
+        factory: Callable[[], Awaitable[T]],
+        limit: float | None,
+        started: Callable[[], None] | None = None,
+    ) -> T:
+        async with self._job_lock:
+            # Before the result can be handed back: both go through call_soon_threadsafe to
+            # the caller's loop, which runs them in this order.
+            if started is not None:
+                started()
+            async with asyncio.timeout(limit):
+                return await factory()
 
     def _thread_main(self, loop: asyncio.AbstractEventLoop) -> None:
         try:

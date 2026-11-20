@@ -17,7 +17,9 @@ lead to is applied here afterwards; key_cache.py explains the model and why it w
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, final, override
 
@@ -41,7 +43,7 @@ from ._entity import account_name
 from .budget import MIN_FETCH_INTERVAL, account_budget_id
 from .const import signal_account_fetch
 from .key_cache import CachedFindMyAccessory, CatchUpWindow, SearchWindow
-from .worker import WorkerNotRunningError
+from .worker import WorkerNotRunningError, notify_job_start
 
 if TYPE_CHECKING:
     from asyncio import TimerHandle
@@ -59,6 +61,23 @@ FindMyDevice = KeyPair | FindMyAccessory | FixedRollingKeyPairAccessory
 # A report is a library object once it was fetched in this run, and plain data while it is the
 # one restored after a restart (last_reports.py). The entities read the same attributes of both.
 type FindMyLocationData = dict[FindMyDevice, KnownReport | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """What a source of a fetch stands for: a device, and the entry it was stored for.
+
+    A device entry may be reloaded while a fetch runs. Its device is then a new object by the
+    time the fetch ends, and what the fetch found belongs to that one: the entry id finds it.
+    """
+
+    device: FindMyDevice
+    # None for a device the storage does not know, which only tests register.
+    entry_id: str | None
+
+
+# What a fetch searched, each source mapped to what it stands for, and what it found.
+type _FetchResult = tuple[dict[FetchSource, _Target], dict[FetchSource, LocationReport | None]]
 
 # Raised by FindMy.py when a session expired and no password is stored to sign in again. That
 # is the normal end of a session: accounts are restored without their password (account.py).
@@ -148,20 +167,54 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         self._storage = storage
 
         self._refresh_handle: TimerHandle | None = None
+        # The fetch of the refresh that is running, and the account it uses; see
+        # async_cancel_fetch.
+        self._running_fetch: tuple[AccountRuntime, asyncio.Task[_FetchResult]] | None = None
 
     def schedule_refresh(self, delay_seconds: float = 10.0) -> None:
         """Schedule a refresh after a quiet period."""
         if self._refresh_handle is not None:
             self._refresh_handle.cancel()
+            self._refresh_handle = None
+        if self._shutdown_requested:
+            # An entry set up while Home Assistant stops; it would not refresh anyway.
+            return
 
         def _request_refresh() -> None:
             self._refresh_handle = None
-            _ = self.hass.async_create_task(
-                self.async_request_refresh(),
-                name="findmy delayed startup refresh",
+            # A background task, like the refreshes Home Assistant schedules itself: the start
+            # of Home Assistant does not wait for a fetch that the setup of an entry asked for,
+            # and the task is cancelled when Home Assistant stops.
+            _ = self.hass.async_create_background_task(
+                self._async_delayed_refresh(),
+                name="findmy delayed refresh",
             )
 
         self._refresh_handle = self.hass.loop.call_later(delay_seconds, _request_refresh)
+
+    async def _async_delayed_refresh(self) -> None:
+        """Run the delayed refresh; nobody awaits the task, so its errors are logged here."""
+        try:
+            # Not async_request_refresh: its debouncer runs the refresh in a task of its own,
+            # which Home Assistant would track and wait for again. The timer above already
+            # coalesces the setups of several entries into one refresh.
+            await self.async_refresh()
+        except Exception:
+            # The coordinator handles what a fetch raises; whatever gets here is a bug.
+            _LOGGER.exception("The delayed refresh of the location reports failed")
+
+    @override
+    async def async_shutdown(self) -> None:
+        """Cancel every planned refresh, including the delayed one, and ignore new ones.
+
+        Home Assistant calls this when it stops (see storage.py). The coordinator belongs to
+        no config entry, so nothing else would: without it, a refresh planned before the stop
+        could still start while Home Assistant shuts down.
+        """
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        await super().async_shutdown()
 
     def _fetchable_accounts(self) -> list[AccountRuntime]:
         """Accounts that take part in the rotation: all but those waiting for a new sign-in."""
@@ -266,9 +319,7 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         """Returns a list of all devices that have been registered with the coordinator."""
         return list({ctx for ctx in self.async_contexts() if isinstance(ctx, FindMyDevice)})  # pyright: ignore[reportAny]
 
-    async def _async_fetch_sources(
-        self, devices: list[FindMyDevice]
-    ) -> dict[FetchSource, FindMyDevice]:
+    async def _async_fetch_sources(self, devices: list[FindMyDevice]) -> dict[FetchSource, _Target]:
         """Prepare what the worker searches, each source mapped to the device it stands for.
 
         A cached accessory is searched through its top window, cut in an executor thread
@@ -280,48 +331,117 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         older indices are searched bit by bit through catch-up windows, see key_cache.py.
         """
         now = datetime.now(tz=UTC)
-        sources: dict[FetchSource, FindMyDevice] = {}
+        sources: dict[FetchSource, _Target] = {}
         for device in devices:
+            # Taken now: an entry reloaded during the fetch has a new object afterwards.
+            target = _Target(device, self._storage.get_entry_id(device))
             if isinstance(device, CachedFindMyAccessory):
                 window = await self.hass.async_add_executor_job(device.search_window, now)
-                sources[window] = device
+                sources[window] = target
+                if target.entry_id is not None:
+                    # The window has walked the key chain; the next start can begin there.
+                    await self._storage.async_keep_checkpoints(target.entry_id, device)
                 planned = device.plan_catch_up(now)
                 if planned is not None:
                     _LOGGER.debug("Catching up on key indices %i..%i of %s", *planned, device.name)
                     catch_up = await self.hass.async_add_executor_job(
                         device.catch_up_window, *planned
                     )
-                    sources[catch_up] = device
+                    sources[catch_up] = target
             elif isinstance(device, FindMyAccessory):
-                sources[_fetch_copy(device)] = device
+                sources[_fetch_copy(device)] = target
             else:
                 # Static key pairs and accessories with pre-generated keys: the fetch only
                 # reads them and nothing ever changes them, so they are safe to share.
-                sources[device] = device
+                sources[device] = target
         return sources
 
-    def _apply_alignments(self, sources: dict[FetchSource, FindMyDevice]) -> None:
+    def _current_device(self, target: _Target) -> FindMyDevice | None:
+        """The device that stands for a target now; None while its entry is not loaded."""
+        if target.entry_id is None:
+            return target.device
+        item = self._storage.get_item(target.entry_id)
+        return item if isinstance(item, FindMyDevice) else None
+
+    def _apply_alignments(self, sources: dict[FetchSource, _Target]) -> None:
         """Realign the accessories with what the reports of a finished fetch showed.
 
         FindMy.py reports alignments to the source it searched, on the worker thread. The
         accessories themselves are only ever realigned here, on the event loop, where the
-        Bluetooth matching reads and updates the same alignment (device_tracker.py).
+        Bluetooth matching reads and updates the same alignment (device_tracker.py). An
+        accessory whose entry was reloaded meanwhile gets the alignment as its new object.
         """
-        for source, device in sources.items():
+        for source, target in sources.items():
+            device = self._current_device(target)
+            if not isinstance(device, FindMyAccessory):
+                continue
             if isinstance(source, SearchWindow):
                 found = source.found_alignment
                 if found is not None:
-                    source.accessory.update_alignment(*found)
-            elif source is not device and isinstance(device, FindMyAccessory):
+                    device.update_alignment(*found)
+            elif source is not target.device:
                 assert isinstance(source, FindMyAccessory)
                 _apply_copy_alignment(source, device)
 
+    async def async_cancel_fetch(self, account: AccountRuntime) -> None:
+        """Cancel the fetch that is running with an account, and wait until it has ended.
+
+        For an account entry that is unloaded. Its account is closed on the worker, and that
+        job would otherwise wait behind the fetch for up to its time limit. A fetch with any
+        other account is left alone: it goes on to the end, and the close waits for it. That
+        wait is bounded by the time limit and usually takes seconds, while cancelling the
+        fetch would throw away its reports and, once it reached Apple, still cost that
+        account its next 15 minutes. A reload of the entry would wait for that fetch anyway,
+        to open its new account on the worker.
+
+        Nothing of a cancelled fetch is taken over: no report, no alignment (its job may still
+        be unwinding on the worker), no move of a catch-up cursor. It counts against the
+        budget only if its job had started, see _async_fetch.
+        """
+        running = self._running_fetch
+        if running is None or running[0] is not account:
+            return
+        fetch = running[1]
+        _LOGGER.debug("Cancelling the fetch with %s, whose entry is unloaded", account)
+        _ = fetch.cancel()
+        # The refresh it belongs to handles the cancellation; this only waits for its end.
+        _ = await asyncio.wait({fetch})
+
+    def _fetch_ended(self, fetch: asyncio.Task[_FetchResult]) -> None:
+        """Let the next refresh fetch again, once the fetch task has ended on any path."""
+        if self._running_fetch is not None and self._running_fetch[1] is fetch:
+            self._running_fetch = None
+
+    async def _async_prepare_and_fetch(
+        self, account: AccountRuntime, budget_id: str, devices: list[FindMyDevice]
+    ) -> _FetchResult:
+        """Prepare the sources of a fetch and run it; the part async_cancel_fetch cancels."""
+        sources = await self._async_fetch_sources(devices)
+        return sources, await self._async_fetch(account, budget_id, sources)
+
     async def _async_fetch(
-        self, account: AccountRuntime, sources: dict[FetchSource, FindMyDevice]
+        self,
+        account: AccountRuntime,
+        budget_id: str,
+        sources: dict[FetchSource, _Target],
     ) -> dict[FetchSource, LocationReport | None]:
         """Run the fetch on the worker and take over the alignments it found."""
+        budget = self._storage.budget
+
+        def count_fetch() -> None:
+            # The fetch counts against the limit of the account once its job starts on the
+            # worker, whatever happens afterwards: from then on it may have reached Apple, and
+            # a fetch that crashes, hangs or times out must not be repeated at once. A fetch
+            # that never got that far did not leave Home Assistant and does not count: one
+            # cancelled while its keys were derived or while it waited for the worker (Home
+            # Assistant stopping, the account being unloaded), or one the stopped worker
+            # turned away. Counting those would make the account wait up to 15 minutes after
+            # a restart or a reload for a fetch that never happened.
+            budget.record_fetch(budget_id, _utcnow())
+
         try:
-            reports = await account.async_fetch(list(sources), timeout=_FETCH_TIMEOUT)
+            with notify_job_start(count_fetch):
+                reports = await account.async_fetch(list(sources), timeout=_FETCH_TIMEOUT)
         except Exception:
             # The job on the worker is over, so the sources are no longer in use there. What
             # the reports of the accessories searched before the failure showed still holds.
@@ -364,6 +484,11 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
     async def _async_update_data(self) -> FindMyLocationData:
         budget = self._storage.budget
         await budget.async_load()
+        if self.hass.is_stopping:
+            # A refresh that was asked for while Home Assistant stops. Scheduled refreshes
+            # and those after the shutdown of this coordinator never get here.
+            _LOGGER.debug("Home Assistant is stopping; not fetching location reports")
+            return self.data or {}
         try:
             return await self._async_fetch_with_next_account(budget)
         finally:
@@ -377,6 +502,20 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         re-authentication and manual refreshes. That makes this the one place that keeps the
         15-minute limit of each account.
         """
+        if self._running_fetch is not None:
+            # At most one fetch is prepared or running at a time. Home Assistant runs one
+            # refresh at a time already (the lock of its debouncer), but a refresh that was
+            # cancelled releases that lock while its fetch task may still be unwinding, and
+            # the fetch is only counted against the budget once its job starts. A second fetch
+            # in between could pick the same account and fetch twice within seconds.
+            #
+            # Not waiting for the running fetch: its result reaches the listeners anyway when
+            # it ends, and waiting could hold a caller for up to the fetch limit. This refresh
+            # keeps the data like one the budget turned away; the schedule that follows the
+            # running fetch plans the next one, also for another account in the rotation.
+            _LOGGER.debug("A fetch is already running; keeping the current data")
+            return self.data or {}
+
         rotation = self._rotation()
         if not rotation:
             if self._storage.accounts:
@@ -400,19 +539,37 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         account = rotation[budget_id]
         _LOGGER.debug("Using lookup account: %s", account)
 
-        # Counted from the start, so that a fetch that crashes, hangs or times out counts too.
-        budget.record_fetch(budget_id, now)
+        # Counted against the budget once the worker starts the fetch, see _async_fetch.
         account.fetch_started()
         self._signal_fetch(account)
 
         devices: list[FindMyDevice] = self.devices
         _LOGGER.debug("Fetching reports for devices: %s", devices)
         success = False
+        # A task of its own, so that unloading the account can cancel the fetch without
+        # cancelling whoever runs this refresh (see async_cancel_fetch). Created inside the try
+        # block, so that a failure still ends the fetch started above.
+        fetch: asyncio.Task[_FetchResult] | None = None
         try:
-            # Inside the try block, so that a failure still ends the fetch started above.
-            sources = await self._async_fetch_sources(devices)
-            device_reports = await self._async_fetch(account, sources)
+            fetch = asyncio.create_task(
+                self._async_prepare_and_fetch(account, budget_id, devices),
+                name="findmy location fetch",
+            )
+            self._running_fetch = (account, fetch)
+            # Released when the task has ended, not when this refresh does: a refresh that is
+            # cancelled itself returns before its fetch task has unwound.
+            fetch.add_done_callback(self._fetch_ended)
+            sources, device_reports = await fetch
             success = True
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is None or task.cancelling() or fetch is None or not fetch.cancelled():
+                # This refresh itself was cancelled; the fetch went with it.
+                raise
+            # Cancelled by async_cancel_fetch. Not a failure of the coordinator: the other
+            # devices keep their data, and the next fetch uses another account.
+            _LOGGER.debug("The fetch with %s was cancelled", account)
+            return self.data or {}
         except WorkerNotRunningError as err:
             # Home Assistant is stopping; the worker has cancelled the fetch.
             msg = "Fetching location reports was interrupted by the shutdown"
@@ -451,21 +608,30 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
     def _take_over_reports(
         self,
-        sources: dict[FetchSource, FindMyDevice],
+        sources: dict[FetchSource, _Target],
         device_reports: dict[FetchSource, LocationReport | None],
     ) -> FindMyLocationData:
-        """Merge the reports of a fetch that worked into the data of the coordinator."""
+        """Merge the reports of a fetch that worked into the data of the coordinator.
+
+        A report belongs to the device that is loaded for its entry when the fetch ends, which
+        is a new object if the entry was reloaded meanwhile. It is remembered for the entry as
+        long as the entry exists, also while it is not loaded: its next setup restores it.
+        """
         # Only after a fetch that worked, so that a failed one searches the same windows again.
-        for source in sources:
-            if isinstance(source, CatchUpWindow):
+        # A reloaded accessory starts a sweep of its own.
+        for source, target in sources.items():
+            if (
+                isinstance(source, CatchUpWindow)
+                and self._current_device(target) is source.accessory
+            ):
                 source.accessory.catch_up_searched(source)
 
-        fetched: dict[FindMyDevice, LocationReport] = {}
+        fetched: dict[_Target, LocationReport] = {}
         for source, report in device_reports.items():
             _LOGGER.debug("Got reports for device: %s - %s", source, report)
             # A report from a window or a copy is a report of the accessory it was made from.
-            device = sources.get(source)
-            if device is None:
+            target = sources.get(source)
+            if target is None:
                 _LOGGER.warning("Got a report for something that was not asked for: %s", source)
                 continue
             if not report:
@@ -473,16 +639,17 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
             # The top window and a catch-up window of an accessory can both bring a report;
             # the newer one counts.
-            known = fetched.get(device)
+            known = fetched.get(target)
             if known is None or report.timestamp >= known.timestamp:
-                fetched[device] = report
-
-        # Kept across restarts, see last_reports.py.
-        for device, report in fetched.items():
-            entry_id = self._storage.get_entry_id(device)
-            if entry_id is not None:
-                self._storage.reports.remember(entry_id, report)
+                fetched[target] = report
 
         data: FindMyLocationData = (self.data or {}).copy()
-        data.update(fetched)
+        for target, report in fetched.items():
+            entry_id = target.entry_id
+            if entry_id is not None and self.hass.config_entries.async_get_entry(entry_id):
+                # Kept across restarts, see last_reports.py.
+                self._storage.reports.remember(entry_id, report)
+            device = self._current_device(target)
+            if device is not None:
+                data[device] = report
         return data
