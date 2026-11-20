@@ -329,12 +329,18 @@ def _chain_access_works() -> bool:
     Compares, on throwaway accessories with fixed keys, a key derived from a restored checkpoint
     with the same key derived by FindMy.py from index 0, and checks that a wrong checkpoint does
     change the result, so that the generator really continues from what it was given.
+
+    Must not be called with _DERIVE_LOCK held: the check derives a few keys itself and takes
+    the lock for that, like every other derivation. After a start several executor threads ask
+    at the same moment, before the first answer is remembered; without the lock each of them
+    would run the check next to the others.
     """
-    try:
-        return CachedFindMyAccessory.probe_chain_access()
-    except Exception:
-        _LOGGER.debug("Cannot use FindMy.py's key generator for checkpoints", exc_info=True)
-        return False
+    with _DERIVE_LOCK:
+        try:
+            return CachedFindMyAccessory.probe_chain_access()
+        except Exception:
+            _LOGGER.debug("Cannot use FindMy.py's key generator for checkpoints", exc_info=True)
+            return False
 
 
 def _evict_farthest[T](cache: dict[int, T], newest: int, limit: int) -> None:
