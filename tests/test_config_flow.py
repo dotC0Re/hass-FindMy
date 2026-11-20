@@ -1698,7 +1698,7 @@ async def test_changed_library_bundle_stops_the_sign_in(hass, accounts, libs, so
         else flow.async_step_acc_login
     )
     email = EMAIL if source == config_entries.SOURCE_REAUTH else "new@example.com"
-    libs.error = AnisetteLibsChecksumError(libs.path, "a" * 64, "b" * 64)
+    libs.error = AnisetteLibsChecksumError(libs.path, "a" * 64, "b" * 64, "c" * 64)
 
     with caplog.at_level(logging.DEBUG):
         result = await step(login_input(email=email))

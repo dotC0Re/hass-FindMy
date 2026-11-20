@@ -166,38 +166,227 @@ async def test_concurrent_callers_share_one_download(
     assert len(download.requests) == 1
 
 
-async def test_changed_bundle_is_refused_with_instructions(
-    hass: HomeAssistant, download: FakeDownload
+def body_ends_early(download: FakeDownload) -> None:
+    download.fail_after_first_chunk = True
+
+
+def body_is_cut_off(download: FakeDownload) -> None:
+    # Arrives without an error, as from a server that closed the connection without having
+    # announced a length.
+    download.body = download.body[: len(download.body) // 2]
+
+
+def body_is_empty(download: FakeDownload) -> None:
+    download.body = b""
+
+
+def body_is_not_an_archive(download: FakeDownload) -> None:
+    download.body = b"<html>503 Service Unavailable</html>" * 100
+
+
+def body_lacks_a_library(download: FakeDownload) -> None:
+    download.body = make_library_archive(libraries=ANISETTE_LIBRARIES[:1])
+
+
+def server_reports_an_error(download: FakeDownload) -> None:
+    download.status = 503
+
+
+def damage(path: Path) -> bytes:
+    """Cut the bundle off, as a process killed while the library re-saves it would."""
+    damaged = path.read_bytes()[:100]
+    path.write_bytes(damaged)
+    return damaged
+
+
+async def test_damaged_bundle_is_repaired_from_a_download_with_the_recorded_checksum(
+    hass: HomeAssistant,
+    download: FakeDownload,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """The server still sends the bundle that was recorded, so nothing new is accepted."""
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    expected = recorded_checksum(hass)
+    checksum_record = path.with_name(CHECKSUM_FILE).read_bytes()
+    damaged = damage(path)
+
+    with caplog.at_level(logging.WARNING):
+        assert await async_ensure_anisette_libs(hass) == path
+
+    # One download for the repair, after the one that stored the bundle.
+    assert len(download.requests) == 2
+    assert path.read_bytes() == original
+    assert path.with_name(CHECKSUM_FILE).read_bytes() == checksum_record
+    assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
+    # The log says what happened, with the checksum of the damaged file and the recorded one.
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "replaced by a verified copy" in warning
+    assert str(path) in warning
+    assert hashlib.sha256(damaged).hexdigest() in warning
+    assert expected in warning
+    # The repaired file is a bundle a provider loads, and the next check needs no download.
+    _ = await hass.async_add_executor_job(load_without_download, monkeypatch, path)
+    assert await async_ensure_anisette_libs(hass) == path
+    assert len(download.requests) == 2
+
+
+async def test_bundle_is_not_replaced_by_a_download_with_another_checksum(
+    hass: HomeAssistant, download: FakeDownload, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Whatever happened to the file: a new checksum is never accepted on a mismatch."""
     path = await async_ensure_anisette_libs(hass)
     expected = recorded_checksum(hass)
-    tampered = path.read_bytes() + b"tampered"
-    path.write_bytes(tampered)
+    checksum_record = path.with_name(CHECKSUM_FILE).read_bytes()
+    damaged = damage(path)
+    download.body = make_library_archive("v2")
 
-    with pytest.raises(AnisetteLibsChecksumError) as raised:
+    with caplog.at_level(logging.WARNING), pytest.raises(AnisetteLibsChecksumError) as raised:
         _ = await async_ensure_anisette_libs(hass)
 
     message = str(raised.value)
     assert str(path) in message
     assert expected in message
-    assert hashlib.sha256(tampered).hexdigest() in message
+    assert hashlib.sha256(damaged).hexdigest() in message
+    assert raised.value.downloaded in message
+    assert raised.value.downloaded not in {expected, hashlib.sha256(damaged).hexdigest()}
     assert "delete this file" in message
     assert raised.value.path == path
-    # Neither replaced by a new download nor touched.
-    assert len(download.requests) == 1
-    assert path.read_bytes() == tampered
-    assert recorded_checksum(hass) == expected
+    # Nothing was replaced: the file is there for the user to look at.
+    assert len(download.requests) == 2
+    assert path.read_bytes() == damaged
+    assert path.with_name(CHECKSUM_FILE).read_bytes() == checksum_record
+    assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
+    assert "replaced by a verified copy" not in caplog.text
 
-
-async def test_damaged_bundle_is_refused(hass: HomeAssistant, download: FakeDownload) -> None:
-    """A file that was cut off, e.g. by a crash while the library was saving it."""
-    path = await async_ensure_anisette_libs(hass)
-    path.write_bytes(path.read_bytes()[:100])
-
+    # Asking again changes nothing, however often.
     with pytest.raises(AnisetteLibsChecksumError):
         _ = await async_ensure_anisette_libs(hass)
+    assert path.read_bytes() == damaged
 
-    assert len(download.requests) == 1
+
+async def test_changed_bundle_of_full_size_is_treated_like_a_damaged_one(
+    hass: HomeAssistant, download: FakeDownload
+) -> None:
+    """Not only a file that was cut off: any content that does not match."""
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    path.write_bytes(original + b"tampered")
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert path.read_bytes() == original
+    assert len(download.requests) == 2
+
+
+async def test_repair_that_times_out_is_retryable_and_replaces_nothing(
+    hass: HomeAssistant, download: FakeDownload, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    damaged = damage(path)
+    download.hang = True
+    monkeypatch.setattr(anisette_libs, "_DOWNLOAD_TIMEOUT", 0.05)
+
+    with pytest.raises(AnisetteLibsUnavailableError) as raised:
+        _ = await async_ensure_anisette_libs(hass)
+
+    # The message tells both: why a download was needed and why it did not help.
+    assert "does not match its recorded checksum" in str(raised.value)
+    assert "did not finish within" in str(raised.value)
+    assert str(path) in str(raised.value)
+    assert download.cancelled
+    assert path.read_bytes() == damaged
+    assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
+
+    # The next attempt repairs it once the server answers.
+    download.hang = False
+    assert await async_ensure_anisette_libs(hass) == path
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "break_download",
+    [
+        body_ends_early,
+        body_is_cut_off,
+        body_is_empty,
+        body_is_not_an_archive,
+        body_lacks_a_library,
+        server_reports_an_error,
+    ],
+)
+async def test_failed_repair_download_is_retryable_and_replaces_nothing(
+    hass: HomeAssistant, download: FakeDownload, break_download: Callable[[FakeDownload], None]
+) -> None:
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    checksum_record = path.with_name(CHECKSUM_FILE).read_bytes()
+    complete = download.body
+    damaged = damage(path)
+    break_download(download)
+
+    with pytest.raises(AnisetteLibsUnavailableError):
+        _ = await async_ensure_anisette_libs(hass)
+
+    assert path.read_bytes() == damaged
+    assert path.with_name(CHECKSUM_FILE).read_bytes() == checksum_record
+    assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
+
+    download.body, download.status, download.fail_after_first_chunk = complete, 200, False
+    assert await async_ensure_anisette_libs(hass) == path
+    assert path.read_bytes() == original
+
+
+async def test_repair_that_cannot_write_is_retryable_and_leaves_the_file(
+    hass: HomeAssistant, download: FakeDownload, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E.g. a full disk, or the file being held open on Windows."""
+    path = await async_ensure_anisette_libs(hass)
+    damaged = damage(path)
+    original_replace = Path.replace
+
+    def replace(source: Path, target: Path) -> Path:
+        if target.name == BUNDLE_FILE:
+            msg = "access denied"
+            raise OSError(msg)
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(AnisetteLibsUnavailableError, match="could not be replaced"):
+        _ = await async_ensure_anisette_libs(hass)
+
+    assert path.read_bytes() == damaged
+    assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
+
+
+async def test_bundle_that_is_whole_again_after_the_download_is_left_alone(
+    hass: HomeAssistant, download: FakeDownload, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider needed longer to re-save the file than the comparison waited."""
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    _ = damage(path)
+    real_download = anisette_libs._async_download
+    writes: list[str] = []
+
+    async def download_while_the_provider_finishes(hass: HomeAssistant) -> bytes:
+        archive = await real_download(hass)
+        path.write_bytes(original)
+        return archive
+
+    def no_write(target: Path, _data: bytes) -> None:
+        writes.append(target.name)
+
+    monkeypatch.setattr(anisette_libs, "_async_download", download_while_the_provider_finishes)
+    monkeypatch.setattr(anisette_libs, "_write", no_write)
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert writes == []
+    assert path.read_bytes() == original
 
 
 async def test_mismatch_is_compared_again_before_it_is_reported(
@@ -231,20 +420,21 @@ async def test_deleting_the_bundle_accepts_a_new_one(
     path = await async_ensure_anisette_libs(hass)
     old_checksum = recorded_checksum(hass)
     path.write_bytes(b"changed")
+    download.body = make_library_archive("v2")
     with pytest.raises(AnisetteLibsChecksumError):
         _ = await async_ensure_anisette_libs(hass)
 
     path.unlink()
-    download.body = make_library_archive("v2")
     with caplog.at_level(logging.WARNING):
         assert await async_ensure_anisette_libs(hass) == path
 
-    assert len(download.requests) == 2
+    # The first bundle, the attempt to repair it, and the one that is accepted.
+    assert len(download.requests) == 3
     assert recorded_checksum(hass) == sha256(path) != old_checksum
     # The change of the bundle leaves a trace.
     assert old_checksum in caplog.text
     assert await async_ensure_anisette_libs(hass) == path
-    assert len(download.requests) == 2
+    assert len(download.requests) == 3
 
 
 async def test_bundle_without_recorded_checksum_is_not_trusted(
@@ -304,32 +494,6 @@ def executor_threads() -> set[threading.Thread]:
         for thread in threading.enumerate()
         if thread.name.startswith(("asyncio_", "ThreadPoolExecutor", "SyncWorker"))
     }
-
-
-def body_ends_early(download: FakeDownload) -> None:
-    download.fail_after_first_chunk = True
-
-
-def body_is_cut_off(download: FakeDownload) -> None:
-    # Arrives without an error, as from a server that closed the connection without having
-    # announced a length.
-    download.body = download.body[: len(download.body) // 2]
-
-
-def body_is_empty(download: FakeDownload) -> None:
-    download.body = b""
-
-
-def body_is_not_an_archive(download: FakeDownload) -> None:
-    download.body = b"<html>503 Service Unavailable</html>" * 100
-
-
-def body_lacks_a_library(download: FakeDownload) -> None:
-    download.body = make_library_archive(libraries=ANISETTE_LIBRARIES[:1])
-
-
-def server_reports_an_error(download: FakeDownload) -> None:
-    download.status = 503
 
 
 @pytest.mark.parametrize(
@@ -428,13 +592,17 @@ async def test_files_are_read_and_written_off_the_event_loop(
 
         monkeypatch.setattr(anisette_libs, name, wrapper)
 
-    for name in ("_verify", "_convert_and_store", "_sha256", "_write"):
+    names = ("_verify", "_convert_and_store", "_repair", "_convert", "_sha256", "_write")
+    for name in names:
         spy(name)
 
+    path = await async_ensure_anisette_libs(hass)
     _ = await async_ensure_anisette_libs(hass)
+    # And the repair of a damaged bundle.
+    _ = damage(path)
     _ = await async_ensure_anisette_libs(hass)
 
-    assert set(ran_on) == {"_verify", "_convert_and_store", "_sha256", "_write"}
+    assert set(ran_on) == set(names)
     assert loop_thread not in ran_on.values()
 
 

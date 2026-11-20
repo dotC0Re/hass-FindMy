@@ -98,7 +98,7 @@
       "login_incomplete": "The login did not complete. Please try again",
       "find_my_token_missing": "Apple did not return the token needed for Find My. This is a known problem since Apple changed its sign-in in October 2026; please check the FindMy.py issue tracker for updates: {issue_tracker_url}",
       "anisette_libs_unavailable": "The libraries of the integrated Anisette provider could not be downloaded. Please check your network and try again, or use a remote Anisette server",
-      "anisette_libs_changed": "The stored Anisette library bundle does not match the checksum recorded when it was downloaded, so it is not used. To accept a newly downloaded bundle, delete the file {anisette_libs_path} and try again"
+      "anisette_libs_changed": "The stored Anisette library bundle does not match the checksum recorded when it was downloaded, and a new download does not match it either, so nothing was replaced and the bundle is not used. To accept the newly downloaded bundle, delete the file {anisette_libs_path} and try again"
     },
     "abort": {
       "unknown_error": "An unexpected error occurred. Please try again later.",

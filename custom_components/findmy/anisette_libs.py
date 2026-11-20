@@ -18,7 +18,10 @@ What this module does
   limit, so nothing can hang and no thread is involved.
 * It remembers the SHA-256 of the stored bundle in ``findmy.anisette_libs.sha256`` next to it
   (trust on first use) and compares it before every use. A bundle that no longer matches is
-  not used: :class:`AnisetteLibsChecksumError` says which file to delete to accept a new one.
+  not used. It is replaced by a new download only if that download has the recorded checksum,
+  which repairs a damaged file without accepting anything new. Otherwise
+  :class:`AnisetteLibsChecksumError` says which file to delete to accept a new bundle;
+  deleting it is the only way a new checksum is ever accepted.
 
 :func:`async_ensure_anisette_libs` is the only entry point. It must be awaited before a local
 provider is created or restored, and returns the path to pass on.
@@ -43,8 +46,15 @@ What cannot be prevented
   (``LocalAnisetteProvider._get_ani`` calls ``save_libs`` unconditionally), in place and not
   atomically. The bytes it writes are the ones it read, so the checksum keeps matching. While
   it writes, the file is incomplete for a moment: the comparison is therefore repeated a few
-  times before a mismatch is reported. A crash in exactly that moment leaves a damaged file,
-  which is then refused like any other change.
+  times before the file counts as not matching. A power cut or a killed process in exactly
+  that moment leaves a damaged file behind. That is what the repair is for: the bundle is
+  downloaded and converted again, and because the conversion is deterministic, the result has
+  the recorded checksum as long as the server still sends the same archive. Only then does it
+  replace the damaged file, with a warning in the log. If the server sends something else,
+  the damaged file stays where it is and the user decides.
+* A release of the anisette package that saves bundles differently would make the re-save
+  change the file. The repair then fails as well (the new conversion differs too), and the
+  bundle has to be deleted once to accept the new form.
 * If the file disappears between the check and the provider's first use, the package falls
   back to its own unlimited download. Only deleting the file while Home Assistant runs gets
   there; the check runs when an account entry is set up and before every sign-in attempt.
@@ -61,6 +71,7 @@ import io
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -107,24 +118,35 @@ class AnisetteLibsError(HomeAssistantError):
 
 
 class AnisetteLibsUnavailableError(AnisetteLibsError):
-    """There is no bundle and none could be fetched or stored. Trying again later may work."""
+    """There is no usable bundle and none could be fetched or stored. Trying again may work."""
 
 
 class AnisetteLibsChecksumError(AnisetteLibsError):
-    """The stored bundle is not the one whose checksum was recorded. Needs the user."""
+    """Neither the stored bundle nor a new download has the recorded checksum. Needs the user."""
 
-    def __init__(self, path: Path, expected: str, actual: str) -> None:
+    def __init__(self, path: Path, expected: str, actual: str, downloaded: str) -> None:
         # Paths and checksums only; nothing in here is secret.
         msg = (
             f"The Anisette library bundle {path} does not match the checksum recorded when it "
-            f"was stored (expected SHA-256 {expected}, found {actual}). It was changed or "
-            "damaged and is not used. To accept a newly downloaded bundle, delete this file "
-            "and reload the integration or sign in again."
+            f"was stored (expected SHA-256 {expected}, found {actual}), and it could not be "
+            f"repaired: a newly downloaded bundle does not match either (SHA-256 {downloaded}). "
+            "Nothing was replaced and the bundle is not used. To accept the newly downloaded "
+            "bundle, delete this file and reload the integration or sign in again."
         )
         super().__init__(msg)
         self.path: Path = path
         self.expected: str = expected
         self.actual: str = actual
+        self.downloaded: str = downloaded
+
+
+@dataclass(frozen=True, slots=True)
+class _Mismatch:
+    """A stored bundle that does not have its recorded checksum."""
+
+    expected: str
+    # The SHA-256 that was found, or a note that the file could not be read.
+    actual: str
 
 
 def anisette_libs_path(hass: HomeAssistant) -> Path:
@@ -135,16 +157,39 @@ def anisette_libs_path(hass: HomeAssistant) -> Path:
 async def async_ensure_anisette_libs(hass: HomeAssistant) -> Path:
     """Return the path of the verified bundle, fetching and storing it first if there is none.
 
-    Raises :class:`AnisetteLibsChecksumError` if the stored bundle does not match its recorded
-    checksum, and :class:`AnisetteLibsUnavailableError` if there is no bundle and the download
-    failed, timed out or did not contain the libraries. In both cases the caller must not create
-    a local provider: without the file it would download on its own.
+    A stored bundle that does not match its recorded checksum is repaired from a new download
+    if that download has the recorded checksum, see the module docstring.
+
+    Raises :class:`AnisetteLibsChecksumError` if the stored bundle does not match and a new
+    download does not either, and :class:`AnisetteLibsUnavailableError` if a download is needed
+    (no bundle, or one to repair) and it failed, timed out or did not contain the libraries. In
+    both cases the caller must not create a local provider: it would use a bundle nobody
+    checked, or download one on its own.
     """
     bundle = anisette_libs_path(hass)
     checksum = bundle.with_name(CHECKSUM_FILE)
 
     async with hass.data.setdefault(_LOCK, asyncio.Lock()):
-        if await hass.async_add_executor_job(_verify, bundle, checksum):
+        state = await hass.async_add_executor_job(_verify, bundle, checksum)
+        if state is True:
+            return bundle
+
+        if isinstance(state, _Mismatch):
+            _LOGGER.info(
+                "Downloading the Anisette library bundle again: %s does not match its checksum",
+                bundle,
+            )
+            try:
+                archive = await _async_download(hass)
+            except AnisetteLibsUnavailableError as err:
+                # Still retryable, but the reader should know that a bundle is there and why
+                # it is not used. The damaged file is left alone.
+                msg = (
+                    f"The Anisette library bundle {bundle} does not match its recorded "
+                    f"checksum and could not be repaired yet. {err}"
+                )
+                raise AnisetteLibsUnavailableError(msg) from err
+            await hass.async_add_executor_job(_repair, archive, bundle, state)
             return bundle
 
         _LOGGER.info("Downloading the Anisette library bundle from %s", DEFAULT_LIBS_URL)
@@ -220,11 +265,12 @@ def _is_hex(text: str) -> bool:
     return True
 
 
-def _verify(bundle: Path, checksum: Path) -> bool:
+def _verify(bundle: Path, checksum: Path) -> bool | _Mismatch:
     """Whether a bundle that matches its recorded checksum is in place. Runs in the executor.
 
-    False means that a bundle has to be downloaded. A bundle that is there but does not match
-    raises AnisetteLibsChecksumError instead: replacing it is the user's decision.
+    False means that there is no bundle to hold against a checksum, so one has to be
+    downloaded and is accepted as it comes. A bundle that is there but does not match is
+    returned as a :class:`_Mismatch`: it may only be replaced by one with the recorded checksum.
     """
     # Left behind only by a write that was interrupted, e.g. by a power loss.
     for leftover in (_temporary(bundle), _temporary(checksum)):
@@ -253,25 +299,65 @@ def _verify(bundle: Path, checksum: Path) -> bool:
 
     actual = ""
     for delay in (*_RECHECK_DELAYS, None):
-        try:
-            actual = _sha256(bundle)
-        except OSError as err:
-            actual = f"unreadable: {type(err).__name__}"
+        actual = _hash_or_note(bundle)
         if actual == expected:
             return True
         if delay is not None:
             # A provider that is initialising may be re-saving the file right now, see the
             # module docstring. This is an executor thread; sleeping here blocks nothing else.
             time.sleep(delay)
-    raise AnisetteLibsChecksumError(bundle, expected, actual)
+    return _Mismatch(expected=expected, actual=actual)
 
 
-def _convert_and_store(archive: bytes, bundle: Path, checksum: Path) -> str:
-    """Turn a downloaded archive into the stored bundle and record its SHA-256.
+def _hash_or_note(bundle: Path) -> str:
+    """The SHA-256 of the stored bundle, or a note for the log if it cannot be read."""
+    try:
+        return _sha256(bundle)
+    except OSError as err:
+        return f"unreadable: {type(err).__name__}"
 
-    Runs in the executor. Either both files are complete afterwards or the bundle is missing;
-    a partial bundle is never left under its final name.
+
+def _repair(archive: bytes, bundle: Path, mismatch: _Mismatch) -> None:
+    """Replace a bundle that does not match by a new download, if that one does.
+
+    Runs in the executor. The checksum record is never touched here: the download is accepted
+    only because it is the bundle that was recorded. Raises AnisetteLibsChecksumError if it is
+    not, and leaves the stored file as it is then, so that the user can look at it.
     """
+    data = _convert(archive)
+    downloaded = hashlib.sha256(data).hexdigest()
+
+    # The download took a while. If the file only looked damaged because a provider was still
+    # re-saving it, it is whole again by now and must not be pulled away under that provider.
+    actual = _hash_or_note(bundle)
+    if actual == mismatch.expected:
+        _LOGGER.info("The Anisette library bundle %s matches its checksum again", bundle)
+        return
+
+    if downloaded != mismatch.expected:
+        raise AnisetteLibsChecksumError(bundle, mismatch.expected, actual, downloaded)
+
+    bundle_tmp = _temporary(bundle)
+    try:
+        _write(bundle_tmp, data)
+        _ = bundle_tmp.replace(bundle)
+    except OSError as err:
+        msg = f"The damaged Anisette library bundle {bundle} could not be replaced ({err})"
+        raise AnisetteLibsUnavailableError(msg) from err
+    finally:
+        with contextlib.suppress(OSError):
+            bundle_tmp.unlink(missing_ok=True)
+    # Three checksums: what was on disk, what was downloaded, and what was recorded. The last
+    # two are equal here, and saying so is the point of the line.
+    replaced = (
+        "The Anisette library bundle %s was damaged (SHA-256 %s) and has been replaced by a "
+        "verified copy (SHA-256 %s, the recorded checksum is %s)"
+    )
+    _LOGGER.warning(replaced, bundle, actual, downloaded, mismatch.expected)
+
+
+def _convert(archive: bytes) -> bytes:
+    """Turn a downloaded archive into the bytes of the bundle a provider loads."""
     converted = io.BytesIO()
     try:
         # No network and no emulator: `init` only notes where the libraries come from, and
@@ -285,7 +371,17 @@ def _convert_and_store(archive: bytes, bundle: Path, checksum: Path) -> str:
             f"({type(err).__name__}); nothing was stored"
         )
         raise AnisetteLibsUnavailableError(msg) from err
-    data = converted.getvalue()
+    return converted.getvalue()
+
+
+def _convert_and_store(archive: bytes, bundle: Path, checksum: Path) -> str:
+    """Turn a downloaded archive into the stored bundle and record its SHA-256.
+
+    Runs in the executor, and only when there is no bundle: this is where a checksum is
+    accepted. Either both files are complete afterwards or the bundle is missing; a partial
+    bundle is never left under its final name.
+    """
+    data = _convert(archive)
     digest = hashlib.sha256(data).hexdigest()
 
     previous = _read_checksum(checksum)

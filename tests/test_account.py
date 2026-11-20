@@ -521,7 +521,7 @@ async def test_changed_library_bundle_fails_the_setup_with_instructions(
 ) -> None:
     """Not retried: only the user can decide to accept another bundle."""
     path = anisette_libs_path(hass)
-    ensure_libs.side_effect = AnisetteLibsChecksumError(path, "a" * 64, "b" * 64)
+    ensure_libs.side_effect = AnisetteLibsChecksumError(path, "a" * 64, "b" * 64, "c" * 64)
 
     with pytest.raises(ConfigEntryError) as raised:
         _ = await async_local_anisette_libs(hass, local_account_state())
@@ -571,7 +571,7 @@ async def test_storage_restores_accounts_with_the_library_bundle(
     ("error", "raised"),
     [
         (AnisetteLibsUnavailableError("the download timed out"), ConfigEntryNotReady),
-        (AnisetteLibsChecksumError(Path("bundle"), "a" * 64, "b" * 64), ConfigEntryError),
+        (AnisetteLibsChecksumError(Path("bundle"), "a" * 64, "b" * 64, "c" * 64), ConfigEntryError),
     ],
 )
 async def test_storage_restores_no_account_without_a_usable_bundle(  # noqa: PLR0917
@@ -605,6 +605,60 @@ async def test_storage_restores_remote_anisette_accounts_without_a_bundle(
 
     ensure_libs.assert_not_awaited()
     assert len(restored) == 1
+
+
+async def test_account_is_usable_again_after_its_bundle_was_damaged(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process killed while FindMy.py re-saved the bundle must not need a manual fix."""
+    download = FakeDownload(make_library_archive())
+    monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
+    monkeypatch.setattr(anisette_libs, "_RECHECK_DELAYS", ())
+    entry = account_entry(hass, local_account_state())
+    _ = await storage.add_entry(entry)
+    _ = await storage.del_entry(entry)
+    path = anisette_libs_path(hass)
+    original = path.read_bytes()
+    path.write_bytes(original[:100])
+
+    # The next start of Home Assistant.
+    account = await storage.add_entry(entry)
+
+    assert isinstance(account, AccountRuntime)
+    assert account.login_state is LoginState.LOGGED_IN
+    assert path.read_bytes() == original
+    # The first bundle and its repair.
+    assert len(download.requests) == 2
+    assert len(restored) == 2
+
+
+async def test_account_is_not_set_up_with_a_bundle_that_cannot_be_repaired(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server sends another bundle: the entry fails with instructions, nothing is used."""
+    download = FakeDownload(make_library_archive())
+    monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
+    monkeypatch.setattr(anisette_libs, "_RECHECK_DELAYS", ())
+    entry = account_entry(hass, local_account_state())
+    _ = await storage.add_entry(entry)
+    _ = await storage.del_entry(entry)
+    path = anisette_libs_path(hass)
+    damaged = path.read_bytes()[:100]
+    path.write_bytes(damaged)
+    download.body = make_library_archive("v2")
+
+    with pytest.raises(ConfigEntryError, match="delete this file"):
+        _ = await storage.add_entry(entry)
+
+    assert path.read_bytes() == damaged
+    assert len(restored) == 1
+    assert storage.accounts == []
 
 
 async def test_accounts_share_one_stored_bundle_across_restarts(

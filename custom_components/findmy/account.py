@@ -153,10 +153,11 @@ async def async_local_anisette_libs(hass: HomeAssistant, account_data: object) -
     anisette_libs.py. This runs on Home Assistant's loop, before the account is restored on
     the worker: it needs Home Assistant's HTTP session and executor.
 
-    Raises ConfigEntryError if the stored bundle does not match its recorded checksum, which
-    only the user can resolve (the message names the file to delete), and ConfigEntryNotReady
-    if there is no bundle and it could not be downloaded, so that Home Assistant tries the
-    setup again later.
+    Raises ConfigEntryError if the stored bundle does not match its recorded checksum and a
+    new download does not either, which only the user can resolve (the message names the file
+    to delete), and ConfigEntryNotReady if a bundle has to be downloaded, because there is
+    none or to repair a damaged one, and that failed, so that Home Assistant tries the setup
+    again later.
     """
     if not _uses_local_anisette(account_data):
         return None
