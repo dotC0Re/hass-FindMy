@@ -6,7 +6,8 @@ Checks, and with ``--write`` repairs where it can:
   ``package_constraints.txt`` shipped with the installed Home Assistant. Home Assistant
   enforces these pins at runtime but does not publish them as package metadata, so uv
   cannot see them on its own.
-* The ``findmy`` pin in ``pyproject.toml`` equals the requirement in ``manifest.json``,
+* The ``findmy`` and ``anisette`` pins in ``pyproject.toml`` equal the requirements in
+  ``manifest.json``,
   so development and users run the same library version.
 * The ``homeassistant`` pin in the dev group equals the minimum version in ``hacs.json``,
   so the advertised minimum is the version the tests actually run against.
@@ -82,12 +83,17 @@ def check_constraints(text: str, *, write: bool) -> list[str]:
     ]
 
 
-def check_findmy(pyproject: dict) -> list[str]:
-    manifest_pin = _exact_pin(json.loads(MANIFEST.read_text("utf-8"))["requirements"], "findmy")
-    project_pin = _exact_pin(pyproject["project"]["dependencies"], "findmy")
-    if manifest_pin is None or manifest_pin != project_pin:
-        return [f"findmy pin differs: manifest.json={manifest_pin}, pyproject.toml={project_pin}"]
-    return []
+def check_requirements(pyproject: dict) -> list[str]:
+    requirements = json.loads(MANIFEST.read_text("utf-8"))["requirements"]
+    errors: list[str] = []
+    for package in ("findmy", "anisette"):
+        manifest_pin = _exact_pin(requirements, package)
+        project_pin = _exact_pin(pyproject["project"]["dependencies"], package)
+        if manifest_pin is None or manifest_pin != project_pin:
+            errors.append(
+                f"{package} pin differs: manifest.json={manifest_pin}, pyproject.toml={project_pin}"
+            )
+    return errors
 
 
 def check_homeassistant(pyproject: dict) -> list[str]:
@@ -107,7 +113,7 @@ def main() -> int:
     pyproject = tomllib.loads(text)
     errors = [
         *check_constraints(text, write=args.write),
-        *check_findmy(pyproject),
+        *check_requirements(pyproject),
         *check_homeassistant(pyproject),
     ]
     for error in errors:

@@ -3,7 +3,9 @@ name = "hass-findmy"
 version = "2026.11.0"
 requires-python = ">=3.14.2,<3.15"
 # Must match `requirements` in custom_components/findmy/manifest.json (checked in CI).
-dependencies = ["findmy==0.10.2"]
+# anisette is a dependency of findmy, which allows any 1.x. It is pinned because the
+# integration reads the bundles this package writes, see anisette_libs.py.
+dependencies = ["findmy==0.10.2", "anisette==1.2.4"]
 
 [dependency-groups]
 dev = [

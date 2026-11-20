@@ -180,7 +180,9 @@ _MAX_CACHED_SECONDARY_SPANS = MAX_CACHED_INDICES // _SECONDARY_KEY_SPAN + 2
 # as after a restart with many accessories, would compete with the event loop for the CPU, and
 # the pauses of one would be the working time of another. It is held for one index, or one slice
 # of the secret chain (_CHAIN_SLICE), and through the pause that may follow (_PACER). Nothing on
-# the event loop derives keys, so the loop never waits for it.
+# the event loop derives keys. The loop takes the lock all the same in one place, the one-off
+# probe of _chain_access_works when the first accessory restores its checkpoints, for a few
+# milliseconds once per start.
 _DERIVE_LOCK = threading.Lock()
 
 # Steps of the secret chain walked per slice: about a millisecond on a desktop.

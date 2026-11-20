@@ -285,3 +285,48 @@ async def test_unloading_keeps_and_removing_forgets_the_checkpoints(hass: HomeAs
     await async_remove_entry(hass, entry)
     assert storage.key_checkpoints.get(entry.entry_id) == {}
     assert DOMAIN in hass.data
+
+
+async def test_checkpoints_of_a_removed_device_do_not_come_back(hass: HomeAssistant) -> None:
+    """Review finding A-5: a fetch that was cutting the window while the device was removed.
+
+    It still holds the accessory and the entry id, and asks to keep the checkpoints after the
+    removal has forgotten them. Nothing would ever forget them again.
+    """
+    data = accessory_data()
+    entry = device_entry(hass, data)
+    storage = RuntimeStorage.attach(hass)
+    await storage.key_checkpoints.async_load()
+    accessory = await storage.add_entry(entry)
+    assert isinstance(accessory, CachedFindMyAccessory)
+    _ = await hass.async_add_executor_job(accessory.search_window, datetime.now(tz=UTC))
+
+    _ = await storage.del_entry(entry)
+    await async_remove_entry(hass, entry)
+    await storage.async_keep_checkpoints(entry.entry_id, accessory)
+
+    assert storage.key_checkpoints.get(entry.entry_id) == {}
+
+
+async def test_checkpoints_of_a_replaced_accessory_are_not_kept_for_its_entry(
+    hass: HomeAssistant,
+) -> None:
+    """After a reload the entry has a new object; the old one no longer speaks for it."""
+    data = accessory_data()
+    entry = device_entry(hass, data)
+    storage = RuntimeStorage.attach(hass)
+    await storage.key_checkpoints.async_load()
+    old = await storage.add_entry(entry)
+    assert isinstance(old, CachedFindMyAccessory)
+    _ = await storage.del_entry(entry)
+    storage.key_checkpoints.forget(entry.entry_id)
+    new = await storage.add_entry(entry)
+    assert isinstance(new, CachedFindMyAccessory)
+    _ = await hass.async_add_executor_job(old.search_window, datetime.now(tz=UTC))
+
+    await storage.async_keep_checkpoints(entry.entry_id, old)
+    assert storage.key_checkpoints.get(entry.entry_id) == {}
+
+    _ = await hass.async_add_executor_job(new.search_window, datetime.now(tz=UTC))
+    await storage.async_keep_checkpoints(entry.entry_id, new)
+    assert storage.key_checkpoints.get(entry.entry_id) != {}

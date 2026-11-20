@@ -26,7 +26,8 @@ session, Home Assistant asks you to sign in again with password and 2FA code (re
 there is no silent sign-in in the background. Signing in again keeps the device identity of the
 account, so Apple should not announce a new device each time; to start over with a new identity,
 remove the account and add it again. Entries created by older versions are cleaned
-automatically on the next start, disabled ones included. The session tokens themselves are still
+automatically on the next start. That includes disabled entries, as soon as at least one entry of
+the integration is loaded. The session tokens themselves are still
 stored in the config entry, and are part of every backup.
 
 Going back to the original integration: restore a backup made before the switch. Without one the
@@ -37,10 +38,17 @@ expires and has to be removed and added again.
 
 Without a remote Anisette server the integration emulates one, which needs a library bundle from
 the server of the `anisette` package. The bundle is downloaded once, kept as
-`.storage/findmy.anisette_libs` in your configuration directory and checked against the SHA-256
-recorded at that first download before every use. A damaged file is repaired from a download that
-matches this checksum. If the check fails for good, the error names the file; deleting it accepts
-a newly downloaded bundle.
+`.storage/findmy.anisette_libs` in your configuration directory and checked before every use
+against a checksum of the libraries in it, recorded at that first download. A damaged file is
+repaired from a download that matches this checksum. If the check fails for good, the error names
+the file; deleting it accepts a newly downloaded bundle.
+
+## Debug logs
+
+"Enable debug logging" covers the integration and the FindMy.py library. The credentials of a
+remote Anisette URL (`https://user:password@...`) are removed from their log lines. The `anisette`
+package behind the integrated provider is left out on purpose: its debug lines contain the
+provisioning secrets of the emulated device. Do not set its logger to debug for a log you share.
 
 ## Increasing the update frequency
 

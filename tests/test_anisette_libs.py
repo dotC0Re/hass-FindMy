@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
+import tarfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 from anisette import Anisette
@@ -69,12 +71,51 @@ def storage_files(hass: HomeAssistant) -> set[str]:
     return {path.name for path in directory.iterdir() if path.name.startswith(BUNDLE_FILE)}
 
 
+CONTENT = "content-sha256:"
+
+
 def recorded_checksum(hass: HomeAssistant) -> str:
-    return anisette_libs_path(hass).with_name(CHECKSUM_FILE).read_text(encoding="ascii").split()[0]
+    record = anisette_libs_path(hass).with_name(CHECKSUM_FILE).read_text(encoding="ascii")
+    return record.split()[0].removeprefix(CONTENT)
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def bundle_files(path: Path) -> dict[str, bytes]:
+    """The regular files of a stored bundle."""
+    files: dict[str, bytes] = {}
+    with tarfile.open(path, mode="r:*") as archive:
+        for member in archive:
+            if member.isfile():
+                content = archive.extractfile(member)
+                assert content is not None
+                files[member.name] = content.read()
+    return files
+
+
+def content_sha256(path: Path) -> str:
+    """The checksum of what a bundle holds, worked out here as the module documents it."""
+    lines = sorted(
+        f"{hashlib.sha256(data).hexdigest()}  {name.removeprefix('./')}\n"
+        for name, data in bundle_files(path).items()
+    )
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+
+type PackMode = Literal["w:bz2", "w:gz", "w:xz", "w"]
+
+
+def repack(path: Path, files: dict[str, bytes], mode: PackMode = "w:bz2") -> None:
+    """Write a bundle with these files, without the directory entries the package adds."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode=mode) as archive:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    path.write_bytes(buffer.getvalue())
 
 
 def load_without_download(monkeypatch: pytest.MonkeyPatch, path: Path) -> Anisette:
@@ -96,10 +137,11 @@ async def test_bundle_is_downloaded_once_and_stored_with_its_checksum(
     assert path == Path(hass.config.path(".storage", BUNDLE_FILE))
     assert download.requests == [anisette_module.DEFAULT_LIBS_URL]
     assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
-    assert recorded_checksum(hass) == sha256(path)
-    # In the format of `sha256sum`, so that it can be checked by hand.
+    assert recorded_checksum(hass) == content_sha256(path)
+    # Marked as a checksum of the content: `sha256sum` of the file gives another value.
     checksum_text = path.with_name(CHECKSUM_FILE).read_text(encoding="ascii")
-    assert checksum_text == f"{sha256(path)}  {BUNDLE_FILE}\n"
+    assert checksum_text == f"{CONTENT}{content_sha256(path)}  {BUNDLE_FILE}\n"
+    assert set(bundle_files(path)) == {"fs.json", *(f"./libs/{n}" for n in ANISETTE_LIBRARIES)}
     # A provider finds the libraries in the file and has no reason to download.
     loaded = await hass.async_add_executor_job(load_without_download, monkeypatch, path)
     library_store = loaded._ani_provider.library_store
@@ -140,9 +182,7 @@ async def test_resave_by_the_library_keeps_the_checksum(
 ) -> None:
     """FindMy.py saves the libraries back to the file whenever a provider initialises.
 
-    The check only holds if that writes the bytes that were read. If a release of the anisette
-    package changes how it saves, this test fails and the checksum has to cover the content
-    instead of the file.
+    The check only holds if that writes the files that were read.
     """
     path = await async_ensure_anisette_libs(hass)
 
@@ -151,9 +191,82 @@ async def test_resave_by_the_library_keeps_the_checksum(
 
     await hass.async_add_executor_job(resave)
 
-    assert sha256(path) == recorded_checksum(hass)
+    assert content_sha256(path) == recorded_checksum(hass)
     assert await async_ensure_anisette_libs(hass) == path
     assert len(download.requests) == 1
+
+
+@pytest.mark.parametrize("mode", ["w:gz", "w:xz", "w"])
+async def test_bundle_that_is_packed_differently_still_matches(
+    hass: HomeAssistant, download: FakeDownload, monkeypatch: pytest.MonkeyPatch, mode: PackMode
+) -> None:
+    """Review finding A-1: another anisette or Python release may save the same files otherwise.
+
+    The checksum covers the files, so the bundle keeps matching and nothing is downloaded. With
+    a checksum of the file, the account would be locked until the bundle is deleted by hand.
+    """
+    path = await async_ensure_anisette_libs(hass)
+    stored = path.read_bytes()
+    record = path.with_name(CHECKSUM_FILE).read_bytes()
+    # Another compression, another order and no directory entries.
+    repack(path, dict(reversed(bundle_files(path).items())), mode)
+    repacked = path.read_bytes()
+    assert repacked != stored
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert len(download.requests) == 1
+    assert path.read_bytes() == repacked
+    assert path.with_name(CHECKSUM_FILE).read_bytes() == record
+    _ = await hass.async_add_executor_job(load_without_download, monkeypatch, path)
+
+
+async def test_record_of_the_whole_file_is_honoured_and_renewed(
+    hass: HomeAssistant, download: FakeDownload
+) -> None:
+    """Version 2026.11.0 recorded the SHA-256 of the file."""
+    path = await async_ensure_anisette_libs(hass)
+    record = path.with_name(CHECKSUM_FILE)
+    record.write_text(f"{sha256(path)}  {BUNDLE_FILE}\n", encoding="ascii")
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert len(download.requests) == 1
+    assert record.read_text(encoding="ascii") == f"{CONTENT}{content_sha256(path)}  {BUNDLE_FILE}\n"
+    assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
+
+
+async def test_damaged_bundle_with_a_record_of_the_whole_file_is_repaired(
+    hass: HomeAssistant, download: FakeDownload
+) -> None:
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    record = path.with_name(CHECKSUM_FILE)
+    record.write_text(f"{sha256(path)}  {BUNDLE_FILE}\n", encoding="ascii")
+    _ = damage(path)
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert len(download.requests) == 2
+    assert path.read_bytes() == original
+    assert record.read_text(encoding="ascii") == f"{CONTENT}{content_sha256(path)}  {BUNDLE_FILE}\n"
+
+
+async def test_record_of_the_whole_file_does_not_accept_another_bundle(
+    hass: HomeAssistant, download: FakeDownload
+) -> None:
+    path = await async_ensure_anisette_libs(hass)
+    record = path.with_name(CHECKSUM_FILE)
+    old_record = f"{sha256(path)}  {BUNDLE_FILE}\n"
+    record.write_text(old_record, encoding="ascii")
+    damaged = damage(path)
+    download.body = make_library_archive("v2")
+
+    with pytest.raises(AnisetteLibsChecksumError):
+        _ = await async_ensure_anisette_libs(hass)
+
+    assert path.read_bytes() == damaged
+    assert record.read_text(encoding="ascii") == old_record
 
 
 async def test_concurrent_callers_share_one_download(
@@ -224,8 +337,9 @@ async def test_damaged_bundle_is_repaired_from_a_download_with_the_recorded_chec
     (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert "replaced by a verified copy" in warning
     assert str(path) in warning
-    assert hashlib.sha256(damaged).hexdigest() in warning
+    assert "unreadable" in warning
     assert expected in warning
+    assert path.read_bytes() != damaged
     # The repaired file is a bundle a provider loads, and the next check needs no download.
     _ = await hass.async_add_executor_job(load_without_download, monkeypatch, path)
     assert await async_ensure_anisette_libs(hass) == path
@@ -248,9 +362,9 @@ async def test_bundle_is_not_replaced_by_a_download_with_another_checksum(
     message = str(raised.value)
     assert str(path) in message
     assert expected in message
-    assert hashlib.sha256(damaged).hexdigest() in message
+    assert "unreadable" in message
     assert raised.value.downloaded in message
-    assert raised.value.downloaded not in {expected, hashlib.sha256(damaged).hexdigest()}
+    assert raised.value.downloaded != expected
     assert "delete this file" in message
     assert raised.value.path == path
     # Nothing was replaced: the file is there for the user to look at.
@@ -272,7 +386,37 @@ async def test_changed_bundle_of_full_size_is_treated_like_a_damaged_one(
     """Not only a file that was cut off: any content that does not match."""
     path = await async_ensure_anisette_libs(hass)
     original = path.read_bytes()
-    path.write_bytes(original + b"tampered")
+    files = bundle_files(path)
+    library = f"./libs/{ANISETTE_LIBRARIES[0]}"
+    repack(path, files | {library: files[library][:-1] + b"!"})
+
+    assert await async_ensure_anisette_libs(hass) == path
+
+    assert path.read_bytes() == original
+    assert len(download.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # Without its index the package finds no libraries and downloads them on its own.
+        lambda files: {name: data for name, data in files.items() if name != "fs.json"},
+        lambda files: files | {"fs.json": b'{"libs": "./elsewhere"}'},
+        lambda files: files | {"./libs/extra.so": b"not from the server"},
+        lambda files: {
+            name.replace("libCoreADI", "libOther"): data for name, data in files.items()
+        },
+    ],
+    ids=["no index", "changed index", "added file", "renamed library"],
+)
+async def test_any_change_of_the_files_in_the_bundle_is_a_mismatch(
+    hass: HomeAssistant,
+    download: FakeDownload,
+    change: Callable[[dict[str, bytes]], dict[str, bytes]],
+) -> None:
+    path = await async_ensure_anisette_libs(hass)
+    original = path.read_bytes()
+    repack(path, change(bundle_files(path)))
 
     assert await async_ensure_anisette_libs(hass) == path
 
@@ -430,7 +574,7 @@ async def test_deleting_the_bundle_accepts_a_new_one(
 
     # The first bundle, the attempt to repair it, and the one that is accepted.
     assert len(download.requests) == 3
-    assert recorded_checksum(hass) == sha256(path) != old_checksum
+    assert recorded_checksum(hass) == content_sha256(path) != old_checksum
     # The change of the bundle leaves a trace.
     assert old_checksum in caplog.text
     assert await async_ensure_anisette_libs(hass) == path
@@ -449,11 +593,20 @@ async def test_bundle_without_recorded_checksum_is_not_trusted(
         assert await async_ensure_anisette_libs(hass) == path
 
     assert len(download.requests) == 1
-    assert recorded_checksum(hass) == sha256(path)
+    assert recorded_checksum(hass) == content_sha256(path)
     assert "no recorded checksum" in caplog.text
 
 
-@pytest.mark.parametrize("record", ["", "not a checksum", "abc123  findmy.anisette_libs\n"])
+@pytest.mark.parametrize(
+    "record",
+    [
+        "",
+        "not a checksum",
+        "abc123  findmy.anisette_libs\n",
+        "content-sha256:abc123  findmy.anisette_libs\n",
+        f"content-sha256:{'g' * 64}  findmy.anisette_libs\n",
+    ],
+)
 async def test_unreadable_checksum_record_counts_as_none(
     hass: HomeAssistant, download: FakeDownload, record: str
 ) -> None:
@@ -463,7 +616,7 @@ async def test_unreadable_checksum_record_counts_as_none(
     assert await async_ensure_anisette_libs(hass) == path
 
     assert len(download.requests) == 2
-    assert recorded_checksum(hass) == sha256(path)
+    assert recorded_checksum(hass) == content_sha256(path)
 
 
 async def test_download_that_hangs_ends_at_the_time_limit(
@@ -484,7 +637,7 @@ async def test_download_that_hangs_ends_at_the_time_limit(
     # Trying again works once the server answers.
     download.hang = False
     path = await async_ensure_anisette_libs(hass)
-    assert recorded_checksum(hass) == sha256(path)
+    assert recorded_checksum(hass) == content_sha256(path)
 
 
 def executor_threads() -> set[threading.Thread]:
@@ -522,7 +675,7 @@ async def test_failed_or_partial_download_leaves_nothing_behind(
     download.body, download.status, download.fail_after_first_chunk = complete, 200, False
     path = await async_ensure_anisette_libs(hass)
     assert len(download.requests) == 2
-    assert recorded_checksum(hass) == sha256(path)
+    assert recorded_checksum(hass) == content_sha256(path)
 
 
 async def test_oversized_download_is_stopped(
@@ -560,7 +713,7 @@ async def test_interrupted_store_leaves_no_bundle(
     monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
     path = await async_ensure_anisette_libs(hass)
     assert storage_files(hass) == {BUNDLE_FILE, CHECKSUM_FILE}
-    assert recorded_checksum(hass) == sha256(path)
+    assert recorded_checksum(hass) == content_sha256(path)
 
 
 async def test_leftovers_of_an_interrupted_write_are_removed(
@@ -592,7 +745,7 @@ async def test_files_are_read_and_written_off_the_event_loop(
 
         monkeypatch.setattr(anisette_libs, name, wrapper)
 
-    names = ("_verify", "_convert_and_store", "_repair", "_convert", "_sha256", "_write")
+    names = ("_verify", "_convert_and_store", "_repair", "_convert", "_content_sha256", "_write")
     for name in names:
         spy(name)
 

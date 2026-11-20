@@ -14,8 +14,14 @@ Per config entry id of a rolling (derived) device, and for each of its two chain
 secrets at a few key indices, 32 bytes each, with the version of FindMy.py that derived them.
 A chain secret is no key: FindMy.py computes it from the SKN or SKS in the config entry, and
 turning it into a key pair needs the master key, which only the config entry holds. Someone who
-can read the config entry learns nothing from this file, and the file alone gives no key. Like
-the config entries, it is readable by the user Home Assistant runs as only. The record of a
+can read the config entry learns nothing from this file, and the file alone gives no key.
+
+It is not harmless on its own, though. A chain secret gives the two numbers that turn the
+public master key into the public key of its index. Someone who has the file and has recorded
+a single advertisement of the accessory can therefore work out the public master key, and with
+it every later public key: enough to recognise the accessory wherever it is heard, though not
+to read its location reports. The file needs the same protection as the config entries, sits
+in the same backups, and is readable by the user Home Assistant runs as only. The record of a
 device is dropped when its config entry is removed.
 
 Each secret comes with a 16-byte tag: an HMAC-SHA256, keyed with the initial secret of its
@@ -59,7 +65,8 @@ _LOGGER = logging.getLogger(__name__)
 STORAGE_KEY = "findmy.key_checkpoints"
 # Version 2 added the tag of every secret. Version 1 records cannot be verified and are dropped.
 STORAGE_VERSION = 2
-# Checkpoints change about once a week per accessory; there is no hurry to write them.
+# With an account the newest checkpoint moves about once an hour per accessory. A write that
+# is lost only costs time at the next start, so there is no hurry to write them.
 SAVE_DELAY = 30.0
 
 _SECRET_LENGTH = 32

@@ -33,7 +33,6 @@ import asyncio
 import copy
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from urllib.parse import urlsplit
 
@@ -88,6 +87,9 @@ from .const import (
     DEFAULT_AWAY_TIMEOUT_MINUTES,
     DOMAIN,
 )
+from .redaction import REDACTED as _REDACTED
+from .redaction import describe_error as _describe
+from .redaction import url_without_credentials as _url_without_credentials
 from .worker import FindMyWorker, WorkerNotRunningError
 
 if TYPE_CHECKING:
@@ -129,7 +131,6 @@ _ISSUE_TRACKER_URL = "https://github.com/malmeloo/FindMy.py/issues"
 # of a static tag (it grants location access forever, since static keys never
 # rotate), the one-time 2FA code and the upload id of a key file.
 _SECRET_FIELDS = frozenset({"password", "private_key", "code", "file"})
-_REDACTED = "**REDACTED**"
 
 
 def _mask_email(email: str) -> str:
@@ -232,35 +233,17 @@ def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) ->
     return "protocol_error"
 
 
-# `scheme://user:password@host` wherever it appears in a text.
-_URL_CREDENTIALS = re.compile(r"(?<=://)[^/@\s'\"]+@")
-
-
-def _describe(err: Exception) -> str:
-    """An error for the log, without the credentials of a URL it may quote.
-
-    aiohttp puts the request URL into the text of its errors, and the URL of a private
-    Anisette server can carry `user:password@`.
-    """
-    return _URL_CREDENTIALS.sub(f"{_REDACTED}@", f"{type(err).__name__}: {err}")
-
-
-def _url_without_credentials(url: str) -> str:
-    """Drop ``user:password@`` from a URL before it is logged."""
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return _REDACTED
-    if parsed.username is None and parsed.password is None:
-        return url
-    host = parsed.hostname or ""
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
-    return parsed._replace(netloc=f"{_REDACTED}@{netloc}").geturl()
-
-
 def _is_valid_anisette_url(url: str) -> bool:
+    """Whether a URL can be used as it is, and logged without its credentials.
+
+    A password with an unencoded ``/``, ``?`` or ``#`` ends the host part early: what is left
+    of it reads as ``user:<not a port>``, and the rest of the password lands in the path. Such
+    a URL would fail at the first request, and the redaction of redaction.py would not
+    recognise its credentials. Asking for the port is what finds it.
+    """
     try:
         parsed = urlsplit(url)
+        _ = parsed.port
     except ValueError:
         return False
     return parsed.scheme in {"http", "https"} and bool(parsed.hostname)

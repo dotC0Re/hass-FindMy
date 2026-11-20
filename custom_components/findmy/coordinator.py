@@ -43,6 +43,7 @@ from ._entity import account_name
 from .budget import MIN_FETCH_INTERVAL, account_budget_id
 from .const import signal_account_fetch
 from .key_cache import CachedFindMyAccessory, CatchUpWindow, SearchWindow
+from .redaction import redact_url_credentials
 from .worker import WorkerNotRunningError, notify_job_start
 
 if TYPE_CHECKING:
@@ -141,16 +142,22 @@ def _is_auth_error(err: Exception) -> bool:
 
 
 def _describe_fetch_error(err: Exception) -> str:
-    """Short message for the log and the coordinator state; the cause keeps the details."""
+    """Short message for the log and the coordinator state; the cause keeps the details.
+
+    Home Assistant logs it at error level. aiohttp quotes the request URL in the text of its
+    errors, and the URL of a private Anisette server can carry ``user:password@``, so the
+    text of the error is redacted (review finding A-3).
+    """
     if isinstance(err, TimeoutError):
         return "Timeout while fetching location reports"
+    detail = redact_url_credentials(str(err))
     if isinstance(err, aiohttp.ClientError):
-        return f"Could not reach Apple: {err}"
+        return f"Could not reach Apple: {detail}"
     if isinstance(err, KeyError):
-        return f"Apple account session is incomplete: missing {err}"
+        return f"Apple account session is incomplete: missing {detail}"
     if isinstance(err, UnhandledProtocolError):
-        return f"Unexpected answer from Apple: {err}"
-    return f"Could not fetch location reports: {err}"
+        return f"Unexpected answer from Apple: {detail}"
+    return f"Could not fetch location reports: {detail}"
 
 
 @final
@@ -519,7 +526,8 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         rotation = self._rotation()
         if not rotation:
             if self._storage.accounts:
-                # Only reached by a manual refresh: no refresh is scheduled in this state.
+                # Reached by a manual refresh and by the delayed refresh after an entry was
+                # set up or reloaded; no refresh is scheduled in this state.
                 msg = "Every Apple account needs to be re-authenticated"
                 raise UpdateFailed(msg)
             _LOGGER.debug("Skipping data update due to missing accounts")

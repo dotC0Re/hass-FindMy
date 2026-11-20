@@ -135,9 +135,17 @@ class RuntimeStorage:
         return self._entries[entry.entry_id]
 
     async def async_keep_checkpoints(self, entry_id: str, accessory: CachedFindMyAccessory) -> None:
-        """Remember where the key chains of an accessory may start after a restart."""
+        """Remember where the key chains of a loaded accessory may start after a restart.
+
+        Does nothing if the accessory is not the one loaded for the entry any more.
+        """
         checkpoints = await self._hass.async_add_executor_job(accessory.chain_checkpoints)
-        self.key_checkpoints.remember(entry_id, checkpoints)
+        # The entry may have been unloaded or removed while a fetch cut its window or while
+        # the executor was busy. Removing forgets the record; writing it now would bring the
+        # chain secrets of a removed device back for good (review finding A-5). After a mere
+        # reload, the new object of the entry keeps its own checkpoints.
+        if self._entries.get(entry_id) is accessory:
+            self.key_checkpoints.remember(entry_id, checkpoints)
 
     async def _async_keep_all_checkpoints(self, _event: Event) -> None:
         for entry_id, item in list(self._entries.items()):
@@ -243,7 +251,10 @@ class RuntimeStorage:
             await self._coordinator.async_cancel_fetch(item)
             await item.async_close()
         elif isinstance(item, CachedFindMyAccessory):
-            # A reload sets the accessory up again from its config entry.
-            await self.async_keep_checkpoints(entry.entry_id, item)
+            # A reload sets the accessory up again from its config entry. Stored directly: the
+            # accessory is no longer the loaded one, which async_keep_checkpoints would refuse.
+            # If the entry is being removed, async_remove_entry forgets the record after this.
+            checkpoints = await self._hass.async_add_executor_job(item.chain_checkpoints)
+            self.key_checkpoints.remember(entry.entry_id, checkpoints)
 
         return item

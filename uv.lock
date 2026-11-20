@@ -1092,6 +1092,7 @@ name = "hass-findmy"
 version = "2026.11.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "anisette" },
     { name = "findmy" },
 ]
 
@@ -1109,7 +1110,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "findmy", specifier = "==0.10.2" }]
+requires-dist = [
+    { name = "anisette", specifier = "==1.2.4" },
+    { name = "findmy", specifier = "==0.10.2" },
+]
 
 [package.metadata.requires-dev]
 dev = [

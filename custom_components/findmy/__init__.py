@@ -16,6 +16,7 @@ from .account import AccountRuntime, without_password
 from .const import CONFIG_FLOW_VERSION_MAJOR, CONFIG_FLOW_VERSION_MINOR, DOMAIN
 from .key_checkpoints import KeyCheckpointStore
 from .last_reports import LastReportStore
+from .redaction import protect_logs
 from .services import async_register as _async_register_services
 from .storage import RuntimeStorage
 
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
     from .config_flow import EntryData
 
 _LOGGER = logging.getLogger(__name__)
+
+# Before anything of this integration or its libraries logs: the config flow, the
+# platforms and the worker are all imported after this module. See redaction.py.
+protect_logs(__name__, list(__path__))
 
 # Set up from config entries only; there is no YAML configuration to validate.
 # Home Assistant types the returned validator with bare dicts.
