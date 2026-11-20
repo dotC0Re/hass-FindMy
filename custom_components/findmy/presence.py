@@ -128,20 +128,17 @@ class FindMyPresenceBinarySensor(BinarySensorEntity, RestoreEntity):  # pyright:
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
 
-        now = datetime.now(tz=UTC)
-        last_state = await self.async_get_last_state()
-        if last_state is not None and last_state.state == STATE_ON:
-            # Assume the accessory is still here until the away timeout passes without it.
-            self._is_on = True
-            self._last_seen = now
-        elif last_state is not None:
-            last_seen: object = last_state.attributes.get("last_seen")
-            if isinstance(last_seen, str):
-                self._last_seen = dt_util.parse_datetime(last_seen)
-
         stored = RuntimeStorage.get(self.hass).local_observations.get(self._identifier)
         if stored is not None:
-            self._handle_observation(*stored)
+            # Heard in this run already: the entry was reloaded. What was heard is known, so
+            # the guess from the restored state is not needed. It would even hide what is
+            # known: its "seen now" is newer than the match, whose signal strength and source
+            # were then dropped until a newer advertisement came in.
+            _ = self._take_observation(*stored)
+            self._read_history()
+            self._update_state(force_write=True)
+        else:
+            await self._async_restore()
 
         self.async_on_remove(
             async_dispatcher_connect(
@@ -154,11 +151,29 @@ class FindMyPresenceBinarySensor(BinarySensorEntity, RestoreEntity):  # pyright:
             async_track_time_interval(self.hass, self._async_refresh, _REFRESH_INTERVAL),
         )
 
+    async def _async_restore(self) -> None:
+        """Start from the state before the restart, when nothing was heard in this run yet."""
+        now = datetime.now(tz=UTC)
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state == STATE_ON:
+            # Assume the accessory is still here until the away timeout passes without it.
+            self._is_on = True
+            self._last_seen = now
+        elif last_state is not None:
+            last_seen: object = last_state.attributes.get("last_seen")
+            if isinstance(last_seen, str):
+                self._last_seen = dt_util.parse_datetime(last_seen)
+
     @callback
     def _handle_observation(self, observation: LocalObservation, source: str | None) -> None:
         """Take over a new rolling address matched by the device tracker."""
+        if self._take_observation(observation, source):
+            self._update_state(force_write=True)
+
+    def _take_observation(self, observation: LocalObservation, source: str | None) -> bool:
+        """Remember a match unless it is older than the current one; returns whether it was."""
         if self._observed_at is not None and observation.detected_at < self._observed_at:
-            return
+            return False
         self._observed_at = observation.detected_at
         self._mac_address = observation.mac_address
         self._local_state = observation.state
@@ -166,21 +181,26 @@ class FindMyPresenceBinarySensor(BinarySensorEntity, RestoreEntity):  # pyright:
             # DULT advertisements carry no battery level; keep the last Offline Finding one.
             self._battery = observation.battery_level
         self._mark_seen(observation.detected_at, observation.rssi, source)
-        self._update_state(force_write=True)
+        return True
 
     @callback
     def _async_refresh(self, _now: datetime | None = None) -> None:
-        if self._mac_address is not None:
-            service_info = bluetooth.async_last_service_info(
-                self.hass,
-                self._mac_address,
-                connectable=False,
-            )
-            if service_info is not None:
-                age = max(0.0, bluetooth.MONOTONIC_TIME() - service_info.time)
-                heard_at = datetime.now(tz=UTC) - timedelta(seconds=age)
-                self._mark_seen(heard_at, service_info.rssi, service_info.source)
+        self._read_history()
         self._update_state(force_write=False)
+
+    def _read_history(self) -> None:
+        """Take over when the current address was last heard, from the Bluetooth history."""
+        if self._mac_address is None:
+            return
+        service_info = bluetooth.async_last_service_info(
+            self.hass,
+            self._mac_address,
+            connectable=False,
+        )
+        if service_info is not None:
+            age = max(0.0, bluetooth.MONOTONIC_TIME() - service_info.time)
+            heard_at = datetime.now(tz=UTC) - timedelta(seconds=age)
+            self._mark_seen(heard_at, service_info.rssi, service_info.source)
 
     @callback
     def _mark_seen(self, heard_at: datetime, rssi: int | None, source: str | None) -> None:
@@ -208,8 +228,12 @@ class FindMyPresenceBinarySensor(BinarySensorEntity, RestoreEntity):  # pyright:
         # An accessory that is away has no signal strength.
         storage = RuntimeStorage.get(self.hass)
         rssi = self._rssi if is_on else None
-        if storage.local_rssi.get(self._identifier) != rssi:
-            storage.local_rssi[self._identifier] = rssi
+        changed = storage.local_rssi.get(self._identifier) != rssi
+        storage.local_rssi[self._identifier] = rssi
+        # Also while the value stays the same: the signal strength sensor holds a small change
+        # back until its own update delay has passed. Told only about changes, it never heard
+        # of the value again once the signal settled, and kept showing the one before.
+        if changed or rssi is not None:
             async_dispatcher_send(self.hass, signal_local_rssi(self._identifier))
 
         attributes_due = (
