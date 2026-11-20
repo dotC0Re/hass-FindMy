@@ -407,6 +407,11 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         # The refresh it belongs to handles the cancellation; this only waits for its end.
         _ = await asyncio.wait({fetch})
 
+    def _fetch_ended(self, fetch: asyncio.Task[_FetchResult]) -> None:
+        """Let the next refresh fetch again, once the fetch task has ended on any path."""
+        if self._running_fetch is not None and self._running_fetch[1] is fetch:
+            self._running_fetch = None
+
     async def _async_prepare_and_fetch(
         self, account: AccountRuntime, budget_id: str, devices: list[FindMyDevice]
     ) -> _FetchResult:
@@ -497,6 +502,20 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
         re-authentication and manual refreshes. That makes this the one place that keeps the
         15-minute limit of each account.
         """
+        if self._running_fetch is not None:
+            # At most one fetch is prepared or running at a time. Home Assistant runs one
+            # refresh at a time already (the lock of its debouncer), but a refresh that was
+            # cancelled releases that lock while its fetch task may still be unwinding, and
+            # the fetch is only counted against the budget once its job starts. A second fetch
+            # in between could pick the same account and fetch twice within seconds.
+            #
+            # Not waiting for the running fetch: its result reaches the listeners anyway when
+            # it ends, and waiting could hold a caller for up to the fetch limit. This refresh
+            # keeps the data like one the budget turned away; the schedule that follows the
+            # running fetch plans the next one, also for another account in the rotation.
+            _LOGGER.debug("A fetch is already running; keeping the current data")
+            return self.data or {}
+
         rotation = self._rotation()
         if not rotation:
             if self._storage.accounts:
@@ -537,6 +556,9 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
                 name="findmy location fetch",
             )
             self._running_fetch = (account, fetch)
+            # Released when the task has ended, not when this refresh does: a refresh that is
+            # cancelled itself returns before its fetch task has unwound.
+            fetch.add_done_callback(self._fetch_ended)
             sources, device_reports = await fetch
             success = True
         except asyncio.CancelledError:
@@ -577,8 +599,6 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
             msg = "Apple account needs to be re-authenticated"
             raise UpdateFailed(msg) from err
         finally:
-            if self._running_fetch is not None and self._running_fetch[1] is fetch:
-                self._running_fetch = None
             account.fetch_finished(success=success)
             self._signal_fetch(account)
             # A fetch may have renewed the session even if it failed afterwards (R5).

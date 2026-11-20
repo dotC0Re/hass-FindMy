@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from findmy import KeyPair
 from homeassistant.config_entries import ConfigEntry
 
 from custom_components.findmy import async_setup, async_setup_entry, async_unload_entry
@@ -350,3 +351,226 @@ async def test_report_of_a_device_reloaded_during_the_fetch_reaches_its_new_obje
     assert stored is not None
     assert stored.timestamp == seen_at
     assert new.alignment == found[0]
+
+
+# --- One fetch at a time ----------------------------------------------------------------------
+#
+# The fetch is counted against the budget when its job starts on the worker (G1), so between the
+# choice of the account and that moment nothing else may choose it again. Home Assistant runs one
+# refresh at a time (the lock of the coordinator's debouncer); these tests take its paths, and
+# also overlap refreshes outside that lock, which the coordinator guards against itself.
+
+
+@final
+class Derivation:
+    """Holds the key derivation of the next search windows in their executor thread."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        original = CachedFindMyAccessory.search_window
+
+        def slow(accessory: CachedFindMyAccessory, now: datetime) -> SearchWindow:
+            self.started.set()
+            _ = self.release.wait(10)
+            return original(accessory, now)
+
+        monkeypatch.setattr(CachedFindMyAccessory, "search_window", slow)
+
+    async def wait_started(self) -> None:
+        assert await asyncio.to_thread(self.started.wait, 5)
+
+
+async def set_up_with_accessory(hass: HomeAssistant, *emails: str) -> RuntimeStorage:
+    storage = await start(hass)
+    for email in emails or (JANE,):
+        assert await async_setup_entry(hass, account_entry(hass, email)) is True
+    _ = storage.coordinator.async_add_listener(lambda: None, unlocated_accessory())
+    return storage
+
+
+def count_budget_records(storage: RuntimeStorage, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The budget ids the budget counts a fetch for, in order."""
+    recorded: list[str] = []
+    original = storage.budget.record_fetch
+
+    def record(budget_id: str, now: datetime) -> None:
+        recorded.append(budget_id)
+        original(budget_id, now)
+
+    monkeypatch.setattr(storage.budget, "record_fetch", record)
+    return recorded
+
+
+async def first_started(gates: dict[str, Gate]) -> Gate:
+    """The gate of whichever account fetches first."""
+    waits = {asyncio.ensure_future(gate.started.wait()): gate for gate in gates.values()}
+    done, pending = await asyncio.wait(waits, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        _ = task.cancel()
+    assert done
+    return waits[next(iter(done))]
+
+
+async def test_refreshes_started_while_the_first_derives_keys_fetch_once(
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) Through Home Assistant's lock, and around it: one fetch, counted once, no failure."""
+    storage = await set_up_with_accessory(hass)
+    coordinator = storage.coordinator
+    recorded = count_budget_records(storage, monkeypatch)
+    derivation = Derivation(monkeypatch)
+
+    first = asyncio.create_task(coordinator.async_refresh())
+    await derivation.wait_started()
+    # Waits for Home Assistant's lock, then finds the account counted.
+    second = asyncio.create_task(coordinator.async_refresh())
+    # Around the lock: returns at once, with the data as it is.
+    assert await coordinator._async_update_data() == {}
+    derivation.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 10)
+
+    assert fetches(apple) == 1
+    assert recorded == [account_budget_id(JANE)]
+    assert coordinator.last_update_success is True
+    assert coordinator.last_exception is None
+    assert coordinator._running_fetch is None
+
+
+async def test_delayed_refresh_during_a_running_scheduled_refresh_does_not_fetch_again(
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) A device set up while the scheduled refresh fetches plans a refresh of its own."""
+    storage = await set_up_with_accessory(hass)
+    coordinator = storage.coordinator
+    recorded = count_budget_records(storage, monkeypatch)
+    gate = Gate()
+    apple[JANE][0].fetch_location.side_effect = gate.fetch
+
+    # What Home Assistant's timer runs for a scheduled refresh.
+    scheduled = asyncio.create_task(coordinator._handle_refresh_interval())
+    await asyncio.wait_for(gate.started.wait(), 10)
+    device = make_config_entry(hass, {"type": "device_static", "data": KeyPair.new().to_json()})
+    assert await async_setup_entry(hass, device) is True
+    coordinator.schedule_refresh(0)
+    await asyncio.sleep(0.05)
+    assert fetches(apple) == 1
+    gate.release.set()
+    await asyncio.wait_for(scheduled, 10)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert fetches(apple) == 1
+    assert recorded == [account_budget_id(JANE)]
+    assert coordinator.last_update_success is True
+    assert coordinator._running_fetch is None
+
+
+async def test_second_account_fetches_after_the_first_never_alongside_it(
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) With two accounts, a refresh that arrives during a fetch does not prepare another.
+
+    Through Home Assistant's lock it runs once the first fetch has ended, and may then fetch
+    with the other account: the limit is per account. Around the lock it fetches nothing.
+    """
+    emails = ("a@example.com", "b@example.com")
+    storage = await set_up_with_accessory(hass, *emails)
+    coordinator = storage.coordinator
+    recorded = count_budget_records(storage, monkeypatch)
+    gates = {email: Gate() for email in emails}
+    running: list[str] = []
+    most = 0
+
+    def fetch_for(email: str) -> Any:
+        async def fetch(sources: list[object]) -> dict[object, None]:
+            nonlocal most
+            running.append(email)
+            most = max(most, len(running))
+            try:
+                return await gates[email].fetch(sources)
+            finally:
+                running.remove(email)
+
+        return fetch
+
+    for email in emails:
+        apple[email][0].fetch_location.side_effect = fetch_for(email)
+
+    first = asyncio.create_task(coordinator.async_refresh())
+    _ = await first_started(gates)
+    assert await coordinator._async_update_data() == {}
+    second = asyncio.create_task(coordinator.async_refresh())
+    await asyncio.sleep(0.05)
+    assert sum(fetches(apple, email) for email in emails) == 1
+    for gate in gates.values():
+        gate.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 10)
+
+    assert [fetches(apple, email) for email in emails] == [1, 1]
+    assert sorted(recorded) == sorted(account_budget_id(email) for email in emails)
+    assert most == 1
+    assert coordinator.last_update_success is True
+    assert coordinator._running_fetch is None
+
+
+@pytest.mark.parametrize(
+    "ending", ["success", "failure", "unload", "refresh cancelled", "shutdown"]
+)
+async def test_next_fetch_is_possible_however_the_last_one_ended(
+    hass: HomeAssistant,
+    platforms: MagicMock,
+    apple: Apple,
+    fetch_clock: FetchClock,
+    ending: str,
+) -> None:
+    """The guard of the running fetch is released on every path the fetch can end."""
+    storage = await start(hass)
+    coordinator = storage.coordinator
+    entry = account_entry(hass)
+    assert await async_setup_entry(hass, entry) is True
+    gate = Gate()
+    library = apple[JANE][0]
+    library.fetch_location.side_effect = TimeoutError if ending == "failure" else gate.fetch
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    if ending != "failure":
+        await asyncio.wait_for(gate.started.wait(), 10)
+        assert coordinator._running_fetch is not None
+
+    if ending == "success":
+        gate.release.set()
+    elif ending == "unload":
+        assert await async_unload_entry(hass, entry) is True
+    elif ending == "refresh cancelled":
+        _ = refresh.cancel()
+    elif ending == "shutdown":
+        await storage.worker.async_stop()
+    if ending == "refresh cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await refresh
+    else:
+        await asyncio.wait_for(refresh, 10)
+    # The thread the fake fetch waited in cannot be cancelled; let it end.
+    gate.release.set()
+    # The fetch task has ended once the loop ran its callbacks.
+    await asyncio.sleep(0)
+
+    assert coordinator._running_fetch is None
+    if ending in {"unload", "shutdown"}:
+        return
+    fetch_clock.advance()
+    library.fetch_location.side_effect = None
+    await coordinator.async_refresh()
+    assert fetches(apple) == 2
+    assert coordinator.last_update_success is True
