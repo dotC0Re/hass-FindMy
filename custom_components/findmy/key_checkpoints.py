@@ -18,10 +18,20 @@ can read the config entry learns nothing from this file, and the file alone give
 the config entries, it is readable by the user Home Assistant runs as only. The record of a
 device is dropped when its config entry is removed.
 
+Each secret comes with a 16-byte tag: an HMAC-SHA256, keyed with the initial secret of its
+chain (the SKN or SKS of the config entry), over the name of the chain, the index and the
+secret. Restoring checks every tag against the accessory's own initial secrets, without walking
+the chain (key_cache.py). The tag tells nothing about the keys either.
+
 Limits
 ------
+* The checkpoints only save time; they can never cost a correct key. If any checkpoint of a
+  device does not verify (a damaged or edited file, a record under the wrong entry, a wrong
+  index), all of its checkpoints are dropped with a warning, its keys are derived from the
+  pairing, and the record is overwritten by the next save.
 * Checkpoints made with another version of FindMy.py are dropped, in case it derives the chain
-  differently; the next walk then starts at the pairing once more.
+  differently; the next walk then starts at the pairing once more. So are those of version 1
+  of the file, which had no tags.
 * A lost or broken file only means that, too.
 * key_cache.py decides whether the checkpoints can be used at all (_chain_access_works).
 """
@@ -31,9 +41,11 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import logging
-from typing import TYPE_CHECKING, TypedDict, cast, final
+from typing import TYPE_CHECKING, Any, TypedDict, cast, final, override
 
 from homeassistant.helpers.storage import Store
+
+from .key_cache import CHECKPOINT_TAG_LENGTH, ChainCheckpoint
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -45,7 +57,8 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_KEY = "findmy.key_checkpoints"
-STORAGE_VERSION = 1
+# Version 2 added the tag of every secret. Version 1 records cannot be verified and are dropped.
+STORAGE_VERSION = 2
 # Checkpoints change about once a week per accessory; there is no hurry to write them.
 SAVE_DELAY = 30.0
 
@@ -63,27 +76,65 @@ def _library_version() -> str | None:
 LIBRARY_VERSION = _library_version()
 
 
+class _StoredCheckpoint(TypedDict):
+    secret: str
+    tag: str
+
+
 class _StoredData(TypedDict):
     library: str | None
-    devices: dict[str, dict[str, dict[str, str]]]
+    devices: dict[str, dict[str, dict[str, _StoredCheckpoint]]]
 
 
-def _parse_chain(stored: object) -> dict[int, bytes]:
-    """Read the checkpoints of one chain; raises TypeError or ValueError for broken ones."""
+@final
+class _CheckpointFile(Store[_StoredData]):
+    """The Store of the checkpoints, which drops records it cannot verify."""
+
+    @override
+    async def _async_migrate_func(
+        self,
+        old_major_version: int,
+        old_minor_version: int,
+        old_data: dict[str, Any],  # pyright: ignore[reportExplicitAny]  # as in Store
+    ) -> _StoredData:
+        # Version 1 stored the secrets without tags; nothing can tell whether they are right.
+        _LOGGER.debug(
+            "Dropping the key checkpoints of storage version %i.%i",
+            old_major_version,
+            old_minor_version,
+        )
+        library = old_data.get("library")
+        return {"library": library if isinstance(library, str) else None, "devices": {}}
+
+
+def _parse_chain(stored: object) -> dict[int, ChainCheckpoint]:
+    """Read the checkpoints of one chain; raises TypeError or ValueError for broken ones.
+
+    Only the form is checked here. Whether a secret belongs to the accessory is for its tag to
+    show, which key_cache.py checks when the accessory is set up.
+    """
     if not isinstance(stored, dict):
         raise TypeError(type(stored).__name__)
-    secrets: dict[int, bytes] = {}
-    for raw_index, raw_secret in cast("dict[object, object]", stored).items():
-        if not isinstance(raw_index, str) or not isinstance(raw_secret, str):
-            msg = "index or secret"
+    checkpoints: dict[int, ChainCheckpoint] = {}
+    for raw_index, raw in cast("dict[object, object]", stored).items():
+        if not isinstance(raw_index, str) or not isinstance(raw, dict):
+            msg = "index or checkpoint"
+            raise TypeError(msg)
+        record = cast("dict[object, object]", raw)
+        raw_secret, raw_tag = record.get("secret"), record.get("tag")
+        if not isinstance(raw_secret, str) or not isinstance(raw_tag, str):
+            msg = "secret or tag"
             raise TypeError(msg)
         index = int(raw_index)
-        secret = bytes.fromhex(raw_secret)
-        if index <= 0 or len(secret) != _SECRET_LENGTH:
+        checkpoint = ChainCheckpoint(bytes.fromhex(raw_secret), bytes.fromhex(raw_tag))
+        if index <= 0 or len(checkpoint.secret) != _SECRET_LENGTH:
             msg = "index or secret"
             raise ValueError(msg)
-        secrets[index] = secret
-    return secrets
+        if len(checkpoint.tag) != CHECKPOINT_TAG_LENGTH:
+            msg = "tag"
+            raise ValueError(msg)
+        checkpoints[index] = checkpoint
+    return checkpoints
 
 
 def _parse_device(stored: object) -> ChainCheckpoints:
@@ -107,7 +158,9 @@ class KeyCheckpointStore:
 
     def __init__(self, hass: HomeAssistant) -> None:
         # private: what is stored is derived from the secrets of the config entries.
-        self._store: Store[_StoredData] = Store(hass, STORAGE_VERSION, STORAGE_KEY, private=True)
+        self._store: Store[_StoredData] = _CheckpointFile(
+            hass, STORAGE_VERSION, STORAGE_KEY, private=True
+        )
         self._devices: dict[str, ChainCheckpoints] = {}
         # A second caller waits for the first load instead of finding half the records.
         self._load_lock = asyncio.Lock()
@@ -205,8 +258,11 @@ class KeyCheckpointStore:
             "library": LIBRARY_VERSION,
             "devices": {
                 entry_id: {
-                    chain: {str(index): secret.hex() for index, secret in secrets.items()}
-                    for chain, secrets in checkpoints.items()
+                    chain: {
+                        str(index): {"secret": checkpoint.secret.hex(), "tag": checkpoint.tag.hex()}
+                        for index, checkpoint in stored.items()
+                    }
+                    for chain, stored in checkpoints.items()
                 }
                 for entry_id, checkpoints in self._devices.items()
             },

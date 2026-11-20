@@ -27,6 +27,7 @@ from custom_components.findmy.key_cache import (
     PRIMARY_CHAIN,
     SECONDARY_CHAIN,
     CachedFindMyAccessory,
+    ChainCheckpoint,
 )
 
 if TYPE_CHECKING:
@@ -139,8 +140,10 @@ def test_checkpoints_hold_chain_secrets_only_and_few_of_them() -> None:
     assert 1 <= len(primary) <= 3
     # Nothing lower than a week below the alignment: what a fetch or the matching can need.
     assert min(primary) >= data["alignment_index"] - 2 * 7 * 96
-    secrets = [secret for chain in checkpoints.values() for secret in chain.values()]
+    stored = [checkpoint for chain in checkpoints.values() for checkpoint in chain.values()]
+    secrets = [checkpoint.secret for checkpoint in stored]
     assert all(len(secret) == 32 for secret in secrets)
+    assert all(len(checkpoint.tag) == 16 for checkpoint in stored)
     # No private key of the accessory.
     plain = FindMyAccessory.from_json(data)
     window = accessory.search_window(datetime.now(tz=UTC))
@@ -184,16 +187,54 @@ def test_checkpoints_of_the_local_gap_are_kept_as_well(chain_steps: list[None]) 
     assert len(chain_steps) < MAX_STEPS_FROM_CHECKPOINTS
 
 
-def test_broken_checkpoints_are_ignored() -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "flipped byte in a secret",
+        "checkpoints of another accessory",
+        "correct secret at a wrong index",
+        "secret of the other chain",
+        "unknown chain",
+        "index 0",
+        "short secret",
+    ],
+)
+def test_checkpoints_that_do_not_belong_to_the_accessory_are_dropped(
+    damage: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A single wrong secret would make every later key wrong; none is seeded, with a warning."""
     data = accessory_data()
-    accessory = cached(data)
+    now = datetime.now(tz=UTC)
+    source = cached(data)
+    _ = source.search_window(now)
+    checkpoints = source.chain_checkpoints()
+    primary = checkpoints[PRIMARY_CHAIN]
+    ind, checkpoint = max(primary.items())
+    if damage == "flipped byte in a secret":
+        flipped = bytes([checkpoint.secret[0] ^ 1]) + checkpoint.secret[1:]
+        primary[ind] = ChainCheckpoint(flipped, checkpoint.tag)
+    elif damage == "checkpoints of another accessory":
+        other = cached(accessory_data())
+        _ = other.search_window(now)
+        checkpoints = other.chain_checkpoints()
+    elif damage == "correct secret at a wrong index":
+        del primary[ind]
+        primary[ind + 4] = checkpoint
+    elif damage == "secret of the other chain":
+        checkpoints[SECONDARY_CHAIN][ind] = checkpoint
+    elif damage == "unknown chain":
+        checkpoints["unknown"] = {ind: checkpoint}
+    elif damage == "index 0":
+        primary[0] = checkpoint
+    else:
+        primary[ind] = ChainCheckpoint(b"short", checkpoint.tag)
 
-    taken = accessory.restore_chain_checkpoints(
-        {PRIMARY_CHAIN: {0: bytes(32), 8: b"short"}, "unknown": {4: bytes(32)}}
-    )
+    restored = cached(data)
+    taken = restored.restore_chain_checkpoints(checkpoints)
 
     assert taken is False
-    keys = window_keys(accessory, datetime.now(tz=UTC))
+    assert "do not belong to it" in caplog.text
+    keys = window_keys(restored, now)
     assert keys == library_keys(data, range(min(keys), max(keys) + 1))
 
 
@@ -209,7 +250,9 @@ def test_changed_library_falls_back_to_the_slow_path(
     assert before.chain_checkpoints() == {}
 
     after = cached(data)
-    assert after.restore_chain_checkpoints({PRIMARY_CHAIN: {8: os.urandom(32)}}) is False
+    secret = os.urandom(32)
+    checkpoint = ChainCheckpoint(secret, after._checkpoint_tag(PRIMARY_CHAIN, 8, secret))
+    assert after.restore_chain_checkpoints({PRIMARY_CHAIN: {8: checkpoint}}) is False
     chain_steps.clear()
     keys = window_keys(after, now)
 

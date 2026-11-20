@@ -193,10 +193,13 @@ class RuntimeStorage:
             # Before anything derives a key, so that the key chain starts close to where its
             # keys are needed instead of at the pairing.
             checkpoints = self.key_checkpoints.get(entry.entry_id)
-            if isinstance(accessory, CachedFindMyAccessory) and accessory.restore_chain_checkpoints(
-                checkpoints
-            ):
-                _LOGGER.debug("Restored the key chain checkpoints of %s", accessory.name)
+            if checkpoints and isinstance(accessory, CachedFindMyAccessory):
+                if accessory.restore_chain_checkpoints(checkpoints):
+                    _LOGGER.debug("Restored the key chain checkpoints of %s", accessory.name)
+                else:
+                    # Not taken, as for checkpoints that do not belong to the accessory: the
+                    # record goes, and the next save writes the accessory's own ones.
+                    self.key_checkpoints.forget(entry.entry_id)
 
             _LOGGER.debug(
                 "Storing entry %s as rolling (derived) tag: %s",

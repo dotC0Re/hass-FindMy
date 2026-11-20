@@ -31,7 +31,11 @@ then walks from there.
 FindMy.py has no public way to do either, so both use private attributes of its key generator.
 :func:`_chain_access_works` checks once per run, on a throwaway accessory, that they still mean
 what this module assumes; if not, no checkpoint is read or restored, and the chain is walked
-from 0 as before, only slower. The checkpoints are also tied to the FindMy.py version that made
+from 0 as before, only slower. Each checkpoint carries a tag, an HMAC keyed with the initial
+secret of its chain over the chain, the index and the secret: a checkpoint that does not belong
+to the accessory, its chain or its index (a damaged or edited file, a record under the wrong
+entry) is never seeded, since it would make every later key of the accessory wrong without
+anything noticing. The checkpoints are also tied to the FindMy.py version that made
 them (key_checkpoints.py).
 
 Sharing the interpreter
@@ -84,13 +88,14 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import hmac
 import logging
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast, final, override
+from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 
 from findmy import FindMyAccessory, KeyPair, RollingKeyPairSource
 
@@ -200,7 +205,18 @@ SECONDARY_CHAIN = "secondary"
 _GENERATOR_ATTRIBUTES = {PRIMARY_CHAIN: "_primary_gen", SECONDARY_CHAIN: "_secondary_gen"}
 _SECRET_LENGTH = 32
 
-type ChainCheckpoints = dict[str, dict[int, bytes]]
+# Length of the tag that binds a checkpoint to its accessory, chain and index, in bytes.
+CHECKPOINT_TAG_LENGTH = 16
+
+
+class ChainCheckpoint(NamedTuple):
+    """A secret of a key chain, and the tag that says whose chain and which index it is."""
+
+    secret: bytes
+    tag: bytes
+
+
+type ChainCheckpoints = dict[str, dict[int, ChainCheckpoint]]
 
 
 def _on_event_loop() -> bool:
@@ -576,34 +592,70 @@ class CachedFindMyAccessory(FindMyAccessory):
                 secrets = None if secret_chain is None else secret_chain.known()
                 if not secrets:
                     continue
-                chosen = {
-                    ind: secret
-                    for ind, secret in secrets.items()
-                    if ind > low and ind % _CHECKPOINT_SPACING == 0
-                }
+                chosen = [ind for ind in secrets if ind > low and ind % _CHECKPOINT_SPACING == 0]
                 below = max((ind for ind in secrets if 0 < ind <= low), default=None)
                 if below is not None:
-                    chosen[below] = secrets[below]
+                    chosen.append(below)
                 if chosen:
-                    checkpoints[chain] = chosen
+                    checkpoints[chain] = {
+                        ind: ChainCheckpoint(
+                            secrets[ind], self._checkpoint_tag(chain, ind, secrets[ind])
+                        )
+                        for ind in sorted(chosen)
+                    }
         return checkpoints
 
-    def restore_chain_checkpoints(self, checkpoints: Mapping[str, Mapping[int, bytes]]) -> bool:
+    def _checkpoint_tag(self, chain: str, ind: int, secret: bytes) -> bytes:
+        """The tag of a chain secret: an HMAC keyed with the initial secret of the chain.
+
+        The initial secrets (SKN, SKS) are in the config entry already. Nobody without them can
+        make a tag, and a tag proves without walking the chain that the secret was stored for
+        this accessory, this chain and this index.
+        """
+        key = self.skn if chain == PRIMARY_CHAIN else self.sks
+        message = chain.encode() + b"\0" + ind.to_bytes(8, "big") + secret
+        return hmac.new(key, message, hashlib.sha256).digest()[:CHECKPOINT_TAG_LENGTH]
+
+    def _checkpoints_belong_here(
+        self, checkpoints: Mapping[str, Mapping[int, ChainCheckpoint]]
+    ) -> bool:
+        """Whether every checkpoint is a secret of this accessory's chain at its index."""
+        for chain, secrets in checkpoints.items():
+            if chain not in _GENERATOR_ATTRIBUTES:
+                return False
+            for ind, checkpoint in secrets.items():
+                if ind <= 0 or len(checkpoint.secret) != _SECRET_LENGTH:
+                    return False
+                expected = self._checkpoint_tag(chain, ind, checkpoint.secret)
+                if not hmac.compare_digest(checkpoint.tag, expected):
+                    return False
+        return True
+
+    def restore_chain_checkpoints(
+        self, checkpoints: Mapping[str, Mapping[int, ChainCheckpoint]]
+    ) -> bool:
         """Give the key generators secrets that chain_checkpoints of an earlier object returned.
 
         Must be called before the accessory is used by anything else. Returns whether they were
-        taken; without access to the generators nothing changes and the chain is walked from 0.
+        taken; otherwise nothing changes and the chain is walked from the pairing. That is the
+        case without access to the generators, and for checkpoints of which any one does not
+        verify (see _checkpoint_tag): all of them are dropped then, with a warning, since a
+        single wrong secret would make every key above it wrong.
         """
-        if not checkpoints or not _chain_access_works():
+        if not checkpoints:
+            return False
+        if not self._checkpoints_belong_here(checkpoints):
+            _LOGGER.warning(
+                "The stored key chain checkpoints of %s do not belong to it; ignoring them",
+                self.name,
+            )
+            return False
+        if not _chain_access_works():
             return False
         taken = False
-        for chain, secrets in checkpoints.items():
-            secret_chain = _SecretChain.of(self, chain) if chain in _GENERATOR_ATTRIBUTES else None
-            valid = {
-                ind: secret
-                for ind, secret in secrets.items()
-                if ind > 0 and len(secret) == _SECRET_LENGTH
-            }
+        for chain, stored in checkpoints.items():
+            secret_chain = _SecretChain.of(self, chain)
+            valid = {ind: checkpoint.secret for ind, checkpoint in stored.items()}
             if secret_chain is None or not valid:
                 continue
             if not secret_chain.seed(valid):
