@@ -81,6 +81,10 @@ What is left to guard, and how:
   A per-accessory lock covers the write and every read of the pair; it is held for a few
   attribute accesses and never across an await.
 * The catch-up cursor: event loop only, no lock.
+* The keys of the local gap (local_gap_keys): ``_gap_lock``, held in an executor thread through
+  a whole call, derivation included. The event loop never takes it. What it hands in, a raised
+  bound of the gap (note_unaligned_match), is one attribute that it replaces as a whole and that
+  the next call reads once; no lock.
 """
 
 from __future__ import annotations
@@ -134,24 +138,47 @@ _SECONDARY_KEY_SPAN = 96
 # report found there realigns the accessory, which puts it back into the top window.
 #
 # The local Bluetooth matching cannot wait for a report: it may run without any Apple account.
-# It gets the keys between the last alignment and the top window from local_gap_keys, see
-# MAX_LOCAL_GAP_INDICES.
+# It gets the keys from a day below the last alignment up to the top window from local_gap_keys,
+# see MAX_LOCAL_GAP_INDICES and LOCAL_RESTART_MARGIN.
 MAX_SEARCH_INDICES = 7 * 96
 
 # How far above its last alignment an accessory is still recognised locally once its index fell
 # below the top window. The case this is for: a battery that was empty for more than a week.
-# The index stood still meanwhile and goes on from where it stopped, which is at or above the
-# index of the last sighting. Without these keys such an accessory would never be heard again
-# unless a location report realigns it, and a setup without an Apple account has no reports.
+# The index stood still meanwhile and goes on from where it stopped, which is at or a little
+# below (LOCAL_RESTART_MARGIN) the index of the last sighting. Without these keys such an
+# accessory would never be heard again unless a location report realigns it, and a setup
+# without an Apple account has no reports.
 #
-# 90 days of indices above the alignment: at most 8,640 advertisement keys per accessory, kept
-# as plain bytes (about 1.5 MB), derived once and only for an accessory that has such a gap.
-# An accessory further ahead of its alignment than that is found by a location report only.
+# 90 days of indices above the alignment, or above the bound a match that cannot align raised it
+# to (CachedFindMyAccessory.note_unaligned_match): at most 8,640 advertisement keys per
+# accessory and the day below (LOCAL_RESTART_MARGIN), kept as plain bytes (about 1.5 MB),
+# derived once and only for an accessory that has such a gap. An accessory further ahead of
+# that bound is found by a location report only.
 MAX_LOCAL_GAP_INDICES = 90 * 96
+
+# Indices below the last sighting that are still recognised locally: a day. That an accessory
+# goes on exactly where it stopped is an assumption, not a measurement. One that writes its index
+# to flash only now and then starts again somewhat below the last index it was heard at after a
+# battery change, and would not be recognised before it climbed back there, up to a day later.
+# A match below the alignment never aligns (alignments only move forwards) and is reported with
+# can_align False, so that the device tracker does not take it for a change of index either.
+#
+# The same day is kept below a bound raised by note_unaligned_match. There it also covers the
+# neighbouring day that shares a secondary key with the matched one (see there).
+#
+# Cost: nothing while the alignment is at most 12 hours old, because the 36-hour window of the
+# local matching (local_bluetooth.KEY_WINDOW_PAST) still reaches a day below it; that is every
+# accessory that is heard regularly. Once it is older, at most 96 primary keys and the secondary
+# keys of the two days they fall in (four derivations), derived once per alignment as the window
+# moves off them: about 40 ms on a desktop, a few times that on a small server, and about 17 KB.
+# An accessory that is not heard locally for more than 12 hours pays that once per absence.
+# Below a raised bound the day lies in the gap, whose keys are derived already.
+LOCAL_RESTART_MARGIN = _SECONDARY_KEY_SPAN
 
 # Indices of that gap derived per call of local_gap_keys, lowest first. One call per local
 # refresh (every 15 minutes) spreads the derivation of a long gap over a few hours; the week
-# right above the alignment, where a tag with a fresh battery is most likely, comes first.
+# right above the alignment, where a tag with a fresh battery is most likely, comes first. The
+# day below it (LOCAL_RESTART_MARGIN) comes before that and does not count against the step.
 LOCAL_GAP_STEP = MAX_SEARCH_INDICES
 
 # Minimum time between two catch-up windows of one accessory. A window holds at most
@@ -219,6 +246,21 @@ class ChainCheckpoint(NamedTuple):
 
 
 type ChainCheckpoints = dict[str, dict[int, ChainCheckpoint]]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class LocalGapKey:
+    """An advertisement key from local_gap_keys and the key index it is reported with.
+
+    ``can_align`` says whether a match may move the alignment to ``index``: only for a primary
+    key at or above the alignment. A secondary key belongs to a whole day of indices, and a key
+    below the alignment (LOCAL_RESTART_MARGIN) would move it backwards.
+    """
+
+    index: int
+    adv_key: bytes
+    can_align: bool
 
 
 def _on_event_loop() -> bool:
@@ -468,13 +510,18 @@ class CachedFindMyAccessory(FindMyAccessory):
         # Makes the alignment, which FindMy.py keeps in two attributes, one value for readers
         # in other threads. Reentrant, because the bounds below are computed from one another.
         self._alignment_lock = threading.RLock()
-        # Advertisement keys between the last alignment and the top window, for the local
-        # Bluetooth matching only; see local_gap_keys. Plain bytes instead of key pairs, since
-        # nothing ever decrypts with them.
+        # Advertisement keys from a day below the last sighting up to the top window, for the
+        # local Bluetooth matching only; see local_gap_keys. Plain bytes instead of key pairs,
+        # since nothing ever decrypts with them.
         self._gap_lock = threading.Lock()
         self._gap_anchor: int | None = None
         self._gap_primary: dict[int, bytes] = {}
         self._gap_secondary: dict[int, tuple[bytes, bytes]] = {}
+        # A raised lower bound of that gap, see note_unaligned_match: the alignment it was
+        # raised under, and the bound. Written on the event loop only and read in executor
+        # threads without a lock: it is one tuple, replaced as a whole, so a reader sees either
+        # the old or the new pair. Never written to disk.
+        self._gap_floor_request: tuple[tuple[datetime, int], int] | None = None
         # Highest index of the primary secret chain known to have been reached, from a restored
         # checkpoint or a walk; see _walk_primary_chain.
         self._primary_reach = 0
@@ -735,22 +782,67 @@ class CachedFindMyAccessory(FindMyAccessory):
         key_1, key_2 = self._secondary_keys_at(ind)
         return CachedKeyPair.from_keypair(key_1), CachedKeyPair.from_keypair(key_2)
 
-    def local_gap_keys(self, covered_from: int) -> list[tuple[int, bytes, bool]]:
-        """Advertisement keys between the last alignment and the lowest index covered anyway.
+    def note_unaligned_match(self, index: int) -> None:
+        """Raise the lower bound of the local gap to the day of a match that cannot align.
 
-        For the local Bluetooth matching of an accessory whose index fell below the top window
-        (see MAX_LOCAL_GAP_INDICES). ``covered_from`` is the lowest index the caller already has
-        keys for. Returns ``(index, advertisement key, is primary)`` for everything derived so
-        far, and derives up to LOCAL_GAP_STEP more indices per call, lowest first. Empty for an
-        accessory without such a gap, which is the normal case and costs nothing.
+        To be called by the device tracker on the event loop for every local match with
+        ``can_align`` False, with the index of the matched candidate. A tag away from its
+        owner's phone sends its secondary key, which cannot align: without this the alignment
+        and with it the gap below the top window would stay where they are for good, about
+        9,500 candidates per refresh, and a tag in the gap would leave its reach after 90 days.
 
-        A match realigns the accessory, which moves the top window to where it was heard; the
-        gap is then gone, and its keys with it.
+        The match shows that the tag uses the keys of that day now. The gap of local_gap_keys
+        then starts at the first index of the day instead of at the alignment: keys below it
+        are dropped by the next call, and the reach of MAX_LOCAL_GAP_INDICES counts from it.
+        A day below the bound stays (LOCAL_RESTART_MARGIN), as below an alignment: FindMy.py
+        does not know whether a day uses the secondary key ``day + 1`` or ``day + 2``
+        (FindMyAccessory._secondary_keys_at), so one key belongs to two neighbouring days, and
+        the day a match is reported with may be the later one.
+
+        The bound only ever rises; an index in the day of the alignment or below changes
+        nothing, which covers every match below the alignment. It is forgotten as soon as the
+        alignment changes, and after a restart: the alignment, and everything ``to_json``
+        writes, stay as they are.
+
+        Does not wait for anything that a derivation holds. It records the bound, a few
+        attribute accesses and the alignment lock for as long, and local_gap_keys applies it
+        when it is called next. A call in progress keeps the bound it started with.
+        """
+        bound = index // _SECONDARY_KEY_SPAN * _SECONDARY_KEY_SPAN
+        alignment = self.alignment
+        if bound > self._last_sighting(alignment):
+            self._gap_floor_request = (alignment, bound)
+
+    def _last_sighting(self, alignment: tuple[datetime, int]) -> int:
+        """The index of an alignment, or the bound note_unaligned_match raised above it."""
+        # Read once: note_unaligned_match may replace it on the event loop meanwhile.
+        request = self._gap_floor_request
+        if request is not None and request[0] == alignment:
+            return max(alignment[1], request[1])
+        return alignment[1]
+
+    def local_gap_keys(self, covered_from: int) -> list[LocalGapKey]:
+        """Advertisement keys around the last sighting that the caller does not cover anyway.
+
+        For the local Bluetooth matching. ``covered_from`` is the lowest index the caller
+        already has keys for. The keys reach from a day below the last sighting
+        (LOCAL_RESTART_MARGIN) up to ``covered_from``, but no more than MAX_LOCAL_GAP_INDICES
+        above it. The last sighting is the alignment, or the bound note_unaligned_match raised
+        if that is higher.
+
+        Returns everything derived so far, and derives up to LOCAL_GAP_STEP more indices above
+        the last sighting per call, lowest first, after the day below it. Empty for an accessory
+        that kept pace with the clock and was heard within the last 12 hours, which is the
+        normal case and costs nothing.
+
+        A match at or above the alignment realigns the accessory, which moves the top window to
+        where it was heard; the gap is then gone, and its keys with it.
 
         Meant to be run in an executor thread.
         """
-        with self._alignment_lock:
-            anchor = self._alignment_index
+        alignment = self.alignment
+        anchor = alignment[1]
+        sighting = self._last_sighting(alignment)
 
         with self._gap_lock:
             if anchor != self._gap_anchor:
@@ -758,46 +850,73 @@ class CachedFindMyAccessory(FindMyAccessory):
                 self._gap_primary = {}
                 self._gap_secondary = {}
 
-            highest = min(covered_from - 1, anchor + MAX_LOCAL_GAP_INDICES - 1)
-            # The top window moves up with the clock and takes over the upper end of the gap.
-            for ind in [ind for ind in self._gap_primary if ind > highest]:
+            lowest = max(sighting - LOCAL_RESTART_MARGIN, 0)
+            highest = min(covered_from - 1, sighting + MAX_LOCAL_GAP_INDICES - 1)
+            # The top window moves up with the clock and takes over the upper end of the gap; a
+            # raised bound takes away its lower end.
+            for ind in [ind for ind in self._gap_primary if not lowest <= ind <= highest]:
                 del self._gap_primary[ind]
 
-            derived = 0
-            for ind in range(max(anchor, 0), highest + 1):
-                if ind in self._gap_primary:
-                    continue
-                if derived >= LOCAL_GAP_STEP:
-                    break
-                span = ind // _SECONDARY_KEY_SPAN
-                self._walk_primary_chain(ind)
-                with _deriving():
-                    self._gap_primary[ind] = self._primary_key_at(ind).adv_key_bytes
-                    if span not in self._gap_secondary:
-                        key_1, key_2 = self._secondary_keys_at(ind)
-                        self._gap_secondary[span] = (key_1.adv_key_bytes, key_2.adv_key_bytes)
-                derived += 1
-
-            spans = {ind // _SECONDARY_KEY_SPAN for ind in self._gap_primary}
-            for span in [span for span in self._gap_secondary if span not in spans]:
-                del self._gap_secondary[span]
-
+            derived = self._derive_gap(lowest, highest, sighting)
             if derived:
                 _LOGGER.debug(
-                    "Derived %i local keys above the last alignment of %s (%i of %i indices)",
+                    "Derived %i local keys around index %i of %s (%i of %i indices)",
                     derived,
+                    sighting,
                     self.name,
                     len(self._gap_primary),
-                    highest - max(anchor, 0) + 1,
+                    highest - lowest + 1,
                 )
+            return self._collect_gap_keys(anchor)
 
-            keys = [(ind, key, True) for ind, key in self._gap_primary.items()]
-            for span, pair in self._gap_secondary.items():
-                # A secondary key belongs to a whole day of indices; it cannot align, so the
-                # index it is reported with only has to lie in that day.
-                first = min(ind for ind in self._gap_primary if ind // _SECONDARY_KEY_SPAN == span)
-                keys.extend((first, key, False) for key in pair)
-            return keys
+    def _derive_gap(self, lowest: int, highest: int, sighting: int) -> int:
+        """Derive the missing keys of the gap, lowest first; returns how many indices.
+
+        The caller holds _gap_lock. At most LOCAL_GAP_STEP indices at or above the last
+        sighting; the day below it, at most LOCAL_RESTART_MARGIN indices, is not counted.
+        """
+        derived = 0
+        derived_above = 0
+        for ind in range(lowest, highest + 1):
+            if ind in self._gap_primary:
+                continue
+            above = ind >= sighting
+            if above and derived_above >= LOCAL_GAP_STEP:
+                break
+            span = ind // _SECONDARY_KEY_SPAN
+            self._walk_primary_chain(ind)
+            with _deriving():
+                self._gap_primary[ind] = self._primary_key_at(ind).adv_key_bytes
+                if span not in self._gap_secondary:
+                    key_1, key_2 = self._secondary_keys_at(ind)
+                    self._gap_secondary[span] = (key_1.adv_key_bytes, key_2.adv_key_bytes)
+            derived += 1
+            if above:
+                derived_above += 1
+        return derived
+
+    def _collect_gap_keys(self, anchor: int) -> list[LocalGapKey]:
+        """The keys of the gap, after dropping secondary keys of days that left it.
+
+        The caller holds _gap_lock.
+        """
+        # Lowest index per day, which is what a secondary key is reported with.
+        first_of_span: dict[int, int] = {}
+        for ind in self._gap_primary:
+            span = ind // _SECONDARY_KEY_SPAN
+            if ind < first_of_span.get(span, ind + 1):
+                first_of_span[span] = ind
+        for span in [span for span in self._gap_secondary if span not in first_of_span]:
+            del self._gap_secondary[span]
+
+        keys = [
+            LocalGapKey(ind, key, can_align=ind >= anchor) for ind, key in self._gap_primary.items()
+        ]
+        for span, pair in self._gap_secondary.items():
+            # A secondary key belongs to a whole day of indices; it cannot align, so the index
+            # it is reported with only has to lie in that day.
+            keys.extend(LocalGapKey(first_of_span[span], key, can_align=False) for key in pair)
+        return keys
 
     def plan_catch_up(self, now: datetime) -> tuple[int, int] | None:
         """Pick the next range of indices below the top window to search, if one is due.

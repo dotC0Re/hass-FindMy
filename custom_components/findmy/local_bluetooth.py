@@ -72,9 +72,12 @@ def build_candidate_key_lookup(
     """Build a lookup keyed by the first six public-key bytes, without the top two bits.
 
     Holds the keys the accessory may use around ``observed_at`` if its index kept pace with the
-    clock. For an accessory whose index fell behind by more than a week (a battery that was
-    empty for a while) it also holds the keys above its last alignment, as far as they have
-    been derived; see ``CachedFindMyAccessory.local_gap_keys``. Meant for an executor thread.
+    clock. For a ``CachedFindMyAccessory`` it also holds the keys of a day below its last
+    sighting, and, for one whose index fell behind by more than a week (a battery that was
+    empty for a while), the keys above it, as far as they have been derived; see
+    ``CachedFindMyAccessory.local_gap_keys``. A match on a key below the alignment cannot
+    align. Every match that cannot align is meant to be passed on to
+    ``CachedFindMyAccessory.note_unaligned_match``. Meant for an executor thread.
     """
     candidates: defaultdict[bytes, list[CandidateKey]] = defaultdict(list)
 
@@ -93,9 +96,13 @@ def build_candidate_key_lookup(
 
     if isinstance(accessory, CachedFindMyAccessory):
         covered_from = accessory.get_min_index(observed_at - KEY_WINDOW_PAST)
-        for index, adv_key, primary in accessory.local_gap_keys(covered_from):
-            candidates[_lookup_prefix(adv_key)].append(
-                CandidateKey(index=index, adv_key=adv_key, can_align=primary),
+        for gap_key in accessory.local_gap_keys(covered_from):
+            candidates[_lookup_prefix(gap_key.adv_key)].append(
+                CandidateKey(
+                    index=gap_key.index,
+                    adv_key=gap_key.adv_key,
+                    can_align=gap_key.can_align,
+                ),
             )
 
     return {partial_key: tuple(keys) for partial_key, keys in candidates.items()}
