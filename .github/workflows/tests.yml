@@ -22,3 +22,24 @@ jobs:
 
     - name: Run pytest
       run: uv run --frozen pytest
+
+  # The same tests against the current Home Assistant release line, without changing the
+  # lock: the locked environment with Home Assistant, its package constraints and the
+  # requirements of bluetooth, hassio and usb replaced. Bump the version with each release.
+  pytest-ha-current:
+    runs-on: ubuntu-latest
+
+    env:
+      HOMEASSISTANT_VERSION: 2026.11.1
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: './.github/actions/setup-project'
+
+    - name: Install Home Assistant ${{ env.HOMEASSISTANT_VERSION }}
+      run: uv run --no-sync python .github/scripts/install_homeassistant.py "$HOMEASSISTANT_VERSION"
+
+    # --no-sync: a syncing `uv run` would restore the locked Home Assistant.
+    - name: Run pytest
+      run: uv run --no-sync pytest

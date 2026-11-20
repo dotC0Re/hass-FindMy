@@ -176,7 +176,7 @@ async def test_restart_while_present_assumes_present_until_the_timeout(
 ) -> None:
     """Home Assistant restarted while the accessory was here; nothing has been heard yet."""
     hass = platform_hass
-    _restore(hass, State(PRESENCE, STATE_ON, {"last_seen": "2026-11-19T07:00:00+00:00"}))
+    await _restore(hass, State(PRESENCE, STATE_ON, {"last_seen": "2026-11-19T07:00:00+00:00"}))
     await _setup(hass, accessory)
 
     assert get_state(hass, PRESENCE).state == STATE_ON
@@ -192,7 +192,7 @@ async def test_restart_while_away_keeps_away_and_the_last_sighting(
     accessory: FindMyAccessory,
 ) -> None:
     hass = platform_hass
-    _restore(hass, State(PRESENCE, STATE_OFF, {"last_seen": "2026-11-19T07:00:00+00:00"}))
+    await _restore(hass, State(PRESENCE, STATE_OFF, {"last_seen": "2026-11-19T07:00:00+00:00"}))
     await _setup(hass, accessory)
     await _pass(hass, virtual_clock, STEP)
 
@@ -252,7 +252,12 @@ async def test_presence_stays_available_when_fetches_fail(
     assert get_state(hass, SIGNAL).state == "-60"
 
 
-def _restore(hass: HomeAssistant, state: State) -> None:
+async def _restore(hass: HomeAssistant, state: State) -> None:
     """What Home Assistant restores for an entity after a restart."""
+    # Saved to the store and loaded again, as on a real start, instead of written into the
+    # in-memory cache: Home Assistant 2026.11 split that private `last_states` dict into
+    # `last_states_by_entity_id` and `last_states_by_entity_registry_id`.
     data = restore_state.async_get(hass)
-    data.last_states[state.entity_id] = restore_state.StoredState(state, None, dt_util.utcnow())
+    stored = restore_state.StoredState(state, None, dt_util.utcnow())
+    await data.store.async_save([stored.as_dict()])
+    await data.async_load()
