@@ -123,8 +123,18 @@ The device tracker exposes the confirmed current address in `mac_address` and ad
 - `local_key_candidates`
 
 An accessory that was without power for more than a week continues with the key it stopped at, far behind
-the clock. It is recognised again from the keys that follow its last sighting, up to 90 days' worth. These
-are derived in the background over a few local refreshes, so it can take a little while until it shows up.
+the clock. It is recognised again from the keys around its last sighting: a day's worth below it and up to
+90 days' worth above. These are derived in the background over a few local refreshes, so it can take a
+little while until it shows up.
+
+The entities of a device do not become unavailable when a fetch from Apple fails or no account is set up.
+What is known about a device stays as it is, and what is not known shows as unknown. The state of the
+Apple account is shown by the account sensors.
+
+Local presence is not a security feature. Bluetooth advertisements are not authenticated: someone who
+records an advertisement of a tag can send it again near one of your scanners up to about 36 hours later,
+and the tag then counts as present although it is not. Use presence for reminders and checks, not to
+unlock doors or to disarm an alarm system.
 
 All key matching happens inside Home Assistant. Local presence tracking therefore continues without an internet
 connection after the rolling-key accessory has been imported, although remote Find My network locations still

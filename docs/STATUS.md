@@ -3,7 +3,7 @@
 Where the refactoring stands. The finding IDs (S1, R1, …) come from the
 [code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md).
 
-Last updated: 2026-11-20, after the first sign-in on a real system was rejected by Apple (see "Open").
+Last updated: 2026-11-20, after the open findings of the local Bluetooth path were worked off (A-6, A-7, A-8, A-10, K-6, S5).
 
 ## Done
 
@@ -55,8 +55,13 @@ Last updated: 2026-11-20, after the first sign-in on a real system was rejected 
 | review A-5 | A fetch that was cutting the search window of a device while the device was removed no longer brings its key chain checkpoints back. |
 | review A-9, A-15, A-18, A-19 | Wording: disabled entries lose their stored password once any entry of the integration is loaded; checkpoints change hourly with an account; the event loop does take the derivation lock briefly; the checkpoint file together with one recorded advertisement is enough to recognise the accessory later. |
 | — | A sign-in that Apple rejects is logged at warning level with what Apple answered (the e-mail address masked), and the form shows that answer instead of only "Invalid username or password". White space around the e-mail address is removed before it is sent. |
-| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.3`), so that it can be told apart from the original integration (`v0.0.1`). |
-| — | Test suite (683 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
+| review A-6 | An accessory that restarts up to a day below its last sighting (after a battery change, if it saves its index only now and then) is recognised at once. Such a match gives presence and battery and never moves the alignment backwards. No cost for an accessory heard within the last 12 hours; otherwise about 100 derivations once per alignment. |
+| review A-8 | A match that cannot align (the secondary key of a tag away from its owner's phone) raises the lower bound of the local gap to the day of the match. Such a tag no longer keeps about 9,500 candidates for good and no longer leaves the 90-day reach. Nothing of this is stored; the alignment stays as it is. |
+| review K-6, A-10 | Device entities never go unavailable because of a fetch: a device nothing is known about shows unknown, whatever the last refresh did. A refresh while every account waits for re-authentication keeps the data and logs at debug level instead of an error on every setup or reload. |
+| review A-7 | After a reload of a device entry the tracker starts from the local sighting stored in this run, with its attributes, address and alignment, and the battery entities show the stored local status at once. |
+| S5 (documentation) | The README says that local presence is not a security feature and why. |
+| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.4`), so that it can be told apart from the original integration (`v0.0.1`). |
+| — | Test suite (696 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
 
@@ -64,7 +69,7 @@ Last updated: 2026-11-20, after the first sign-in on a real system was rejected 
 |---|---|---|
 | R13 | `CONFIG_SCHEMA` declared; schedule recalculated on unload; entities are unloaded before their account is closed on the worker; the worker stops with Home Assistant. | The shared storage object is never torn down, and the delayed refresh after setup can still fire after the last unload. |
 | R22 | A sign-in that ends without the Find My token shows a dedicated error in the config flow and creates no entry. | No specific state or repair hint for accounts that are already set up. The handling follows upstream reports and the library source; it could not be verified against Apple. |
-| S5 | Realignment refreshes are debounced and only run when the alignment really moved. | Plausibility check for alignments taken from Bluetooth; documentation that presence is not a security feature. |
+| S5 | Realignment refreshes are debounced and only run when the alignment really moved. The README warns that presence is not a security feature. | No plausibility check for alignments taken from Bluetooth, on purpose: the check proposed in the review (reject an index behind what the clock expects) would lock out exactly the accessory whose battery was empty for a while, which the local path has to find again. A replayed advertisement can therefore still fake presence and delay the network location by its age. |
 | S7 | E-mail addresses are masked in the config flow logs. | The FindMy library logs the user name at info level; device names still contain name and e-mail. |
 
 ## Open
@@ -80,11 +85,10 @@ Last updated: 2026-11-20, after the first sign-in on a real system was rejected 
 | review M5 | Going back to the original integration: an entry without a password works there until the session expires, then fails with a traceback on every interval instead of asking to sign in. Documented in the README; restoring a backup is the clean way back. |
 | review G10 | Session tokens remain in plain text in the config entry and in backups. Unavoidable without the password, but not documented beyond the README note. |
 | review G14, A-20, N-1 (rest) | CI does not pin actions by commit, the second job installs packages without hash checking, and its Home Assistant version has to be bumped by hand. There are no GitHub releases yet; HACS installs the state of `main`. |
-| review A-6, A-8, A-16 | Local gap keys: an index just below the last alignment is not recognised at once; an accessory that only sends secondary keys keeps its gap and drops out after 90 days; a gap of more than 7 days is derived step by step (672 indices per 15 minutes). |
-| review A-7, A-10 | Availability follows the last refresh, not the last fetch: after a reload with failing fetches the tracker is unavailable until the next advertisement although a sighting is stored, and a refresh the budget turned away counts as a success. The delayed refresh after setup logs an error while every account waits for re-authentication. With an account, a failed fetch turns latitude, longitude and the tracker of a tag that has no report and was not heard locally since the start from unknown to unavailable (review K-6). |
 | review A-11, A-12 | A stored Anisette state that is valid base64 but no archive, or a bundle read while another provider rewrites it, ends a sign-in with "unknown error" instead of one retry with a fresh provider. |
 | review A-13, A-14 | The size limit of the bundle download does not bound the memory its conversion needs, and the first download is trusted without a reference checksum shipped with the integration. Both need a compromised server or TLS chain. |
-| review A-17 | A cancelled key derivation runs to its end in the executor; a reload during a cold start derives twice. |
+| review A-16 | Accepted trade-off: a local gap of more than 7 days is derived step by step (672 indices per 15 minutes, 90 days at most) instead of at once, which cost up to 80 s per refresh in the original. An accessory that continues at its old index after a battery change is found at once; one whose index runs behind the clock for another reason is found later. |
+| review A-17 | Accepted for now: a cancelled key derivation runs to its end in the executor; a reload during a cold start derives twice (a few seconds on a small server, results are correct). |
 | W1–W4, W6–W10 | Entry type enum, shared entity base classes, Bluetooth manager, documentation, translations. |
 | new | The account sensors do not show that an account waits for re-authentication. |
 
@@ -98,7 +102,8 @@ Last updated: 2026-11-20, after the first sign-in on a real system was rejected 
 - The tests ran on Windows and, in CI, on Linux; never on ARM hardware.
 - Whether Apple treats the identity reused in a re-authentication as the known device.
 - The download and conversion of the real Anisette library bundle. The conversion uses the same code path of the `anisette` package as its own download; tests use a stand-in archive.
-- The throughput numbers of the key derivation come from one Windows desktop; nothing was measured on Linux or a NAS.
+- The throughput numbers of the key derivation come from one Windows desktop; nothing was measured on Linux or a NAS. The same holds for the cost of the day of keys below an alignment (about 40 ms there).
+- Whether an AirTag really restarts below its last index after a battery change is not measured; the day of keys below the alignment is a precaution.
 - FindMy.py rewrites the Anisette bundle in place on every provider start. The checksum of its content survives another packing; a release of `anisette` that renames the files inside or stops writing a tar archive would still need the file to be deleted once. The pin keeps such a release out until the integration is tested with it.
 - The log filter covers the loggers of FindMy.py by name. A module a later FindMy.py release adds is not covered until it is listed in `redaction.py`.
 - The second CI job replaces Home Assistant and its pinned libraries in the locked environment; it ran on Windows locally and on Linux in CI, against 2026.11.1 and 2026.11.2 only.

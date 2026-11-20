@@ -797,7 +797,9 @@ class CachedFindMyAccessory(FindMyAccessory):
         A day below the bound stays (LOCAL_RESTART_MARGIN), as below an alignment: FindMy.py
         does not know whether a day uses the secondary key ``day + 1`` or ``day + 2``
         (FindMyAccessory._secondary_keys_at), so one key belongs to two neighbouring days, and
-        the day a match is reported with may be the later one.
+        the day a match is reported with may be the later one. It may as well be the earlier
+        one (the candidates of the top window list a key under the first index they hold it
+        for), which only leaves the bound a day lower than it could be.
 
         The bound only ever rises; an index in the day of the alignment or below changes
         nothing, which covers every match below the alignment. It is forgotten as soon as the

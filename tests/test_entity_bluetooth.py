@@ -361,6 +361,54 @@ async def test_a_secondary_key_is_matched_but_never_aligns(
     assert counter.entry_writes == []
 
 
+async def test_a_match_that_cannot_align_is_passed_on_to_the_accessory(  # noqa: PLR0917
+    platform_hass: HomeAssistant,
+    storage: RuntimeStorage,
+    fake_bluetooth: FakeBluetooth,
+    accessory: FindMyAccessory,
+    counter: _Counter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review finding A-8: the day of such a match lets the accessory drop older local keys.
+
+    What the accessory does with it is tested in test_local_gap.py; this is the call.
+    """
+    from findmy import KeyPairType  # noqa: PLC0415
+
+    hass = platform_hass
+    _ = _device(hass, storage)
+    noted: list[int] = []
+    monkeypatch.setattr(
+        CachedFindMyAccessory,
+        "note_unaligned_match",
+        lambda _self, index: noted.append(index),
+    )
+    primary = next(
+        key for key in accessory.keys_at(INDEX + 4) if key.key_type == KeyPairType.PRIMARY
+    )
+    secondary = next(
+        key for key in accessory.keys_at(INDEX + 8) if key.key_type == KeyPairType.SECONDARY
+    )
+
+    # A primary key aligns; there is nothing to pass on.
+    fake_bluetooth.advertise(
+        primary.mac_address, manufacturer_data=separated_advertisement(primary, CRITICAL)
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert noted == []
+
+    fake_bluetooth.advertise(
+        secondary.mac_address, manufacturer_data=separated_advertisement(secondary, CRITICAL)
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    # An index of a day the secondary key belongs to. One key serves two neighbouring days,
+    # and the candidates list it under the first index they hold it for, so it is the day of
+    # the accessory or the one before.
+    (index,) = noted
+    assert (INDEX + 8) // 96 - index // 96 in {0, 1}
+
+
 async def test_unload_stops_bluetooth_and_timers(  # noqa: PLR0917
     platform_hass: HomeAssistant,
     storage: RuntimeStorage,

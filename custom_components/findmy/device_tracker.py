@@ -361,6 +361,14 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
             service_info.source,
         )
 
+        if not observation.can_align and isinstance(self._device, CachedFindMyAccessory):
+            # A key that cannot align: the secondary key a tag sends while it is away from its
+            # owner's phone, or a key just below the alignment. It still tells in which day
+            # the index of the tag lies, which lets the accessory give up the local keys it
+            # holds below that day (review finding A-8). Only records a number; the next
+            # generation of the candidates applies it.
+            self._device.note_unaligned_match(observation.key_index)
+
         now_mono = monotonic()
         current_index = self._device._alignment_index  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         index_changed = observation.can_align and observation.key_index != current_index
