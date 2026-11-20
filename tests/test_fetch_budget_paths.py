@@ -60,7 +60,9 @@ def apple(monkeypatch: pytest.MonkeyPatch) -> Apple:
     """
     opened: Apple = {}
 
-    async def async_load(worker: Any, entry_id: str, account_data: Any) -> AccountRuntime:
+    async def async_load(
+        worker: Any, entry_id: str, account_data: Any, **_options: object
+    ) -> AccountRuntime:
         email = account_data["account"]["username"]
         mock = make_mock_account(email=email, reports={})
         opened.setdefault(email, []).append(mock)

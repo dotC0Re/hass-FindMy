@@ -371,7 +371,8 @@ class LibraryAccounts:
         exactly what the coordinator schedules after setup.
         """
 
-        def from_json(data: Mapping[str, Any]) -> MagicMock:
+        def from_json(data: Mapping[str, Any], **_options: object) -> MagicMock:
+            # Options such as the Anisette library path do not matter to a mock.
             email = cast("str", data["account"]["username"])
             account = self.factory(email=email, reports={})
             self.by_email[email] = account

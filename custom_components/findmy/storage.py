@@ -171,14 +171,11 @@ class RuntimeStorage:
             # (anisette_libs.py), which has to be in place before the account is restored.
             # This also raises ConfigEntryNotReady, while the bundle cannot be downloaded,
             # and ConfigEntryError for a bundle that was changed on disk.
+            # None for a remote Anisette server, which nothing of this applies to.
             libs_path = await async_local_anisette_libs(self._hass, account_data)
-            if libs_path is None:
-                # A remote Anisette server: nothing of this applies.
-                account = await AccountRuntime.async_load(self.worker, entry.entry_id, account_data)
-            else:
-                account = await AccountRuntime.async_load(
-                    self.worker, entry.entry_id, account_data, anisette_libs_path=libs_path
-                )
+            account = await AccountRuntime.async_load(
+                self.worker, entry.entry_id, account_data, anisette_libs_path=libs_path
+            )
 
             _LOGGER.debug(
                 "Storing entry %s as account: (%s)",
