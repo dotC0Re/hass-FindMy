@@ -45,6 +45,7 @@ Last updated: 2026-11-20, after the second round of fixes from the first externa
 | review G3 | The delayed first refresh is a background task, so the start of Home Assistant does not wait for a fetch. |
 | review G5 | A device entry reloaded during a fetch gets the report and the alignment of that fetch. |
 | — | Found by the new entity tests: a local alignment is saved also within the first hour after the host booted; the signal strength sensor no longer sticks to an old value; a reloaded entry keeps signal strength and source. |
+| review G15 | The manifest carries a version of the fork's own (`2026.11.0`, year.month.patch), so that it can be told apart from the original integration (`v0.0.1`). |
 | — | Test suite (613 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
@@ -67,7 +68,7 @@ Last updated: 2026-11-20, after the second round of fixes from the first externa
 | review M4 (rest) | Report decryption and the Anisette emulation run inside library code on the worker thread and are not paced. Only a separate process would isolate them; the measurements do not call for it so far. A catch-up window whose fetch was cancelled is searched again an hour later, not at once. |
 | review M5 | Going back to the original integration: an entry without a password works there until the session expires, then fails with a traceback on every interval instead of asking to sign in. Documented in the README; restoring a backup is the clean way back. |
 | review G10 | Session tokens remain in plain text in the config entry and in backups. Unavoidable without the password, but not documented beyond the README note. |
-| review G14, G15 | CI tests one Home Assistant version only and does not pin actions by commit; the manifest version is still `v0.0.1`, so the fork cannot be told apart from the original by version. |
+| review G14 | CI tests one Home Assistant version only and does not pin actions by commit. There are no GitHub releases yet; HACS installs the state of `main`. |
 | W1–W4, W6–W10 | Entry type enum, shared entity base classes, Bluetooth manager, documentation, translations. |
 | new | The account sensors do not show that an account waits for re-authentication. |
 | new | FindMy.py logs the full URL of a remote Anisette server at info level, including credentials it may carry. A log filter on the library's loggers would close that. |
