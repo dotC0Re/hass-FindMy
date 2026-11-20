@@ -86,7 +86,8 @@ Last updated: 2026-11-20, after the fixes from the second external review (findi
 
 - Nothing was tested against Apple's servers. All tests use mocks of the FindMy library.
 - The blueprints load and validate, but were not triggered in a running Home Assistant.
-- The integration was not run inside a real Home Assistant instance after these changes.
+- One real installation runs the integration since 2026-11-20: version 2026.11.1 (`3cc0af7`) on Home Assistant Core 2026.11.2, four AirTags tracked locally, no account. Nothing that needs an account has run on a real system: sign-in, re-authentication, fetching, the download of the Anisette bundle. Neither has the migration of existing entries, because the switch there went through deleting and re-adding them (see the README).
+- The steps for switching through Home Assistant's integration marketplace in the README are what that one installation reported; they were not reproduced.
 - Whether the integrated Anisette emulation changes its serialised state on every fetch is unknown. If it does, the config entry of such an account is rewritten after every fetch.
 - The tests ran on Windows and, in CI, on Linux; never on ARM hardware.
 - Whether Apple treats the identity reused in a re-authentication as the known device.

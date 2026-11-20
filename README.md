@@ -19,7 +19,38 @@ been fixed so far, and what is still open, is listed in [docs/STATUS.md](docs/ST
       might start throwing errors after a while, so private servers are preferred. Google is your friend.
 3. Enjoy!
 
-## Your Apple ID password is not stored
+## Switching from the original integration
+
+Both integrations use the domain `findmy`, so only one of them can be installed. Make a backup
+first, and keep the key files of your devices (`.plist` or `.json`) at hand.
+
+**Replacing the files and keeping the entries.** If the folder `custom_components/findmy` is
+replaced while your entries exist (by hand, or with a store that lets you swap the repository
+under existing entries), the entries are taken over on the next start: stored passwords are
+removed (see below) and everything else stays. This path is covered by tests only; nobody has
+reported it from a running system yet.
+
+**Through the integration marketplace of Home Assistant 2026.11.** As observed on one
+installation with Core 2026.11.2, the marketplace does not uninstall an integration while its
+domain has any config entry, a disabled one included, and does not install a second repository
+for a domain whose folder another repository owns. What worked there:
+
+1. Delete all FindMy entries (devices and accounts).
+2. Uninstall the original integration and remove its repository.
+3. Add `https://github.com/dotC0Re/hass-FindMy` and install it.
+4. Restart Home Assistant.
+5. Add your devices again with the same key files, and your account if you use one.
+
+What to expect after these steps:
+
+- The entities of a device come back with their entity ids, their settings (such as being
+  disabled) and their device, because all of these are derived from the identifier in the key
+  file. Automations and dashboards keep working.
+- A name you gave a device in Home Assistant is replaced by the name from the key file. Rename
+  the device again.
+- The entries are new, so nothing is carried over from the old ones: an account signs in again
+  with password and 2FA code, as a new device.
+
 
 The integration keeps the session of your Apple account, not its password. When Apple ends the
 session, Home Assistant asks you to sign in again with password and 2FA code (re-authentication);
