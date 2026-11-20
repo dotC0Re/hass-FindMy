@@ -50,7 +50,7 @@ Last updated: 2026-11-20, after the fixes from the second external review (findi
 | review A-4 | The presence tests prepare restored states through Home Assistant's store instead of a private attribute that 2026.11 renamed. CI runs the suite against the locked Home Assistant 2026.9.3 and, in a second job, against 2026.11.1. |
 | review A-5 | A fetch that was cutting the search window of a device while the device was removed no longer brings its key chain checkpoints back. |
 | review A-9, A-15, A-18, A-19 | Wording: disabled entries lose their stored password once any entry of the integration is loaded; checkpoints change hourly with an account; the event loop does take the derivation lock briefly; the checkpoint file together with one recorded advertisement is enough to recognise the accessory later. |
-| review G15 | The manifest carries a version of the fork's own (`2026.11.0`, year.month.patch), so that it can be told apart from the original integration (`v0.0.1`). |
+| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.1`), so that it can be told apart from the original integration (`v0.0.1`). |
 | — | Test suite (659 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done

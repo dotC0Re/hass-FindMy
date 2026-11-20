@@ -10,5 +10,5 @@
   "issue_tracker": "https://github.com/dotC0Re/hass-FindMy/issues",
   "loggers": ["findmy"],
   "requirements": ["FindMy==0.10.2", "anisette==1.2.4"],
-  "version": "2026.11.0"
+  "version": "2026.11.1"
 }
