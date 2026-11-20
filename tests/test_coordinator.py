@@ -47,6 +47,7 @@ from custom_components.findmy.key_cache import (
     CatchUpWindow,
     SearchWindow,
 )
+from custom_components.findmy.last_reports import RestoredReport
 from custom_components.findmy.storage import RuntimeStorage
 
 from .conftest import (
@@ -427,24 +428,50 @@ async def test_reloaded_entry_returns_to_the_rotation(
 
 
 @pytest.mark.asyncio
-async def test_all_accounts_expired_stops_the_schedule_and_fails_manual_refreshes(
-    hass: HomeAssistant, storage: RuntimeStorage, coordinator: FindMyCoordinator
+async def test_all_accounts_expired_stops_the_schedule_and_later_refreshes_are_quiet(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    coordinator: FindMyCoordinator,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Nothing to fetch with is no failure: the delayed refresh after every setup gets here.
+
+    The re-authentication flow and the account sensors show the condition, so the refresh
+    keeps the data and logs at debug level only, instead of an error on every setup or reload.
+    """
     account = await add_account(hass, storage, "a")
     lib(account).fetch_location.side_effect = InvalidStateError("account is in state REQUIRE_2FA")
     await coordinator.reload()
     listen(coordinator)
+    device = make_accessory()
+    known = RestoredReport(
+        timestamp=datetime(2026, 11, 19, 8, 30, tzinfo=UTC),
+        latitude=52.5,
+        longitude=13.4,
+        horizontal_accuracy=35,
+        status=0x40,
+    )
+    coordinator.data = {device: known}
 
     await coordinator.async_refresh()
 
     assert coordinator.update_interval is None
     assert coordinator._unsub_refresh is None
+    # The refresh that found the account expired is the failure; it is not what this is about.
+    assert coordinator.last_update_success is False
 
-    await coordinator.async_refresh()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="custom_components.findmy.coordinator"):
+        await coordinator.async_refresh()
 
     assert lib(account).fetch_location.await_count == 1
-    assert coordinator.last_update_success is False
-    assert "re-authenticated" in str(coordinator.last_exception)
+    assert coordinator.last_update_success is True
+    assert coordinator.data == {device: known}
+    assert coordinator.update_interval is None
+    assert coordinator._unsub_refresh is None
+    # Home Assistant itself notes the recovery after the earlier failure at INFO level.
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert "every Apple account waits for re-authentication" in caplog.text
 
 
 @pytest.mark.asyncio

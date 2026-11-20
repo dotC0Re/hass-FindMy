@@ -525,12 +525,17 @@ class FindMyCoordinator(DataUpdateCoordinator[FindMyLocationData | None]):
 
         rotation = self._rotation()
         if not rotation:
-            if self._storage.accounts:
-                # Reached by a manual refresh and by the delayed refresh after an entry was
-                # set up or reloaded; no refresh is scheduled in this state.
-                msg = "Every Apple account needs to be re-authenticated"
-                raise UpdateFailed(msg)
-            _LOGGER.debug("Skipping data update due to missing accounts")
+            # No account to fetch with: none is set up, or every one waits for its entry to be
+            # re-authenticated. The latter is reached by manual refreshes and by the delayed
+            # refresh after every setup or reload of a device entry, so it must not be an
+            # error: it would be logged each time. The re-authentication flow and the account
+            # sensors already show the condition, and no refresh is scheduled in this state.
+            _LOGGER.debug(
+                "Skipping data update: %s",
+                "every Apple account waits for re-authentication"
+                if self._storage.accounts
+                else "no Apple account",
+            )
             # Not an empty result: the devices keep what is known about them, such as the
             # locations restored after a restart. Without an account nothing replaces them.
             return self.data or {}

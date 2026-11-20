@@ -135,17 +135,18 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
     @property
     @override
     def available(self) -> bool:  # pyright: ignore[reportIncompatibleVariableOverride]
-        """Available while anything is known about the device, whatever the latest fetch did.
+        """Never unavailable because of what a fetch did.
 
         The base class follows the success of the coordinator's latest refresh. A fetch that
-        failed (Apple unreachable, a session that expired) would then take away every tracker,
-        including those that are heard locally and those with a known location.
+        failed (Apple unreachable, a session that expired) says something about the Apple
+        account, which the account sensors show; it takes nothing away from what is known
+        about a device. For a device nothing is known about, the state is unknown. Neither
+        does the refresh that ended last matter: one the fetch budget turned away counts as a
+        success, so following it would flip entities between unavailable and unknown. This is
+        the rule of every entity of a device (sensor.py, binary_sensor.py, presence.py).
+        Home Assistant itself shows unavailable for an entry that is not loaded.
         """
-        return (
-            self.coordinator.last_update_success
-            or self._last_location is not None
-            or self._local_observation is not None
-        )
+        return True
 
     @override
     async def async_added_to_hass(self) -> None:
@@ -155,6 +156,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         if not isinstance(self._device, FindMyAccessory):
             return
 
+        self._adopt_stored_observation()
         self._local_active = True
         # Nearby/separated advertisements and Bluetooth proxies do not always
         # classify the AirTag's connectability consistently, so listen for both.
@@ -199,6 +201,34 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         """Stop publishing results while background work is winding down."""
         self._local_active = False
         await super().async_will_remove_from_hass()
+
+    def _adopt_stored_observation(self) -> None:
+        """Start from the match an earlier tracker of this device published in this run.
+
+        A reloaded entry gets a new tracker, which would otherwise lack its local attributes
+        and the address until the next advertisement callback, up to one key rotation of 15
+        minutes away. The presence sensor reads the same storage.
+
+        Taken over: the match, its source, and with the match the guard against older ones (an
+        address from before the last rotation that the Bluetooth history still holds). The
+        alignment it showed is applied as well, because the guard makes the history replay
+        that follows the generation of the candidates skip this very match, and the entry that
+        the new device was built from may trail the alignment by up to an hour.
+        update_alignment() ignores anything behind what the device already knows.
+
+        Deliberately not replayed: the rate-limit timestamps (they stay at "never", so the
+        first match of this tracker saves the entry and writes the state at once), saving the
+        entry (the next match does), the realignment refresh (the initial refresh that follows
+        starts from the alignment applied here) and the dispatcher signal (storage already
+        holds the match, and the other entities read it when they are added).
+        """
+        stored = RuntimeStorage.get(self.hass).local_observations.get(self.unique_id)
+        if stored is None:
+            return
+        observation, self._local_source = stored
+        self._local_observation = observation
+        if observation.can_align and isinstance(self._device, FindMyAccessory):
+            self._device.update_alignment(observation.detected_at, observation.key_index)
 
     @callback
     def _cancel_local_refresh_tasks(self) -> None:
