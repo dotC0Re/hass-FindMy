@@ -65,6 +65,13 @@ Going back to the original integration: restore a backup made before the switch.
 entries load there, but an account without a stored password fails for good once its session
 expires and has to be removed and added again.
 
+## If Apple rejects the sign-in
+
+The form shows what Apple answered, and the log has the same text as a warning. A wrong e-mail
+address or password is only one possible reason. If both are right, do not keep trying: every
+attempt registers a new emulated device with Apple, and repeated failures can get an account
+locked. Please open an issue with Apple's answer instead.
+
 ## Integrated Anisette provider
 
 Without a remote Anisette server the integration emulates one, which needs a library bundle from

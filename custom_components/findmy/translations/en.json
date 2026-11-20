@@ -86,7 +86,7 @@
       }
     },
     "error": {
-      "invalid_auth": "Invalid username or password",
+      "invalid_auth": "Apple rejected the sign-in ({apple_message}). Check the e-mail address and the password. If both are right, do not keep trying: the reason is something else, and repeated attempts can get the account locked.",
       "2fa_unavailable": "No available 2FA methods found. Please try another account",
       "2fa_invalid": "Error while validating 2FA code. Please try again",
       "invalid_dev": "Invalid device specified",

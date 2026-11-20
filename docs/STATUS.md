@@ -3,7 +3,7 @@
 Where the refactoring stands. The finding IDs (S1, R1, …) come from the
 [code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md).
 
-Last updated: 2026-11-20, after the fixes from the third external review (findings K-1 to K-6, N-1, N-2).
+Last updated: 2026-11-20, after the first sign-in on a real system was rejected by Apple (see "Open").
 
 ## Done
 
@@ -54,8 +54,9 @@ Last updated: 2026-11-20, after the fixes from the third external review (findin
 | review N-2 | The fix for A-5 is tested through the coordinator: a fetch keeps the checkpoints of the chains it walked, and a device removed while the fetch is held up in the executor leaves none. |
 | review A-5 | A fetch that was cutting the search window of a device while the device was removed no longer brings its key chain checkpoints back. |
 | review A-9, A-15, A-18, A-19 | Wording: disabled entries lose their stored password once any entry of the integration is loaded; checkpoints change hourly with an account; the event loop does take the derivation lock briefly; the checkpoint file together with one recorded advertisement is enough to recognise the accessory later. |
-| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.2`), so that it can be told apart from the original integration (`v0.0.1`). |
-| — | Test suite (678 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
+| — | A sign-in that Apple rejects is logged at warning level with what Apple answered (the e-mail address masked), and the form shows that answer instead of only "Invalid username or password". White space around the e-mail address is removed before it is sent. |
+| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.3`), so that it can be told apart from the original integration (`v0.0.1`). |
+| — | Test suite (683 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
 
@@ -70,6 +71,7 @@ Last updated: 2026-11-20, after the fixes from the third external review (findin
 
 | Finding | Summary |
 |---|---|
+| new, 2026-11-20 | **The first sign-in on a real system failed.** With 2026.11.2, the integrated Anisette provider and a new account entry, Apple rejected three attempts within four minutes at the first sign-in request, before the password is checked; the same credentials worked on icloud.com, and the same account had signed in with the original integration two days earlier. What Apple answered was not logged then (it is now). Reading the code found no difference to the original integration in what is sent: the sign-in call is the same, the device ids are created the same way, and the libraries loaded from the stored bundle are the ones the `anisette` package downloads itself. Not known: whether Apple limits new emulated devices per account. Every attempt, here as in the original, provisions a new emulated device. |
 | R8, R9 | Device entries have no unique id; account devices are keyed by the local part of the e-mail address. |
 | R11 | Bluetooth is a hard dependency although local detection is optional. |
 | R18 (review G4) | The config entry is rewritten on every fetch that moves an alignment; estimated at 100 to 200 writes a day with four tags and an account. |
@@ -90,7 +92,7 @@ Last updated: 2026-11-20, after the fixes from the third external review (findin
 
 - Nothing was tested against Apple's servers. All tests use mocks of the FindMy library.
 - The blueprints load and validate, but were not triggered in a running Home Assistant.
-- One real installation runs the integration since 2026-11-20: version 2026.11.1 (`3cc0af7`) on Home Assistant Core 2026.11.2, four AirTags tracked locally, no account. Nothing that needs an account has run on a real system: sign-in, re-authentication, fetching, the download of the Anisette bundle. Neither has the migration of existing entries, because the switch there went through deleting and re-adding them (see the README).
+- One real installation runs the integration since 2026-11-20 on Home Assistant Core 2026.11.2, four AirTags tracked locally, no account. The download of the Anisette bundle worked there (1.4 s). A sign-in did not (see "Open"), so nothing after it has run on a real system: 2FA, re-authentication, fetching. Neither has the migration of existing entries, because the switch there went through deleting and re-adding them (see the README).
 - The steps for switching through Home Assistant's integration marketplace in the README are what that one installation reported; they were not reproduced.
 - Whether the integrated Anisette emulation changes its serialised state on every fetch is unknown. If it does, the config entry of such an account is rewritten after every fetch.
 - The tests ran on Windows and, in CI, on Linux; never on ARM hardware.

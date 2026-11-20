@@ -33,6 +33,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from urllib.parse import urlsplit
 
@@ -210,9 +211,45 @@ def _get_key(node: object, key: str) -> object:
     return cast("dict[str, object]", node).get(key) if isinstance(node, dict) else None
 
 
-def _error_key(err: Exception, action: str, *, remote_anisette: bool = False) -> str:
-    """Map an expected FindMy failure to a form error key and log it."""
+# How much of what Apple answered is logged and shown.
+_MAX_REJECTION_LENGTH = 300
+_NO_REJECTION_DETAILS = "no details"
+
+
+def _rejection_reason(err: Exception, email: str | None) -> str:
+    """What Apple said when it rejected a sign-in, fit for the log and for the form.
+
+    FindMy.py raises ``InvalidCredentialsError`` for every error status of the two sign-in
+    requests and puts Apple's message into its text: "Email verification failed: ..." for
+    the first one, before any password is checked, and "Password authentication failed: ..."
+    for the second. A wrong password is only one of the reasons; a locked account or a device
+    Apple does not accept reads the same without this text.
+
+    The text comes from a server, so it is cut, reduced to one line of printable characters,
+    and the address that was entered is masked in it.
+    """
+    text = " ".join(str(err).split())
+    if email:
+        text = re.sub(re.escape(email), _mask_email(email), text, flags=re.IGNORECASE)
+    text = "".join(char if char.isprintable() else "?" for char in text)
+    if len(text) > _MAX_REJECTION_LENGTH:
+        text = text[:_MAX_REJECTION_LENGTH] + "..."
+    return text or _NO_REJECTION_DETAILS
+
+
+def _error_key(
+    err: Exception, action: str, *, remote_anisette: bool = False, email: str | None = None
+) -> str:
+    """Map an expected FindMy failure to a form error key and log it.
+
+    ``email`` is the address of the sign-in, which is masked if a logged text quotes it.
+    """
     if isinstance(err, InvalidCredentialsError):
+        # At warning level: without Apple's text nobody can tell a wrong password from an
+        # account or a device that Apple turns away.
+        _LOGGER.warning(
+            "Apple rejected the sign-in during %s: %s", action, _rejection_reason(err, email)
+        )
         return "invalid_auth"
     if _is_missing_find_my_token(err):
         _LOGGER.warning("Apple did not return the Find My token during %s", action)
@@ -620,6 +657,10 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Plain data copied out of the session's jobs. Home Assistant's side never
         # touches a FindMy object.
         self._login_state: LoginState | None = None
+        # The address of the current sign-in, and what Apple said if it rejected it. Both
+        # only serve the error texts.
+        self._login_email: str | None = None
+        self._rejection: str | None = None
         self._2fa_labels: list[str] = []
         self._2fa_method_index: int | None = None
         # Kept so the method selection can be shown again after a failed request.
@@ -631,6 +672,23 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ##########################
     ### Sign-in worker     ###
     ##########################
+
+    def _error(self, err: Exception, action: str, *, remote_anisette: bool = False) -> str:
+        """Map a failure to a form error key, log it, and keep Apple's words for the form."""
+        if isinstance(err, InvalidCredentialsError):
+            self._rejection = _rejection_reason(err, self._login_email)
+        return _error_key(err, action, remote_anisette=remote_anisette, email=self._login_email)
+
+    def _error_placeholders(self) -> dict[str, str]:
+        """What the texts of the form errors refer to; needed by every form that shows one."""
+        return {
+            # Used by the text of the invalid_auth error.
+            "apple_message": self._rejection or _NO_REJECTION_DETAILS,
+            # Used by the text of the find_my_token_missing error.
+            "issue_tracker_url": _ISSUE_TRACKER_URL,
+            # Used by the text of the anisette_libs_changed error.
+            "anisette_libs_path": str(anisette_libs_path(self.hass)),
+        }
 
     def _reset_login(self) -> None:
         self._login_state = None
@@ -787,12 +845,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Show the login form of this flow, which differs for re-authentication."""
-        placeholders = {
-            # Used by the text of the find_my_token_missing error.
-            "issue_tracker_url": _ISSUE_TRACKER_URL,
-            # Used by the text of the anisette_libs_changed error.
-            "anisette_libs_path": str(anisette_libs_path(self.hass)),
-        }
+        placeholders = self._error_placeholders()
         if self.source != config_entries.SOURCE_REAUTH:
             return self.async_show_form(
                 step_id="acc_login",
@@ -859,7 +912,10 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.warning("%s", err)
                 return self._show_login_form({"base": "anisette_libs_unavailable"})
 
-        email, password = info["email"], info["password"]
+        # Surrounding white space is never part of an Apple ID, but easily part of what was
+        # pasted into the form, and Apple would answer that it does not know the account.
+        email, password = info["email"].strip(), info["password"]
+        self._login_email, self._rejection = email, None
         self._reset_login()
         try:
             self._login_state = await self._async_run(
@@ -871,7 +927,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as err:
             if not _is_flow_error(err):
                 raise
-            error = _error_key(err, "login", remote_anisette=anisette_url is not None)
+            error = self._error(err, "login", remote_anisette=anisette_url is not None)
             return await self._async_restart_login(error)
 
         _LOGGER.debug("State after login: %s", self._login_state)
@@ -890,7 +946,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.warning("Login step called without info data")
             return self._show_login_form()
 
-        _ = await self.async_set_unique_id(info["email"].lower())
+        _ = await self.async_set_unique_id(info["email"].strip().lower())
         self._abort_if_unique_id_configured()
 
         return await self._async_login(info)
@@ -915,7 +971,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 raise
             # The account cannot be reused for another login attempt, so the user
             # starts over from the login form.
-            return await self._async_restart_login(_error_key(err, "2FA method lookup"))
+            return await self._async_restart_login(self._error(err, "2FA method lookup"))
 
         if not labels:
             return await self._async_restart_login("2fa_unavailable")
@@ -971,7 +1027,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as err:
             if not _is_flow_error(err):
                 raise
-            error = _error_key(err, "2FA code request")
+            error = self._error(err, "2FA code request")
             if isinstance(err, WorkerNotRunningError):
                 # The account went with the worker; only a fresh login can continue.
                 return await self._async_restart_login(error)
@@ -979,6 +1035,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="acc_2fa_request",
                 data_schema=self._2fa_schema,
                 errors={"base": error},
+                description_placeholders=self._error_placeholders(),
             )
 
         return self.async_show_form(
@@ -1020,7 +1077,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.warning("2FA code was rejected", exc_info=True)
                 error = "2fa_invalid"
             else:
-                error = _error_key(err, "2FA submit")
+                error = self._error(err, "2FA submit")
             if error == "find_my_token_missing":
                 # The code was accepted; a new attempt starts with signing in.
                 return await self._async_restart_login(error)
@@ -1035,6 +1092,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="acc_2fa_submit",
                 data_schema=DATA_SCHEME_ACC_2FA,
                 errors={"base": error or "2fa_invalid"},
+                description_placeholders=self._error_placeholders(),
             )
         # The 2FA session is gone; only a fresh login can continue.
         return await self._async_restart_login(error or "login_incomplete")
@@ -1062,7 +1120,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as err:
             if not _is_flow_error(err):
                 raise
-            return await self._async_restart_login(_error_key(err, "saving the session"))
+            return await self._async_restart_login(self._error(err, "saving the session"))
 
         if not _has_find_my_token(account_data):
             _LOGGER.warning("Apple did not return the Find My token during sign-in")
@@ -1111,7 +1169,7 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         # The e-mail field stays editable; logging into another account here
         # would silently replace the session of the entry being repaired.
-        _ = await self.async_set_unique_id(info["email"].lower())
+        _ = await self.async_set_unique_id(info["email"].strip().lower())
         self._abort_if_unique_id_mismatch(reason="wrong_account")
 
         return await self._async_login(info)

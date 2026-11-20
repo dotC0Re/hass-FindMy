@@ -821,3 +821,30 @@ async def test_damaged_bundle_with_a_record_of_version_2026_11_1_is_repaired(
     assert len(download.requests) == 2
     assert path.read_bytes() == original
     assert record.read_text(encoding="ascii") == f"{CONTENT}{content_sha256(path)}  {BUNDLE_FILE}\n"
+
+
+async def test_provider_gets_the_same_libraries_as_from_the_package_own_download(
+    hass: HomeAssistant, download: FakeDownload, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stored bundle must not change what the emulator runs.
+
+    Asked after the first sign-in on a real system was rejected by Apple: the libraries a
+    provider loads from the bundle are, byte for byte, the ones the anisette package reads
+    from the same archive when it downloads it on its own.
+    """
+
+    def libraries(store: Any) -> dict[str, bytes]:
+        found: dict[str, bytes] = {}
+        for name in store.listdir():
+            with store.open_library(name) as file:
+                found[name] = file.read()
+        return found
+
+    # What the package makes of the archive without this integration.
+    direct = libraries(anisette_module._get_libs(io.BytesIO(download.body)))
+    path = await async_ensure_anisette_libs(hass)
+
+    loaded = await hass.async_add_executor_job(load_without_download, monkeypatch, path)
+
+    assert set(direct) == set(ANISETTE_LIBRARIES)
+    assert libraries(loaded._ani_provider.library_store) == direct

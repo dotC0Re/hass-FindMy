@@ -1769,3 +1769,64 @@ def test_error_texts_explain_the_library_bundle():
     assert "{anisette_libs_path}" in errors["anisette_libs_changed"]
     assert "delete" in errors["anisette_libs_changed"]
     assert "try again" in errors["anisette_libs_unavailable"]
+
+
+####################################
+### Rejected sign-in (first real) ###
+####################################
+
+# The first sign-in on a real system was turned away by Apple at the first request, with the
+# right password, and the flow said "Invalid username or password" without a word of Apple's.
+
+
+@pytest.mark.asyncio
+async def test_what_apple_says_about_a_rejected_sign_in_is_logged_and_shown(hass, accounts, caplog):
+    _created, factory_state = accounts
+    said = f"Email verification failed: This Apple Account ({EMAIL.upper()}) is locked."
+    factory_state["login_error"] = InvalidCredentialsError(said)
+    flow = make_flow(hass)
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.findmy"):
+        result = await flow.async_step_acc_login(login_input())
+
+    assert result["errors"] == {"base": "invalid_auth"}
+    shown = (result.get("description_placeholders") or {}).get("apple_message")
+    assert shown == "Email verification failed: This Apple Account (j***@example.com) is locked."
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning == f"Apple rejected the sign-in during login: {shown}"
+    assert EMAIL.lower() not in caplog.text.lower()
+    assert PASSWORD not in caplog.text
+
+    # The next attempt does not show what was said about the previous one.
+    factory_state["login_error"] = aiohttp.ClientConnectionError("no route")
+    result = await flow.async_step_acc_login(login_input())
+    assert result["errors"] == {"base": "cannot_connect"}
+    placeholders = result.get("description_placeholders") or {}
+    assert placeholders.get("apple_message") == "no details"
+
+
+def test_text_of_a_rejection_is_tamed_before_it_is_logged_or_shown():
+    reason = config_flow._rejection_reason
+    assert reason(InvalidCredentialsError("  two\n lines\tand a \x1b[31m colour "), None) == (
+        "two lines and a ?[31m colour"
+    )
+    assert reason(InvalidCredentialsError(""), EMAIL) == "no details"
+    long = reason(InvalidCredentialsError("x" * 1000), None)
+    assert long == "x" * 300 + "..."
+
+
+def test_error_text_for_a_rejection_has_its_placeholder():
+    strings = json.loads((_COMPONENT / "translations" / "en.json").read_text(encoding="utf-8"))
+    assert "{apple_message}" in strings["config"]["error"]["invalid_auth"]
+
+
+@pytest.mark.asyncio
+async def test_white_space_around_the_address_is_not_sent_to_apple(hass, accounts):
+    created, _factory_state = accounts
+    flow = make_flow(hass)
+
+    result = await flow.async_step_acc_login(login_input(email=f"  {EMAIL}\t"))
+
+    assert result["type"] == "create_entry"
+    created[0].login.assert_awaited_once_with(EMAIL, PASSWORD)
+    assert flow.unique_id == EMAIL
