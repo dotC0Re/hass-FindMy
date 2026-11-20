@@ -32,8 +32,6 @@ from ._entity import (
     device_unique_id,
     latest_report,
     latest_status,
-    report_available,
-    status_available,
     status_counter,
 )
 from .account import AccountRuntime, FetchStatus
@@ -107,8 +105,6 @@ class _FindMyDeviceBaseSensor[T](
     _attr_has_entity_name: bool = True
     _attr_should_poll: bool = False
     _suffix: str = ""
-    # Derived from the status byte, which local advertisements carry as well.
-    _from_status: bool = False
 
     def __init__(
         self,
@@ -119,8 +115,6 @@ class _FindMyDeviceBaseSensor[T](
         self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
         self._cached_value: T | None = None
-        # Refined when the first update or observation arrives; see _compute_available.
-        self._attr_available: bool = report_available(coordinator, device)
 
     @override
     async def async_added_to_hass(self) -> None:
@@ -143,18 +137,9 @@ class _FindMyDeviceBaseSensor[T](
     @callback
     def _handle_local_observation(self, *_args: object) -> None:
         value = self._compute_value()
-        available = self._compute_available()
-        if value != self._cached_value or available != self._attr_available:
+        if value != self._cached_value:
             self._cached_value = value
-            self._attr_available = available
             self.async_write_ha_state()
-
-    def _compute_available(self) -> bool:
-        # Not the success of the latest fetch: that is shown by the account sensors, and a
-        # failed fetch leaves what is known about the device as it was.
-        if self._from_status:
-            return status_available(self.hass, self._coordinator, self._device)
-        return report_available(self._coordinator, self._device)
 
     @cached_property
     @override
@@ -168,7 +153,6 @@ class _FindMyDeviceBaseSensor[T](
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        self._attr_available = self._compute_available()
         self._cached_value = self._compute_value()
         self.async_write_ha_state()
 
@@ -232,7 +216,6 @@ class FindMyBatteryLevelSensor(_FindMyDeviceBaseSensor[str]):
     _attr_device_class: SensorDeviceClass | None = SensorDeviceClass.ENUM
     _attr_options: list[str] | None = ["ok", "medium", "low", "critical"]  # noqa: RUF012
     _suffix: str = "battery_level"
-    _from_status: bool = True
 
     @override
     def _compute_value(self) -> str | None:
@@ -245,7 +228,6 @@ class FindMyBatteryPercentSensor(_FindMyDeviceBaseSensor[int]):
     _attr_native_unit_of_measurement: str | None = "%"
     _attr_state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
     _suffix: str = "battery_percent"
-    _from_status: bool = True
 
     @override
     def _compute_value(self) -> int | None:
@@ -259,7 +241,6 @@ class FindMyBatteryVoltageSensor(_FindMyDeviceBaseSensor[int]):
     _attr_state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
     _attr_entity_registry_enabled_default: bool = False  # estimate only, opt-in
     _suffix: str = "battery_voltage"
-    _from_status: bool = True
 
     @override
     def _compute_value(self) -> int | None:
@@ -271,7 +252,6 @@ class FindMyStatusCounterSensor(_FindMyDeviceBaseSensor[int]):
     _attr_state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
     _attr_entity_registry_enabled_default: bool = False  # diagnostic, opt-in
     _suffix: str = "status_counter"
-    _from_status: bool = True
 
     @override
     def _compute_value(self) -> int | None:

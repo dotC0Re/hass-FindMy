@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 import pytest
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import STATE_UNKNOWN
 from homeassistant.helpers.storage import Store
 
 from custom_components.findmy.last_reports import STORAGE_KEY, STORAGE_VERSION, RestoredReport
@@ -165,7 +165,7 @@ async def test_the_restored_report_is_shown_before_any_fetch(
     }
 
 
-async def test_a_failed_fetch_takes_away_only_what_has_no_source(  # noqa: PLR0917
+async def test_a_failed_fetch_changes_no_state_of_any_device(  # noqa: PLR0917
     platform_hass: HomeAssistant,
     library_accounts: LibraryAccounts,
     fake_bluetooth: FakeBluetooth,
@@ -173,7 +173,11 @@ async def test_a_failed_fetch_takes_away_only_what_has_no_source(  # noqa: PLR09
     keypair_factory: KeyPairFactory,
     accessory_factory: AccessoryFactory,
 ) -> None:
-    """A report or a local sighting is still valid after a fetch failed; nothing else is."""
+    """A report or a local sighting stays valid after a failed fetch; the rest stays unknown.
+
+    A fetch says something about the account, not about a device. Replaces the test of the
+    rule that a device nothing is known about goes unavailable while fetches fail.
+    """
     hass = platform_hass
     located = keypair_factory(name="Located")
     unknown = keypair_factory(name="Unknown")
@@ -223,25 +227,25 @@ async def test_a_failed_fetch_takes_away_only_what_has_no_source(  # noqa: PLR09
     assert _report_values(hass, "located")["latitude"] == "52.5"
     assert _report_values(hass, "located")["battery"] == "65"
 
-    assert get_state(hass, "device_tracker.findmy_unknown").state == STATE_UNAVAILABLE
-    assert set(_report_values(hass, "unknown").values()) == {STATE_UNAVAILABLE}
+    assert get_state(hass, "device_tracker.findmy_unknown").state == STATE_UNKNOWN
+    assert set(_report_values(hass, "unknown").values()) == {STATE_UNKNOWN}
 
-    # Heard locally: the tracker and the battery are there, a position is not.
+    # Heard locally: the battery is there, a position is not.
     assert get_state(hass, "device_tracker.findmy_heard").state == STATE_UNKNOWN
     assert _report_values(hass, "heard") == {
-        "latitude": STATE_UNAVAILABLE,
-        "longitude": STATE_UNAVAILABLE,
-        "position": STATE_UNAVAILABLE,
+        "latitude": STATE_UNKNOWN,
+        "longitude": STATE_UNKNOWN,
+        "position": STATE_UNKNOWN,
         "battery_level": "low",
         "battery": "40",
         "battery_low": "on",
     }
-    # DULT advertisements carry no battery state: available, but unknown.
+    # DULT advertisements carry no battery state: unknown.
     assert get_state(hass, "device_tracker.findmy_dult").state == STATE_UNKNOWN
     assert _report_values(hass, "dult") == {
-        "latitude": STATE_UNAVAILABLE,
-        "longitude": STATE_UNAVAILABLE,
-        "position": STATE_UNAVAILABLE,
+        "latitude": STATE_UNKNOWN,
+        "longitude": STATE_UNKNOWN,
+        "position": STATE_UNKNOWN,
         "battery_level": STATE_UNKNOWN,
         "battery": STATE_UNKNOWN,
         "battery_low": STATE_UNKNOWN,

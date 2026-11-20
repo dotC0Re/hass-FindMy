@@ -21,8 +21,6 @@ from ._entity import (
     build_device_info,
     device_unique_id,
     latest_status,
-    report_available,
-    status_available,
 )
 from .const import signal_local_observation
 from .coordinator import FindMyCoordinator, FindMyDevice
@@ -79,8 +77,6 @@ class FindMyBatteryLowBinarySensor(
         self._coordinator: FindMyCoordinator = coordinator
         self._device: FindMyDevice = device
         self._cached: bool | None = None
-        # Refined when the first update or observation arrives; see status_available.
-        self._attr_available: bool = report_available(coordinator, device)
 
     @override
     async def async_added_to_hass(self) -> None:
@@ -103,10 +99,8 @@ class FindMyBatteryLowBinarySensor(
     @callback
     def _handle_local_observation(self, *_args: object) -> None:
         value = self._compute()
-        available = status_available(self.hass, self._coordinator, self._device)
-        if value != self._cached or available != self._attr_available:
+        if value != self._cached:
             self._cached = value
-            self._attr_available = available
             self.async_write_ha_state()
 
     @cached_property
@@ -121,7 +115,6 @@ class FindMyBatteryLowBinarySensor(
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        self._attr_available = status_available(self.hass, self._coordinator, self._device)
         self._cached = self._compute()
         self.async_write_ha_state()
 
