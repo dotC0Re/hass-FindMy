@@ -404,7 +404,8 @@ def test_bluetooth_window_is_limited_too() -> None:
     """An accessory unseen for years costs one refresh a bounded number of keys.
 
     The candidates are the top window, and for an accessory that lags this far the keys right
-    above its last alignment (test_local_gap.py), a step at a time and up to a fixed bound.
+    above its last alignment and a day below it (test_local_gap.py), a step at a time and up
+    to a fixed bound.
     """
     cached, _ = make_pair(paired_days=1000, aligned_hours_ago=900 * 24)
     now = datetime.now(tz=UTC)
@@ -416,7 +417,12 @@ def test_bluetooth_window_is_limited_too() -> None:
     top = {index for index in indices if index >= alignment_index + key_cache.MAX_LOCAL_GAP_INDICES}
     gap = indices - top
     assert max(top) - min(top) + 1 <= WEEK + 48
-    assert gap == set(range(alignment_index, alignment_index + key_cache.LOCAL_GAP_STEP))
+    assert gap == set(
+        range(
+            alignment_index - key_cache.LOCAL_RESTART_MARGIN,
+            alignment_index + key_cache.LOCAL_GAP_STEP,
+        )
+    )
     assert len(cached._key_cache) <= key_cache.MAX_CACHED_INDICES
 
 
