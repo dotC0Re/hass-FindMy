@@ -1,6 +1,31 @@
 # pyright: reportUnknownParameterType=false, reportExplicitAny=false, reportUnknownMemberType=false
 
-"""Integration config flow."""
+"""Integration config flow.
+
+Signing in again keeps the device identity
+------------------------------------------
+No Apple ID password is stored, so every expired session ends in a re-authentication. To Apple
+a sign-in comes from a device, which FindMy.py describes with two ids (``ids.uid`` and
+``ids.devid``) and the Anisette data (for the integrated provider its provisioning state, for a
+remote server whatever that server holds). A sign-in from an unknown device raises a notice on
+all of the user's Apple devices and has to earn trust again.
+
+A re-authentication therefore signs in with an account that is restored from what the entry
+already holds: the ids and the Anisette provider, with the login part reset to "logged out"
+(finding H3). See ``_reusable_identity`` for what is taken over and when a new identity is
+used instead. The initial setup always starts with a new one.
+
+Library route: ``AsyncAppleAccount.from_json`` on a copy of the stored mapping. It is the
+public way to give an account its ids and to restore its provider, and ``login()`` only asks
+for the state ``LOGGED_OUT``, which the copy carries. Nothing private is touched.
+
+What FindMy.py 0.10.2 offers for an expired session, from its source: nothing cheaper than a
+full sign-in. ``fetch_raw_reports`` answers an HTTP 401 with ``_gsa_authenticate()``, which is
+the SRP exchange with the password and fails without one; there is no request that renews the
+session from stored tokens. The tokens of the first stage (``idms_pet``, ``adsid``) are
+replaced by the Find My data once the sign-in completes and are not kept. Whether Apple skips
+the second factor for a known device is Apple's decision and could not be tested.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +75,12 @@ from findmy import (
 )
 
 from .account import without_password
+from .anisette_libs import (
+    AnisetteLibsChecksumError,
+    AnisetteLibsUnavailableError,
+    anisette_libs_path,
+    async_ensure_anisette_libs,
+)
 from .const import (
     CONF_AWAY_TIMEOUT,
     CONFIG_FLOW_VERSION_MAJOR,
@@ -77,7 +108,8 @@ _LOGGER = logging.getLogger(__name__)
 _WORKER_NAME = "findmy-login"
 # Limits on the run time of one job on that thread. A synchronous stretch cannot be
 # interrupted, so a job ends at the next await after its limit.
-# The first sign-in with the local Anisette emulation also downloads and provisions it.
+# The first sign-in with the local Anisette emulation also provisions it. Its library bundle
+# is in place before the job starts (anisette_libs.py), so no download counts against this.
 _LOGIN_TIMEOUT = 120.0
 # Requesting or submitting a code; submitting also finishes the sign-in.
 _2FA_TIMEOUT = 60.0
@@ -234,6 +266,96 @@ def _is_valid_anisette_url(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
 
 
+# What restoring an account from a prepared identity can still raise: a provisioning state
+# that is not base64 (ValueError), fields the checks below do not look at (KeyError, or
+# ValueError where FindMy.py translates it), or values of the wrong shape (TypeError,
+# AssertionError).
+_IDENTITY_ERRORS = (ValueError, KeyError, TypeError, AssertionError)
+
+# The second half of the two log lines that tell why Apple may announce a new device.
+_NEW_DEVICE = "signing in as a new device"
+
+_ANISETTE_LOCAL = "aniLocal"
+_ANISETTE_REMOTE = "aniRemote"
+
+
+def _stored_anisette(account_data: object) -> dict[str, object] | None:
+    """The Anisette part of stored account state, if a provider can be restored from it."""
+    anisette = _get_key(account_data, "anisette")
+    if not isinstance(anisette, dict):
+        return None
+    anisette = cast("dict[str, object]", anisette)
+    kind = anisette.get("type")
+    if kind == _ANISETTE_LOCAL:
+        # No provisioning state yet is a valid state: the provider provisions on first use.
+        prov_data = anisette.get("prov_data")
+        return anisette if prov_data is None or isinstance(prov_data, str) else None
+    if kind == _ANISETTE_REMOTE:
+        url = anisette.get("url")
+        return anisette if isinstance(url, str) and url else None
+    return None
+
+
+def _stored_anisette_url(account_data: object) -> str | None:
+    """The URL of the remote Anisette server an account was stored with, if it uses one.
+
+    May carry ``user:password@``. It is shown in the form of the entry's owner, and must go
+    through ``_url_without_credentials`` before it is logged.
+    """
+    anisette = _stored_anisette(account_data)
+    if anisette is None or anisette.get("type") != _ANISETTE_REMOTE:
+        return None
+    return cast("str", anisette["url"])
+
+
+def _reusable_identity(
+    account_data: object, anisette_url: str | None
+) -> AccountStateMapping | None:
+    """Stored account state reduced to the identity a new sign-in presents to Apple.
+
+    The result restores (``AsyncAppleAccount.from_json``) to an account that is logged out, so
+    ``login()`` accepts it, and that has
+
+    * the device ids of the stored account, and
+    * its Anisette provider, as long as the sign-in asks for the same one: the integrated
+      provider with its provisioning state, or the remote server with the same URL and
+      options. If the user chose another provider, that one is used with the same ids.
+
+    Nothing of the old session is taken over: no tokens, no account details, no password.
+
+    Returns None if the stored data has no usable ids; the sign-in then starts with a new
+    identity, like the initial setup. Never raises, whatever the entry holds.
+    """
+    ids = _get_key(account_data, "ids")
+    uid, devid = _get_key(ids, "uid"), _get_key(ids, "devid")
+    if not (isinstance(uid, str) and uid and isinstance(devid, str) and devid):
+        return None
+
+    stored = _stored_anisette(account_data)
+    requested = _ANISETTE_LOCAL if anisette_url is None else _ANISETTE_REMOTE
+    if (
+        stored is not None
+        and stored.get("type") == requested
+        and (anisette_url is None or stored.get("url") == anisette_url)
+    ):
+        # A copy: the data of a config entry is read-only and belongs to Home Assistant's loop.
+        anisette = copy.deepcopy(stored)
+    elif anisette_url is None:
+        anisette = {"type": _ANISETTE_LOCAL, "prov_data": None}
+    else:
+        anisette = {"type": _ANISETTE_REMOTE, "url": anisette_url}
+
+    identity: dict[str, object] = {
+        "type": "account",
+        "ids": {"uid": uid, "devid": devid},
+        "account": {"username": None, "password": None, "info": None},
+        "login": {"state": LoginState.LOGGED_OUT.value, "data": {}},
+        "anisette": anisette,
+    }
+    # Checked field by field above; the type checker cannot follow that.
+    return cast("AccountStateMapping", cast("object", identity))
+
+
 DATA_SCHEMA_ACC_LOGIN = vol.Schema(
     {
         vol.Required("email"): str,
@@ -362,20 +484,52 @@ class _LoginSession:
             raise RuntimeError(msg)
         return self._account
 
+    @staticmethod
+    def _create_account(
+        anisette_url: str | None,
+        identity: AccountStateMapping | None,
+        libs_path: Path | None,
+    ) -> AsyncAppleAccount:
+        """Create a logged-out account, with the given identity if it can be restored."""
+        if identity is not None:
+            try:
+                # A copy per attempt: the library keeps the nested dicts it is given, and a
+                # second attempt after a wrong password must start from the same data.
+                return AsyncAppleAccount.from_json(
+                    copy.deepcopy(identity), anisette_libs_path=libs_path
+                )
+            except _IDENTITY_ERRORS as err:
+                # Only the kind of error: its text may quote stored data.
+                _LOGGER.info(
+                    "The stored device identity cannot be restored (%s); %s",
+                    type(err).__name__,
+                    _NEW_DEVICE,
+                )
+        if anisette_url is None:
+            anisette = LocalAnisetteProvider(libs_path=libs_path)
+        else:
+            anisette = RemoteAnisetteProvider(anisette_url)
+        return AsyncAppleAccount(anisette=anisette)
+
     async def async_login(
         self,
         email: str,
         password: str,
         anisette_url: str | None,
+        *,
+        identity: AccountStateMapping | None = None,
+        libs_path: Path | None = None,
     ) -> LoginState:
+        """Sign in with a new account object.
+
+        ``identity`` is what ``_reusable_identity`` returned for a re-authentication; without
+        it the account gets new device ids and a new Anisette provider. ``libs_path`` is the
+        library bundle for the integrated Anisette provider, see anisette_libs.py.
+        """
         # Each attempt needs a fresh account; closing the previous one first keeps
         # every wrong password from leaking a client session.
         await self.async_close()
-        if anisette_url is None:
-            anisette = LocalAnisetteProvider()
-        else:
-            anisette = RemoteAnisetteProvider(anisette_url)
-        self._account = AsyncAppleAccount(anisette=anisette)
+        self._account = self._create_account(anisette_url, identity, libs_path)
         # FindMy's login-state decorator hides the return type from the type checker.
         _ = cast("LoginState", await self._account.login(email, password))
         return self._account.login_state
@@ -635,13 +789,21 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _reauth_email(self) -> str:
         return self._get_reauth_entry().unique_id or ""
 
+    def _reauth_account_data(self) -> object:
+        """What the entry being re-authenticated stores for its account; may be damaged."""
+        return cast("Mapping[str, object]", self._get_reauth_entry().data).get("account_data")
+
     def _show_login_form(
         self,
         errors: dict[str, str] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Show the login form of this flow, which differs for re-authentication."""
-        # Used by the text of the find_my_token_missing error.
-        placeholders = {"issue_tracker_url": _ISSUE_TRACKER_URL}
+        placeholders = {
+            # Used by the text of the find_my_token_missing error.
+            "issue_tracker_url": _ISSUE_TRACKER_URL,
+            # Used by the text of the anisette_libs_changed error.
+            "anisette_libs_path": str(anisette_libs_path(self.hass)),
+        }
         if self.source != config_entries.SOURCE_REAUTH:
             return self.async_show_form(
                 step_id="acc_login",
@@ -653,12 +815,16 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # The unique_id is the account email, so the address can be pre-filled
         # and the user only has to supply the password and 2FA code.
         email = self._reauth_email()
+        suggested: dict[str, object] = {"email": email}
+        anisette_url = _stored_anisette_url(self._reauth_account_data())
+        if anisette_url is not None:
+            # Without this the field starts empty, and submitting the form as it is would
+            # move the account from its remote server to the integrated provider (finding
+            # G7). Clearing the field is still how the user asks for exactly that.
+            suggested["advanced_options"] = {"anisette_url": anisette_url}
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=self.add_suggested_values_to_schema(
-                DATA_SCHEMA_ACC_LOGIN,
-                {"email": email},
-            ),
+            data_schema=self.add_suggested_values_to_schema(DATA_SCHEMA_ACC_LOGIN, suggested),
             errors=errors,
             description_placeholders={**placeholders, "account": email},
         )
@@ -683,11 +849,34 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if anisette_url is not None and not _is_valid_anisette_url(anisette_url):
             return self._show_login_form({"base": "invalid_anisette_url"})
 
+        identity: AccountStateMapping | None = None
+        if self.source == config_entries.SOURCE_REAUTH:
+            identity = _reusable_identity(self._reauth_account_data(), anisette_url)
+            if identity is None:
+                _LOGGER.info("The stored account data holds no device identity; %s", _NEW_DEVICE)
+
+        libs_path: Path | None = None
+        if anisette_url is None:
+            # The integrated provider must find its library bundle in place; otherwise it
+            # downloads one itself, unchecked and without a time limit. Checked before every
+            # attempt, on Home Assistant's side: it needs the HTTP session and the executor.
+            try:
+                libs_path = await async_ensure_anisette_libs(self.hass)
+            except AnisetteLibsChecksumError as err:
+                # The text names the file and the checksums, nothing else.
+                _LOGGER.error("%s", err)  # noqa: TRY400  # no traceback: it explains itself
+                return self._show_login_form({"base": "anisette_libs_changed"})
+            except AnisetteLibsUnavailableError as err:
+                _LOGGER.warning("%s", err)
+                return self._show_login_form({"base": "anisette_libs_unavailable"})
+
         email, password = info["email"], info["password"]
         self._reset_login()
         try:
             self._login_state = await self._async_run(
-                lambda session: session.async_login(email, password, anisette_url),
+                lambda session: session.async_login(
+                    email, password, anisette_url, identity=identity, libs_path=libs_path
+                ),
                 _LOGIN_TIMEOUT,
             )
         except Exception as err:

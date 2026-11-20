@@ -9,16 +9,29 @@ from __future__ import annotations
 
 import copy
 import threading
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
-from findmy import AsyncAppleAccount, LoginState
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError
+from findmy import AsyncAppleAccount, LocalAnisetteProvider, LoginState
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError, ConfigEntryNotReady
 
-from custom_components.findmy.account import AccountRuntime, FetchStatus, without_password
+from custom_components.findmy import account as account_module
+from custom_components.findmy import anisette_libs
+from custom_components.findmy.account import (
+    AccountRuntime,
+    FetchStatus,
+    async_local_anisette_libs,
+    without_password,
+)
+from custom_components.findmy.anisette_libs import (
+    AnisetteLibsChecksumError,
+    AnisetteLibsUnavailableError,
+    anisette_libs_path,
+)
 from custom_components.findmy.storage import RuntimeStorage
 
 from .conftest import (
@@ -29,14 +42,25 @@ from .conftest import (
     open_account,
     worker_thread_id,
 )
+from .offline import FakeDownload, install_network_guard, make_library_archive
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from findmy import AccountStateMapping
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
 
 STORED_PASSWORD = "hunter2"
+
+
+@pytest.fixture(autouse=True)
+def network_guard(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """No test of this file may reach the network, see offline.py."""
+    attempts = install_network_guard(monkeypatch)
+    yield
+    assert not attempts, f"the network was used: {attempts}"
 
 
 def account_state() -> AccountStateMapping:
@@ -100,8 +124,8 @@ def restored(monkeypatch: pytest.MonkeyPatch) -> list[tuple[AsyncAppleAccount, i
     accounts: list[tuple[AsyncAppleAccount, int]] = []
     original = AsyncAppleAccount.from_json
 
-    def from_json(data: AccountStateMapping) -> AsyncAppleAccount:
-        account = original(data)
+    def from_json(data: AccountStateMapping, **kwargs: Any) -> AsyncAppleAccount:
+        account = original(data, **kwargs)
         accounts.append((account, threading.get_ident()))
         return account
 
@@ -421,3 +445,242 @@ async def test_session_of_a_removed_entry_is_not_stored(
 
     assert account.persist_session(hass) is False
     entry_updates.assert_not_called()
+
+
+###############################################
+### M3: the library bundle of local Anisette ###
+###############################################
+
+
+def local_account_state() -> AccountStateMapping:
+    """A signed-in account that uses the integrated Anisette provider."""
+    state = make_account_state()
+    return {**state, "anisette": {"type": "aniLocal", "prov_data": None}}
+
+
+@pytest.fixture
+def ensure_libs(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """The bundle is "in place"; anisette_libs.py has tests of its own."""
+    mock = AsyncMock(return_value=anisette_libs_path(hass))
+    monkeypatch.setattr(account_module, "async_ensure_anisette_libs", mock)
+    return mock
+
+
+async def test_local_anisette_account_is_restored_with_the_library_bundle(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    ensure_libs: AsyncMock,
+) -> None:
+    """Without the path the anisette package downloads its libraries after every start."""
+    state = local_account_state()
+
+    path = await async_local_anisette_libs(hass, state)
+    account = await AccountRuntime.async_load(
+        storage.worker, "entry-1", state, anisette_libs_path=path
+    )
+
+    ensure_libs.assert_awaited_once_with(hass)
+    assert path == anisette_libs_path(hass)
+    library_account, _thread = restored[0]
+    provider = library_account._anisette
+    assert isinstance(provider, LocalAnisetteProvider)
+    assert provider._libs_path == path
+    assert account.login_state is LoginState.LOGGED_IN
+
+
+@pytest.mark.parametrize(
+    "account_data",
+    [
+        pytest.param(make_account_state(), id="remote-server"),
+        pytest.param(None, id="missing"),
+        pytest.param("damaged", id="not-a-mapping"),
+        pytest.param({"anisette": "aniLocal"}, id="anisette-not-a-mapping"),
+        pytest.param({"anisette": {"type": "aniOther"}}, id="unknown-provider"),
+    ],
+)
+async def test_only_local_anisette_accounts_need_the_library_bundle(
+    hass: HomeAssistant, ensure_libs: AsyncMock, account_data: Any
+) -> None:
+    """Damaged data is left to the restore, which reports it."""
+    assert await async_local_anisette_libs(hass, account_data) is None
+
+    ensure_libs.assert_not_awaited()
+
+
+async def test_remote_anisette_account_is_restored_without_a_bundle(
+    storage: RuntimeStorage, restored: list[tuple[AsyncAppleAccount, int]]
+) -> None:
+    _ = await AccountRuntime.async_load(storage.worker, "entry-1", make_account_state())
+
+    assert len(restored) == 1
+
+
+async def test_changed_library_bundle_fails_the_setup_with_instructions(
+    hass: HomeAssistant, ensure_libs: AsyncMock
+) -> None:
+    """Not retried: only the user can decide to accept another bundle."""
+    path = anisette_libs_path(hass)
+    ensure_libs.side_effect = AnisetteLibsChecksumError(path, "a" * 64, "b" * 64, "c" * 64)
+
+    with pytest.raises(ConfigEntryError) as raised:
+        _ = await async_local_anisette_libs(hass, local_account_state())
+
+    assert str(path) in str(raised.value)
+    assert "delete this file" in str(raised.value)
+
+
+async def test_missing_library_bundle_makes_the_setup_retry(
+    hass: HomeAssistant, ensure_libs: AsyncMock
+) -> None:
+    ensure_libs.side_effect = AnisetteLibsUnavailableError("the download timed out")
+
+    with pytest.raises(ConfigEntryNotReady, match="the download timed out"):
+        _ = await async_local_anisette_libs(hass, local_account_state())
+
+
+async def test_local_anisette_account_is_not_restored_without_the_bundle(
+    storage: RuntimeStorage, restored: list[tuple[AsyncAppleAccount, int]]
+) -> None:
+    """A caller that skips the check must not quietly get the library's own download back."""
+    with pytest.raises(RuntimeError, match="needs anisette_libs_path"):
+        _ = await AccountRuntime.async_load(storage.worker, "entry-1", local_account_state())
+
+    assert restored == []
+    assert storage.worker._stop_callbacks == {}
+
+
+async def test_storage_restores_accounts_with_the_library_bundle(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    ensure_libs: AsyncMock,
+) -> None:
+    """The one place that loads the account of a config entry."""
+    entry = account_entry(hass, local_account_state())
+
+    account = await storage.add_entry(entry)
+
+    assert isinstance(account, AccountRuntime)
+    ensure_libs.assert_awaited_once_with(hass)
+    library_account, _thread = restored[0]
+    assert cast("Any", library_account._anisette)._libs_path == anisette_libs_path(hass)
+
+
+@pytest.mark.parametrize(
+    ("error", "raised"),
+    [
+        (AnisetteLibsUnavailableError("the download timed out"), ConfigEntryNotReady),
+        (AnisetteLibsChecksumError(Path("bundle"), "a" * 64, "b" * 64, "c" * 64), ConfigEntryError),
+    ],
+)
+async def test_storage_restores_no_account_without_a_usable_bundle(  # noqa: PLR0917
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    ensure_libs: AsyncMock,
+    error: Exception,
+    raised: type[Exception],
+) -> None:
+    """No provider may exist that could download the libraries on its own."""
+    entry = account_entry(hass, local_account_state())
+    ensure_libs.side_effect = error
+
+    with pytest.raises(raised):
+        _ = await storage.add_entry(entry)
+
+    assert restored == []
+    assert storage.accounts == []
+
+
+async def test_storage_restores_remote_anisette_accounts_without_a_bundle(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    ensure_libs: AsyncMock,
+) -> None:
+    entry = account_entry(hass, make_account_state())
+
+    _ = await storage.add_entry(entry)
+
+    ensure_libs.assert_not_awaited()
+    assert len(restored) == 1
+
+
+async def test_account_is_usable_again_after_its_bundle_was_damaged(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process killed while FindMy.py re-saved the bundle must not need a manual fix."""
+    download = FakeDownload(make_library_archive())
+    monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
+    monkeypatch.setattr(anisette_libs, "_RECHECK_DELAYS", ())
+    entry = account_entry(hass, local_account_state())
+    _ = await storage.add_entry(entry)
+    _ = await storage.del_entry(entry)
+    path = anisette_libs_path(hass)
+    original = path.read_bytes()
+    path.write_bytes(original[:100])
+
+    # The next start of Home Assistant.
+    account = await storage.add_entry(entry)
+
+    assert isinstance(account, AccountRuntime)
+    assert account.login_state is LoginState.LOGGED_IN
+    assert path.read_bytes() == original
+    # The first bundle and its repair.
+    assert len(download.requests) == 2
+    assert len(restored) == 2
+
+
+async def test_account_is_not_set_up_with_a_bundle_that_cannot_be_repaired(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server sends another bundle: the entry fails with instructions, nothing is used."""
+    download = FakeDownload(make_library_archive())
+    monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
+    monkeypatch.setattr(anisette_libs, "_RECHECK_DELAYS", ())
+    entry = account_entry(hass, local_account_state())
+    _ = await storage.add_entry(entry)
+    _ = await storage.del_entry(entry)
+    path = anisette_libs_path(hass)
+    damaged = path.read_bytes()[:100]
+    path.write_bytes(damaged)
+    download.body = make_library_archive("v2")
+
+    with pytest.raises(ConfigEntryError, match="delete this file"):
+        _ = await storage.add_entry(entry)
+
+    assert path.read_bytes() == damaged
+    assert len(restored) == 1
+    assert storage.accounts == []
+
+
+async def test_accounts_share_one_stored_bundle_across_restarts(
+    hass: HomeAssistant,
+    storage: RuntimeStorage,
+    restored: list[tuple[AsyncAppleAccount, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real bundle store behind two account entries; only the download is a fake."""
+    download = FakeDownload(make_library_archive())
+    monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
+    first = account_entry(hass, local_account_state())
+    second = account_entry(hass, local_account_state())
+
+    _ = await storage.add_entry(first)
+    _ = await storage.add_entry(second)
+    # What the next start of Home Assistant does with the first entry.
+    _ = await storage.del_entry(first)
+    _ = await storage.add_entry(first)
+
+    assert len(download.requests) == 1
+    path = anisette_libs_path(hass)
+    assert path.is_file()
+    providers = [cast("Any", account._anisette) for account, _thread in restored]
+    assert [provider._libs_path for provider in providers] == [path] * 3

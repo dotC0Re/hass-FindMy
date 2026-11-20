@@ -10,7 +10,9 @@ network classes are replaced; nothing talks to Apple.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -21,6 +23,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
@@ -32,16 +35,25 @@ from findmy import (
     FindMyAccessory,
     InvalidCredentialsError,
     KeyPair,
+    LocalAnisetteProvider,
     LoginState,
+    RemoteAnisetteProvider,
     UnhandledProtocolError,
 )
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import AbortFlow
 
-from custom_components.findmy import config_flow
+from custom_components.findmy import anisette_libs, config_flow
 from custom_components.findmy.account import without_password
+from custom_components.findmy.anisette_libs import (
+    AnisetteLibsChecksumError,
+    AnisetteLibsUnavailableError,
+    anisette_libs_path,
+)
 from custom_components.findmy.const import DOMAIN
+
+from .offline import FakeDownload, install_network_guard, make_library_archive
 
 EMAIL = "john.secret@example.com"
 PASSWORD = "PW-SECRET-4711"
@@ -77,6 +89,37 @@ async def hass(tmp_path):
     await hass.async_stop(force=True)
     # A flow that was left open is cleaned up by Home Assistant's shutdown at the latest.
     assert not login_threads(), "a sign-in thread outlived Home Assistant"
+
+
+@pytest.fixture(autouse=True)
+def network_guard(monkeypatch):
+    """No test of this file may reach the network, see offline.py."""
+    attempts = install_network_guard(monkeypatch)
+    yield
+    assert not attempts, f"the network was used: {attempts}"
+
+
+class LibsStub:
+    """Stands in for the check and download of the Anisette library bundle."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.calls = 0
+        self.error: Exception | None = None
+
+    async def ensure(self, _hass) -> Path:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.path
+
+
+@pytest.fixture(autouse=True)
+def libs(hass, monkeypatch) -> LibsStub:
+    """The bundle is "in place" for every flow; anisette_libs.py has tests of its own."""
+    stub = LibsStub(anisette_libs_path(hass))
+    monkeypatch.setattr(config_flow, "async_ensure_anisette_libs", stub.ensure)
+    return stub
 
 
 def _record(calls: list[tuple[str, str]], name: str) -> None:
@@ -161,7 +204,10 @@ def accounts(monkeypatch):
         return account
 
     def provider(name: str):
-        return MagicMock(side_effect=lambda *_args, **_kwargs: _record(calls, name))
+        mock = MagicMock(side_effect=lambda *_args, **_kwargs: _record(calls, name))
+        # Kept so that a test can look at how the provider was created.
+        factory_state[name] = mock
+        return mock
 
     monkeypatch.setattr(config_flow, "AsyncAppleAccount", factory)
     monkeypatch.setattr(config_flow, "LocalAnisetteProvider", provider("LocalAnisetteProvider"))
@@ -178,9 +224,15 @@ def make_flow(hass, source: str = config_entries.SOURCE_USER, **context):
     return flow
 
 
-def add_account_entry(hass, unique_id: str = EMAIL) -> config_entries.ConfigEntry:
+def add_account_entry(
+    hass, unique_id: str = EMAIL, account_data: object = None
+) -> config_entries.ConfigEntry:
+    """An account entry; by default with data nothing can be restored from."""
     entry = config_entries.ConfigEntry(
-        data={"type": "account", "account_data": {"old": True}},
+        data={
+            "type": "account",
+            "account_data": {"old": True} if account_data is None else account_data,
+        },
         discovery_keys=MappingProxyType({}),
         domain=DOMAIN,
         minor_version=1,
@@ -1169,3 +1221,551 @@ async def test_no_entry_for_a_session_without_find_my_token(hass, accounts):
     factory_state["customize"] = lambda _account: None
     result = await flow.async_step_acc_login(login_input())
     assert result["type"] == "create_entry"
+
+
+################
+### H3 / G7  ###
+################
+
+# What the entry of an account holds before it is re-authenticated.
+OLD_UID = "0A1B2C3D-UID-OF-THE-ENTRY"
+OLD_DEVID = "4E5F6A7B-DEVID-OF-THE-ENTRY"
+OLD_TOKEN = "OLD-SEARCH-PARTY-TOKEN"
+NEW_TOKEN = "NEW-SEARCH-PARTY-TOKEN"
+# The provisioning state is an opaque archive to FindMy.py until the provider is used.
+PROV_DATA = base64.b64encode(b"PROVISIONING-STATE-OF-THE-ENTRY").decode()
+LOCAL_ANISETTE = {"type": "aniLocal", "prov_data": PROV_DATA}
+REMOTE_URL = "https://ani-user:s3cret-ani@ani.example:6969/v3"
+REMOTE_ANISETTE = {"type": "aniRemote", "url": REMOTE_URL}
+
+
+def stored_account(anisette: dict | None = None) -> dict:
+    """Account state as an entry stores it: signed in, without a password."""
+    return {
+        "type": "account",
+        "ids": {"uid": OLD_UID, "devid": OLD_DEVID},
+        "account": {
+            "username": EMAIL,
+            "password": None,
+            "info": {
+                "account_name": EMAIL,
+                "first_name": "John",
+                "last_name": "Secret",
+                "trusted_device_2fa": False,
+            },
+        },
+        "login": {
+            "state": LoginState.LOGGED_IN.value,
+            "data": {"dsid": "1", "mobileme_data": {"tokens": {"searchPartyToken": OLD_TOKEN}}},
+        },
+        "anisette": copy.deepcopy(LOCAL_ANISETTE if anisette is None else anisette),
+    }
+
+
+@pytest.fixture
+def library(monkeypatch):
+    """FindMy.py for real, except for the two requests a sign-in sends to Apple.
+
+    Accounts, providers, ``from_json``, ``to_json`` and the state check of ``login`` are the
+    library's own. The returned class lists what happened: ``events`` (name, thread),
+    ``restores`` (the arguments of ``from_json``) and ``instances``.
+    """
+
+    class Account(AsyncAppleAccount):
+        events: list[tuple[str, str]] = []  # noqa: RUF012  # one class per test
+        restores: list[dict] = []  # noqa: RUF012
+        instances: list[AsyncAppleAccount] = []  # noqa: RUF012
+        login_error: BaseException | None = None
+
+        def __init__(self, anisette, *, state_info=None):
+            _record(self.events, "create")
+            super().__init__(anisette, state_info=state_info)
+            # `login` only accepts an account that is logged out.
+            self.state_when_created = self.login_state
+            self.instances.append(self)
+
+        @classmethod
+        def from_json(cls, val, /, *, anisette_libs_path=None):
+            _record(cls.events, "from_json")
+            cls.restores.append({"data": copy.deepcopy(val), "libs_path": anisette_libs_path})
+            return super().from_json(val, anisette_libs_path=anisette_libs_path)
+
+        async def _gsa_authenticate(self, username=None, password=None):
+            _record(self.events, "authenticate")
+            if self.login_error is not None:
+                raise self.login_error
+            self._username, self._password = username, password
+            self._account_info = {
+                "account_name": username,
+                "first_name": "John",
+                "last_name": "Secret",
+                "trusted_device_2fa": False,
+            }
+            return self._set_login_state(LoginState.AUTHENTICATED, {"idms_pet": "pet"})
+
+        async def _login_mobileme(self):
+            return self._set_login_state(
+                LoginState.LOGGED_IN,
+                {"dsid": "2", "mobileme_data": {"tokens": {"searchPartyToken": NEW_TOKEN}}},
+            )
+
+        def to_json(self, path=None, /):
+            _record(self.events, "to_json")
+            return super().to_json(path)
+
+        async def close(self):
+            _record(self.events, "close")
+            await super().close()
+
+    monkeypatch.setattr(config_flow, "AsyncAppleAccount", Account)
+    return Account
+
+
+def reauth_flow(hass, entry):
+    return make_flow(hass, config_entries.SOURCE_REAUTH, entry_id=entry.entry_id)
+
+
+def suggested_anisette_url(result) -> str | None:
+    """The Anisette URL a login form starts with."""
+    advanced = result["data_schema"].schema["advanced_options"]
+    for key in advanced.schema.schema:
+        if key == "anisette_url":
+            return (key.description or {}).get("suggested_value")
+    msg = "the form has no field for the Anisette URL"
+    raise AssertionError(msg)
+
+
+@pytest.mark.asyncio
+async def test_reauth_keeps_device_ids_and_local_provisioning(hass, library, libs):
+    """H3: Apple sees the device it already knows, not a new one."""
+    entry = add_account_entry(hass, account_data=stored_account())
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    data = entry.data["account_data"]
+    assert data["ids"] == {"uid": OLD_UID, "devid": OLD_DEVID}
+    # The provider was never used here, so the library hands back the state it was given.
+    assert data["anisette"] == LOCAL_ANISETTE
+    # The session is the new one, and it is complete.
+    assert data["login"]["state"] == LoginState.LOGGED_IN.value
+    assert data["login"]["data"]["mobileme_data"]["tokens"]["searchPartyToken"] == NEW_TOKEN
+    assert data["account"]["password"] is None
+    # Restored once, logged out, from nothing but the identity, and with the library bundle.
+    (restore,) = library.restores
+    assert restore["libs_path"] == libs.path
+    assert restore["data"] == {
+        "type": "account",
+        "ids": {"uid": OLD_UID, "devid": OLD_DEVID},
+        "account": {"username": None, "password": None, "info": None},
+        "login": {"state": LoginState.LOGGED_OUT.value, "data": {}},
+        "anisette": LOCAL_ANISETTE,
+    }
+    (account,) = library.instances
+    assert account.state_when_created is LoginState.LOGGED_OUT
+    assert isinstance(account._anisette, LocalAnisetteProvider)
+    assert account._anisette._libs_path == libs.path
+
+
+@pytest.mark.asyncio
+async def test_reauth_runs_the_library_on_the_flow_worker_only(hass, library):
+    entry = add_account_entry(hass, account_data=stored_account())
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    assert [name for name, _thread in library.events] == [
+        "from_json",
+        "create",
+        "authenticate",
+        "to_json",
+        "close",
+    ]
+    assert {thread for _name, thread in library.events} == {WORKER_THREAD}
+    assert not login_threads()
+
+
+@pytest.mark.asyncio
+async def test_reauth_form_starts_with_the_remote_anisette_url(hass, library):
+    """G7: submitting the form as it is must not move the account to another provider."""
+    entry = add_account_entry(hass, account_data=stored_account(REMOTE_ANISETTE))
+
+    result = await reauth_flow(hass, entry).async_step_reauth(dict(entry.data))
+
+    assert result["step_id"] == "reauth_confirm"
+    assert suggested_anisette_url(result) == REMOTE_URL
+    # Also when the form comes back with an error.
+    library.login_error = InvalidCredentialsError("wrong password")
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(
+        login_input(anisette_url=REMOTE_URL)
+    )
+    assert result["errors"] == {"base": "invalid_auth"}
+    assert suggested_anisette_url(result) == REMOTE_URL
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("library")
+@pytest.mark.parametrize("account_data", [stored_account(), {"old": True}, "damaged"])
+async def test_login_forms_without_a_remote_server_start_empty(hass, account_data):
+    entry = add_account_entry(hass, account_data=account_data)
+
+    result = await reauth_flow(hass, entry).async_step_reauth(dict(entry.data))
+    assert suggested_anisette_url(result) is None
+
+    result = await make_flow(hass).async_step_start_acc()
+    assert suggested_anisette_url(result) is None
+
+
+@pytest.mark.asyncio
+async def test_reauth_keeps_the_remote_anisette_server(hass, library, libs):
+    """The URL survives, together with an option that only exists in the stored data."""
+    anisette = {**REMOTE_ANISETTE, "allow_unverified_https": True}
+    entry = add_account_entry(hass, account_data=stored_account(anisette))
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(
+        login_input(anisette_url=REMOTE_URL)
+    )
+
+    assert result["reason"] == "reauth_successful"
+    data = entry.data["account_data"]
+    assert data["anisette"] == anisette
+    assert data["ids"] == {"uid": OLD_UID, "devid": OLD_DEVID}
+    (account,) = library.instances
+    assert isinstance(account._anisette, RemoteAnisetteProvider)
+    # A remote server needs no library bundle.
+    assert libs.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "submitted_url", "expected"),
+    [
+        pytest.param(
+            REMOTE_ANISETTE,
+            "http://other.example:6969",
+            {"type": "aniRemote", "url": "http://other.example:6969"},
+            id="another-server",
+        ),
+        pytest.param(
+            LOCAL_ANISETTE,
+            "http://other.example:6969",
+            {"type": "aniRemote", "url": "http://other.example:6969"},
+            id="integrated-to-remote",
+        ),
+        pytest.param(
+            REMOTE_ANISETTE,
+            None,
+            # A provider that has not been used yet has no provisioning state.
+            {"type": "aniLocal", "prov_data": None},
+            id="remote-to-integrated",
+        ),
+    ],
+)
+async def test_reauth_with_another_provider_keeps_the_device_ids(
+    hass, library, libs, stored, submitted_url, expected
+):
+    entry = add_account_entry(hass, account_data=stored_account(stored))
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(
+        login_input(anisette_url=submitted_url)
+    )
+
+    assert result["reason"] == "reauth_successful"
+    data = entry.data["account_data"]
+    assert data["anisette"] == expected
+    assert data["ids"] == {"uid": OLD_UID, "devid": OLD_DEVID}
+    assert libs.calls == (1 if submitted_url is None else 0)
+    assert len(library.restores) == 1
+
+
+@pytest.mark.asyncio
+async def test_every_reauth_attempt_starts_from_the_stored_identity(hass, library):
+    """A wrong password must not cost the identity: the next attempt restores it again."""
+    entry = add_account_entry(hass, account_data=stored_account())
+    flow = reauth_flow(hass, entry)
+
+    library.login_error = InvalidCredentialsError("wrong password")
+    result = await flow.async_step_reauth_confirm(login_input(password="wrong"))
+    assert result["errors"] == {"base": "invalid_auth"}
+    library.login_error = None
+    result = await flow.async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    assert [restore["data"]["ids"] for restore in library.restores] == [
+        {"uid": OLD_UID, "devid": OLD_DEVID}
+    ] * 2
+    assert entry.data["account_data"]["ids"] == {"uid": OLD_UID, "devid": OLD_DEVID}
+    assert entry.data["account_data"]["anisette"] == LOCAL_ANISETTE
+    first, second = library.instances
+    assert first is not second
+    assert [name for name, _thread in library.events].count("close") == 2
+
+
+def _without(key: str) -> dict:
+    data = stored_account()
+    del data[key]
+    return data
+
+
+def _with_ids(ids: object) -> dict:
+    return {**stored_account(), "ids": ids}
+
+
+UNUSABLE_IDENTITIES = [
+    pytest.param({"old": True}, id="unrelated-data"),
+    pytest.param("damaged", id="not-a-mapping"),
+    pytest.param(_without("ids"), id="no-ids"),
+    pytest.param(_with_ids("uid"), id="ids-not-a-mapping"),
+    pytest.param(_with_ids({"uid": OLD_UID}), id="no-devid"),
+    pytest.param(_with_ids({"uid": "", "devid": OLD_DEVID}), id="empty-uid"),
+    pytest.param(_with_ids({"uid": 1, "devid": 2}), id="ids-not-text"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("account_data", UNUSABLE_IDENTITIES)
+async def test_reauth_without_usable_ids_signs_in_as_a_new_device(
+    hass, library, caplog, account_data
+):
+    entry = add_account_entry(hass, account_data=account_data)
+    caplog.set_level(logging.INFO)
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    assert not library.restores
+    ids = entry.data["account_data"]["ids"]
+    assert ids["uid"] not in {OLD_UID, ""}
+    assert ids["devid"] not in {OLD_DEVID, ""}
+    assert entry.data["account_data"]["anisette"] == {"type": "aniLocal", "prov_data": None}
+    messages = [r.getMessage() for r in caplog.records if r.name == config_flow.__name__]
+    assert any("signing in as a new device" in message for message in messages)
+    assert_not_logged(caplog, PASSWORD, OLD_UID, OLD_DEVID, PROV_DATA, OLD_TOKEN)
+
+
+@pytest.mark.asyncio
+async def test_reauth_with_unreadable_provisioning_state_signs_in_as_a_new_device(
+    hass, library, caplog
+):
+    """The ids look fine, but the library cannot restore the provider."""
+    broken = "not-base64!"
+    entry = add_account_entry(
+        hass, account_data=stored_account({"type": "aniLocal", "prov_data": broken})
+    )
+    caplog.set_level(logging.INFO)
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    assert len(library.restores) == 1
+    data = entry.data["account_data"]
+    assert data["ids"]["uid"] != OLD_UID
+    assert data["ids"]["devid"] != OLD_DEVID
+    assert data["anisette"] == {"type": "aniLocal", "prov_data": None}
+    assert "cannot be restored" in caplog.text
+    assert "signing in as a new device" in caplog.text
+    assert_not_logged(caplog, PASSWORD, OLD_UID, OLD_DEVID, broken)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "anisette",
+    [
+        pytest.param({"type": "aniOther"}, id="unknown-provider"),
+        pytest.param({"type": "aniRemote"}, id="remote-without-url"),
+        pytest.param({"type": "aniLocal", "prov_data": 42}, id="state-not-text"),
+        pytest.param("damaged", id="not-a-mapping"),
+    ],
+)
+async def test_reauth_with_unusable_provider_keeps_the_ids(hass, library, anisette):
+    """The provider the form asks for is created anew; the ids are still the known ones."""
+    account_data = {**stored_account(), "anisette": anisette}
+    entry = add_account_entry(hass, account_data=account_data)
+
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    data = entry.data["account_data"]
+    assert data["ids"] == {"uid": OLD_UID, "devid": OLD_DEVID}
+    assert data["anisette"] == {"type": "aniLocal", "prov_data": None}
+
+
+@pytest.mark.asyncio
+async def test_initial_setup_always_creates_a_new_identity(hass, library, libs):
+    first = await make_flow(hass).async_step_acc_login(login_input())
+    second = await make_flow(hass).async_step_acc_login(login_input(email="other@example.com"))
+
+    assert first["type"] == second["type"] == "create_entry"
+    assert not library.restores
+    ids = [result["data"]["account_data"]["ids"] for result in (first, second)]
+    assert ids[0]["uid"] != ids[1]["uid"]
+    assert ids[0]["devid"] != ids[1]["devid"]
+    for account in library.instances:
+        assert isinstance(account._anisette, LocalAnisetteProvider)
+        assert account._anisette._libs_path == libs.path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("anisette", [LOCAL_ANISETTE, REMOTE_ANISETTE])
+async def test_reauth_logs_nothing_secret(hass, library, caplog, anisette):
+    """Neither the identity nor the credentials of a private Anisette server reach a log."""
+    entry = add_account_entry(hass, account_data=stored_account(anisette))
+    caplog.set_level(logging.DEBUG)
+    url = anisette.get("url")
+    flow = reauth_flow(hass, entry)
+
+    await flow.async_step_reauth(dict(entry.data))
+    library.login_error = aiohttp.ClientConnectionError(f"Cannot connect to host {REMOTE_URL}")
+    result = await flow.async_step_reauth_confirm(login_input(anisette_url=url))
+    assert result["errors"] == {"base": "cannot_connect"}
+    library.login_error = None
+    result = await flow.async_step_reauth_confirm(login_input(anisette_url=url))
+
+    assert result["reason"] == "reauth_successful"
+    assert "Step: reauth_confirm" in caplog.text, "the test must capture the flow's log"
+    assert_not_logged(
+        caplog,
+        PASSWORD,
+        "s3cret-ani",
+        "ani-user",
+        OLD_UID,
+        OLD_DEVID,
+        PROV_DATA,
+        OLD_TOKEN,
+        NEW_TOKEN,
+        EMAIL,
+    )
+
+
+def test_reusable_identity_never_shares_data_with_the_entry():
+    """The entry's data is read-only and stays on Home Assistant's side."""
+    stored = stored_account({**REMOTE_ANISETTE, "allow_unverified_https": True})
+    before = copy.deepcopy(stored)
+
+    identity = config_flow._reusable_identity(stored, REMOTE_URL)
+
+    assert identity is not None
+    assert identity["anisette"] == stored["anisette"]
+    assert identity["anisette"] is not stored["anisette"]
+    # Changing the copy must leave the entry's data alone.
+    cast("dict[str, object]", identity["anisette"])["url"] = "changed"
+    identity["ids"]["uid"] = "changed"
+    assert stored == before
+
+
+###########
+### M3  ###
+###########
+
+
+@pytest.mark.asyncio
+async def test_integrated_anisette_gets_the_library_bundle(hass, accounts, libs):
+    """Without the path the anisette package downloads its libraries on first use."""
+    _created, factory_state = accounts
+
+    result = await make_flow(hass).async_step_acc_login(login_input())
+
+    assert result["type"] == "create_entry"
+    assert libs.calls == 1
+    factory_state["LocalAnisetteProvider"].assert_called_once_with(libs_path=libs.path)
+
+
+@pytest.mark.asyncio
+async def test_remote_anisette_needs_no_library_bundle(hass, accounts, libs):
+    _created, factory_state = accounts
+
+    result = await make_flow(hass).async_step_acc_login(
+        login_input(anisette_url="http://ani.example:6969")
+    )
+
+    assert result["type"] == "create_entry"
+    assert libs.calls == 0
+    factory_state["RemoteAnisetteProvider"].assert_called_once_with("http://ani.example:6969")
+    factory_state["LocalAnisetteProvider"].assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", [config_entries.SOURCE_USER, config_entries.SOURCE_REAUTH])
+async def test_changed_library_bundle_stops_the_sign_in(hass, accounts, libs, source, caplog):
+    """The bundle is not used, and the form says which file to delete."""
+    created, _factory_state = accounts
+    entry = add_account_entry(hass)
+    context = {"entry_id": entry.entry_id} if source == config_entries.SOURCE_REAUTH else {}
+    flow = make_flow(hass, source, **context)
+    step = (
+        flow.async_step_reauth_confirm
+        if source == config_entries.SOURCE_REAUTH
+        else flow.async_step_acc_login
+    )
+    email = EMAIL if source == config_entries.SOURCE_REAUTH else "new@example.com"
+    libs.error = AnisetteLibsChecksumError(libs.path, "a" * 64, "b" * 64, "c" * 64)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await step(login_input(email=email))
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "anisette_libs_changed"}
+    placeholders = result.get("description_placeholders") or {}
+    assert placeholders["anisette_libs_path"] == str(libs.path)
+    assert not created, "no account may be created without a verified bundle"
+    assert not login_threads(), "nothing was signed in, so no thread is needed"
+    # The log names the file too, for those who do not see the form.
+    assert str(libs.path) in caplog.text
+    assert_not_logged(caplog, PASSWORD)
+
+    # After the user dealt with the file, the same form signs in.
+    libs.error = None
+    result = await step(login_input(email=email))
+    assert result["type"] in {"create_entry", "abort"}
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_bundle_download_is_a_retryable_form_error(hass, accounts, libs):
+    created, _factory_state = accounts
+    flow = make_flow(hass)
+    libs.error = AnisetteLibsUnavailableError("the download did not finish within 60 s")
+
+    result = await flow.async_step_acc_login(login_input())
+
+    assert result["errors"] == {"base": "anisette_libs_unavailable"}
+    assert not created
+    assert not login_threads()
+
+    libs.error = None
+    result = await flow.async_step_acc_login(login_input())
+    assert result["type"] == "create_entry"
+    assert libs.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_sign_in_stores_the_bundle_and_later_sign_ins_reuse_it(hass, library, monkeypatch):
+    """The flow with the real bundle store; only the download is a fake."""
+    download = FakeDownload(make_library_archive())
+    monkeypatch.setattr(anisette_libs, "async_get_clientsession", lambda _hass: download)
+    monkeypatch.setattr(
+        config_flow, "async_ensure_anisette_libs", anisette_libs.async_ensure_anisette_libs
+    )
+    path = anisette_libs_path(hass)
+
+    result = await make_flow(hass).async_step_acc_login(login_input())
+    assert result["type"] == "create_entry"
+    assert path.is_file()
+    stored = path.read_bytes()
+
+    entry = add_account_entry(hass, account_data=result["data"]["account_data"])
+    result = await reauth_flow(hass, entry).async_step_reauth_confirm(login_input())
+
+    assert result["reason"] == "reauth_successful"
+    assert len(download.requests) == 1
+    assert path.read_bytes() == stored
+    assert [account._anisette._libs_path for account in library.instances] == [path, path]
+
+
+def test_error_texts_explain_the_library_bundle():
+    strings = json.loads((_COMPONENT / "translations" / "en.json").read_text(encoding="utf-8"))
+    errors = strings["config"]["error"]
+
+    assert "{anisette_libs_path}" in errors["anisette_libs_changed"]
+    assert "delete" in errors["anisette_libs_changed"]
+    assert "try again" in errors["anisette_libs_unavailable"]

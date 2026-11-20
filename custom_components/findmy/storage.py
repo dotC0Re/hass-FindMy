@@ -22,7 +22,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
 from findmy import FixedRollingKeyPairAccessory, KeyPair
 
-from .account import AccountRuntime
+from .account import AccountRuntime, async_local_anisette_libs
 from .budget import PersistentFetchBudget
 from .const import DOMAIN
 from .coordinator import FindMyCoordinator, FindMyDevice
@@ -166,9 +166,19 @@ class RuntimeStorage:
         if data["type"] == "account":
             # `get`: an entry without account data is damaged like any other, and is reported
             # the same way instead of with a KeyError from here.
-            account = await AccountRuntime.async_load(
-                self.worker, entry.entry_id, data.get("account_data")
-            )
+            account_data = data.get("account_data")
+            # The integrated Anisette provider loads its libraries from one verified bundle
+            # (anisette_libs.py), which has to be in place before the account is restored.
+            # This also raises ConfigEntryNotReady, while the bundle cannot be downloaded,
+            # and ConfigEntryError for a bundle that was changed on disk.
+            libs_path = await async_local_anisette_libs(self._hass, account_data)
+            if libs_path is None:
+                # A remote Anisette server: nothing of this applies.
+                account = await AccountRuntime.async_load(self.worker, entry.entry_id, account_data)
+            else:
+                account = await AccountRuntime.async_load(
+                    self.worker, entry.entry_id, account_data, anisette_libs_path=libs_path
+                )
 
             _LOGGER.debug(
                 "Storing entry %s as account: (%s)",
