@@ -3,7 +3,7 @@
 Where the refactoring stands. The finding IDs (S1, R1, …) come from the
 [code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md).
 
-Last updated: 2026-11-19, after the fixes from the first external review (see below).
+Last updated: 2026-11-20, after the second round of fixes from the first external review.
 
 ## Done
 
@@ -35,7 +35,17 @@ Last updated: 2026-11-19, after the fixes from the first external review (see be
 | review M1 | A refresh without any loaded account keeps the data instead of emptying it, so restored locations survive when the account is disabled or failed to set up. |
 | review M2 | The stored password is also removed from account entries Home Assistant never migrates (disabled ones), when the integration is set up. |
 | review G11 | Removing a device while the integration is not loaded still drops its stored location. |
-| — | Test suite (442 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
+| S4 (review M3) | The libraries of the integrated Anisette provider are downloaded once, by the integration itself with a time limit, kept under `.storage/findmy.anisette_libs` and verified against a SHA-256 recorded at the first download (trust on first use) before every use. A damaged file is replaced only by a download that matches the recorded checksum; anything else is refused with a message naming the file to delete. |
+| review H3, G7 | A re-authentication signs in with the device ids and the Anisette state the entry already has instead of as a new device, and its form starts with the remote Anisette URL of the entry. FindMy.py offers nothing cheaper than a full sign-in for an expired session. |
+| review M4, G6 | Key derivation runs in short slices with pauses, never for two accessories at once, and the key chain is walked from checkpoints kept in `.storage/findmy.key_checkpoints` instead of from the pairing after every restart. Each checkpoint is bound to its accessory with an HMAC and dropped if it does not verify. Measured on a desktop with four accessories paired 900 days ago: a TCP ping-pong on the event loop keeps about a third of its idle throughput during a cold refresh, instead of 0.04 %. |
+| review M7 | The tracker no longer overrides the deprecated `battery_level`. The battery sensors of the device carry the value. |
+| review M8 | Entities are tested through Home Assistant's real entity platforms. A contract test pins every entity id, unique id, device identifier, class, unit and attribute key; compared with the original integration, only the `state_class` of latitude/longitude and the tracker's `battery_level` attribute differ. |
+| review G1 | The coordinator shuts down with Home Assistant; no refresh starts while it stops. A fetch counts against the limit once its job starts on the worker, not if it never left Home Assistant. At most one fetch is prepared or running at a time. |
+| review G2 | Unloading an account cancels a fetch running with that account instead of waiting up to 120 s for it. |
+| review G3 | The delayed first refresh is a background task, so the start of Home Assistant does not wait for a fetch. |
+| review G5 | A device entry reloaded during a fetch gets the report and the alignment of that fetch. |
+| — | Found by the new entity tests: a local alignment is saved also within the first hour after the host booted; the signal strength sensor no longer sticks to an old value; a reloaded entry keeps signal strength and source. |
+| — | Test suite (613 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
 
@@ -50,20 +60,17 @@ Last updated: 2026-11-19, after the fixes from the first external review (see be
 
 | Finding | Summary |
 |---|---|
-| S4 (review M3) | Local Anisette downloads its libraries on every start, from a third-party server, without an integrity check and without a timeout. A hanging download ends the fetch after 120 s but leaves its thread behind. Planned: a library path under the configuration directory, loaded once and checked against a stored checksum. |
 | R8, R9 | Device entries have no unique id; account devices are keyed by the local part of the e-mail address. |
 | R11 | Bluetooth is a hard dependency although local detection is optional. |
 | R18 (review G4) | The config entry is rewritten on every fetch that moves an alignment; estimated at 100 to 200 writes a day with four tags and an account. |
-| review H3 | Without a stored password every expired session needs a re-authentication with 2FA. The re-authentication also signs in with a new Anisette identity, which Apple treats as a new device each time. Planned: reuse the device ids and the Anisette state of the entry. Cannot be verified against Apple at the moment. |
-| review M4 | CPU work in other threads still slows the event loop through the GIL, more than the blocking tests show (they measure wake-ups, not throughput). The largest single piece is deriving the key chain from index 0 once per restart. Planned: persist a chain checkpoint at the alignment; add an I/O-bound measurement to the tests. |
+| review H3 (rest) | Every expired session still needs a re-authentication with password and 2FA; that is the price of not storing the password. An identity Apple no longer accepts can only be replaced by removing the account and adding it again. |
+| review M4 (rest) | Report decryption and the Anisette emulation run inside library code on the worker thread and are not paced. Only a separate process would isolate them; the measurements do not call for it so far. A catch-up window whose fetch was cancelled is searched again an hour later, not at once. |
 | review M5 | Going back to the original integration: an entry without a password works there until the session expires, then fails with a traceback on every interval instead of asking to sign in. Documented in the README; restoring a backup is the clean way back. |
-| review M8 | No entity is tested through a real entity platform; `presence.py` has no tests. Planned: one test that sets up a rolling accessory with the real platforms and pins entity ids, unique ids and attribute keys. |
-| review G1–G3, G5–G7 | Smaller runtime points: the coordinator registers no shutdown, so a refresh during stop still counts against the limit; unload waits for a running fetch (up to 120 s); the delayed first refresh is no background task; a device reloaded during a fetch loses that fetch's report; one comment on the derive lock is wrong after a restart; re-authentication silently switches a remote Anisette server to the integrated one. |
 | review G10 | Session tokens remain in plain text in the config entry and in backups. Unavoidable without the password, but not documented beyond the README note. |
 | review G14, G15 | CI tests one Home Assistant version only and does not pin actions by commit; the manifest version is still `v0.0.1`, so the fork cannot be told apart from the original by version. |
 | W1–W4, W6–W10 | Entry type enum, shared entity base classes, Bluetooth manager, documentation, translations. |
-| new | `FindMyDeviceTracker` overrides the deprecated `battery_level` property, which Home Assistant stops supporting in 2027.7. |
 | new | The account sensors do not show that an account waits for re-authentication. |
+| new | FindMy.py logs the full URL of a remote Anisette server at info level, including credentials it may carry. A log filter on the library's loggers would close that. |
 
 ## Not verified
 
@@ -72,3 +79,7 @@ Last updated: 2026-11-19, after the fixes from the first external review (see be
 - The integration was not run inside a real Home Assistant instance after these changes.
 - Whether the integrated Anisette emulation changes its serialised state on every fetch is unknown. If it does, the config entry of such an account is rewritten after every fetch.
 - The tests ran on Windows and, in CI, on Linux; never on ARM hardware.
+- Whether Apple treats the identity reused in a re-authentication as the known device.
+- The download and conversion of the real Anisette library bundle. The conversion uses the same code path of the `anisette` package as its own download; tests use a stand-in archive.
+- The throughput numbers of the key derivation come from one Windows desktop; nothing was measured on Linux or a NAS.
+- FindMy.py rewrites the Anisette bundle in place on every provider start. If a future `anisette` release serialises it differently, the checksum check trips once and the file has to be deleted.

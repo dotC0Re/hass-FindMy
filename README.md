@@ -23,13 +23,24 @@ been fixed so far, and what is still open, is listed in [docs/STATUS.md](docs/ST
 
 The integration keeps the session of your Apple account, not its password. When Apple ends the
 session, Home Assistant asks you to sign in again with password and 2FA code (re-authentication);
-there is no silent sign-in in the background. Entries created by older versions are cleaned
+there is no silent sign-in in the background. Signing in again keeps the device identity of the
+account, so Apple should not announce a new device each time; to start over with a new identity,
+remove the account and add it again. Entries created by older versions are cleaned
 automatically on the next start, disabled ones included. The session tokens themselves are still
 stored in the config entry, and are part of every backup.
 
 Going back to the original integration: restore a backup made before the switch. Without one the
 entries load there, but an account without a stored password fails for good once its session
 expires and has to be removed and added again.
+
+## Integrated Anisette provider
+
+Without a remote Anisette server the integration emulates one, which needs a library bundle from
+the server of the `anisette` package. The bundle is downloaded once, kept as
+`.storage/findmy.anisette_libs` in your configuration directory and checked against the SHA-256
+recorded at that first download before every use. A damaged file is repaired from a download that
+matches this checksum. If the check fails for good, the error names the file; deleting it accepts
+a newly downloaded bundle.
 
 ## Increasing the update frequency
 
@@ -51,6 +62,9 @@ Trackers and sensors of a device stay available as long as anything is known abo
 
 Rolling-key accessories such as official AirTags can also be detected by Home Assistant Bluetooth adapters and
 ESPHome Bluetooth proxies. Local detections update independently of the 15-minute Find My network polling interval.
+
+The tracker has no `battery_level` attribute (Home Assistant deprecated it for trackers); use the
+battery sensors of the device instead.
 
 The device tracker exposes the confirmed current address in `mac_address` and adds these attributes:
 
