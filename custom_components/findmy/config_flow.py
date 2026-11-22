@@ -97,6 +97,7 @@ from .worker import FindMyWorker, WorkerNotRunningError
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
     from pathlib import Path
+    from types import FrameType
     from typing import Any
 
     from homeassistant.core import CALLBACK_TYPE, HomeAssistant
@@ -189,9 +190,72 @@ def _is_missing_find_my_token(err: BaseException) -> bool:
     return isinstance(err, KeyError) and err.args == (_FIND_MY_TOKEN,)
 
 
+# The package behind the integrated Anisette provider, as its modules are named.
+_ANISETTE_PACKAGE = "anisette"
+# The local variable its provisioning keeps Apple's answer in (anisette/_session.py).
+_PROVISIONING_ANSWER = "spim_response"
+# How many field names of an answer without a status are listed.
+_MAX_ANSWER_FIELDS = 8
+
+
+def _module_of(frame: FrameType) -> str:
+    name: object = frame.f_globals.get("__name__")
+    return name if isinstance(name, str) else ""
+
+
+def _anisette_failure(err: BaseException) -> str | None:
+    """Describe a failure inside the integrated Anisette provider, or return None.
+
+    The provider registers ("provisions") an emulated device with Apple before the first
+    sign-in request. The ``anisette`` package reads Apple's answers without checking them,
+    so an answer that lacks a field ends in a bare ``KeyError`` from deep inside the package,
+    which the flow could only show as "Unknown error" (seen on a real system: ``KeyError:
+    'ptm'`` from the request that finishes the provisioning).
+
+    Such a failure is recognised by where it came from: its traceback passes through the
+    ``anisette`` package, whether the package raised it itself or something it called did
+    (its own HTTP client, when Apple cannot be reached). What Apple answered is not part of
+    the exception. It is still in the frame that failed, so the status of the answer is read
+    from there: its error code and message if it has them, otherwise the names of the fields
+    it holds. Only those; an answer that went well holds the keys of the emulated device.
+    """
+    frames: list[FrameType] = []
+    traceback = err.__traceback__
+    while traceback is not None:
+        module = _module_of(traceback.tb_frame)
+        if module == _ANISETTE_PACKAGE or module.startswith(f"{_ANISETTE_PACKAGE}."):
+            frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    if not frames:
+        return None
+
+    detail = f"{type(err).__name__}: {err}" if str(err) else type(err).__name__
+    innermost = frames[-1]
+    described = f"{detail} in {_module_of(innermost)}.{innermost.f_code.co_name}"
+    answer: object = None
+    for frame in reversed(frames):
+        answer = frame.f_locals.get(_PROVISIONING_ANSWER)
+        if answer is not None:
+            break
+    if isinstance(answer, dict):
+        fields = cast("dict[object, object]", answer)
+        status = fields.get("Status")
+        if isinstance(status, dict):
+            status = cast("dict[object, object]", status)
+            described += f"; Apple answered with error {status.get('ec')}: {status.get('em')}"
+        else:
+            names = sorted(str(name) for name in fields)[:_MAX_ANSWER_FIELDS]
+            described += f"; Apple's answer holds only: {', '.join(names) or 'nothing'}"
+    return _tame(described)
+
+
 def _is_flow_error(err: BaseException) -> bool:
     """Whether a failure is one the user can fix or retry, see ``_error_key``."""
-    return isinstance(err, _FLOW_ERRORS) or _is_missing_find_my_token(err)
+    return (
+        isinstance(err, _FLOW_ERRORS)
+        or _is_missing_find_my_token(err)
+        or _anisette_failure(err) is not None
+    )
 
 
 def _has_find_my_token(account_data: Mapping[str, object]) -> bool:
@@ -228,16 +292,22 @@ def _rejection_reason(err: Exception, email: str | None) -> str:
     The text comes from a server, so it is cut, reduced to one line of printable characters,
     and the address that was entered is masked in it.
     """
-    text = " ".join(str(err).split())
+    text = str(err)
     if email:
         text = re.sub(re.escape(email), _mask_email(email), text, flags=re.IGNORECASE)
+    return _tame(text)
+
+
+def _tame(text: str) -> str:
+    """Reduce a text that quotes a server to one short line of printable characters."""
+    text = " ".join(text.split())
     text = "".join(char if char.isprintable() else "?" for char in text)
     if len(text) > _MAX_REJECTION_LENGTH:
         text = text[:_MAX_REJECTION_LENGTH] + "..."
     return text or _NO_REJECTION_DETAILS
 
 
-def _error_key(
+def _error_key(  # noqa: PLR0911  # one return per kind of failure reads best as a list
     err: Exception, action: str, *, remote_anisette: bool = False, email: str | None = None
 ) -> str:
     """Map an expected FindMy failure to a form error key and log it.
@@ -254,6 +324,12 @@ def _error_key(
     if _is_missing_find_my_token(err):
         _LOGGER.warning("Apple did not return the Find My token during %s", action)
         return "find_my_token_missing"
+    anisette_failure = _anisette_failure(err)
+    if anisette_failure is not None:
+        _LOGGER.warning(
+            "The integrated Anisette provider failed during %s: %s", action, anisette_failure
+        )
+        return "anisette_failed"
     if isinstance(err, WorkerNotRunningError):
         _LOGGER.warning("Sign-in was stopped during %s: %s", action, err)
         return "login_incomplete"
@@ -677,12 +753,14 @@ class InitialSetupConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Map a failure to a form error key, log it, and keep Apple's words for the form."""
         if isinstance(err, InvalidCredentialsError):
             self._rejection = _rejection_reason(err, self._login_email)
+        else:
+            self._rejection = _anisette_failure(err)
         return _error_key(err, action, remote_anisette=remote_anisette, email=self._login_email)
 
     def _error_placeholders(self) -> dict[str, str]:
         """What the texts of the form errors refer to; needed by every form that shows one."""
         return {
-            # Used by the text of the invalid_auth error.
+            # Used by the texts of the invalid_auth and anisette_failed errors.
             "apple_message": self._rejection or _NO_REJECTION_DETAILS,
             # Used by the text of the find_my_token_missing error.
             "issue_tracker_url": _ISSUE_TRACKER_URL,

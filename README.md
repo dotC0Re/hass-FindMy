@@ -72,6 +72,12 @@ address or password is only one possible reason. If both are right, do not keep 
 attempt registers a new emulated device with Apple, and repeated failures can get an account
 locked. Please open an issue with Apple's answer instead.
 
+Since October 2026 Apple turns away sign-ins of the FindMy.py library for many accounts, whatever
+Anisette provider is used ("This action cannot be completed at this time."). The library's
+authors are working on it; see [FindMy.py #278](https://github.com/malmeloo/FindMy.py/issues/278).
+Until a fixed library is released, signing in is not expected to work. Local Bluetooth tracking
+does not need an account and is not affected.
+
 ## Integrated Anisette provider
 
 Without a remote Anisette server the integration emulates one, which needs a library bundle from

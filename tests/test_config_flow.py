@@ -1830,3 +1830,101 @@ async def test_white_space_around_the_address_is_not_sent_to_apple(hass, account
     assert result["type"] == "create_entry"
     created[0].login.assert_awaited_once_with(EMAIL, PASSWORD)
     assert flow.unique_id == EMAIL
+
+
+###########################################
+### Failed Anisette provisioning (real) ###
+###########################################
+
+# The second sign-in attempt on a real system ended inside the anisette package, before any
+# sign-in request: Apple's answer to the request that finishes the provisioning of the
+# emulated device had no `ptm`, and the flow showed "Unknown error".
+
+
+def provisioning_failure(finish_answer: dict[str, object]) -> Exception:
+    """Run the real provisioning code of the anisette package against prepared answers."""
+    from anisette._session import ProvisioningSession  # noqa: PLC0415
+
+    answers = [
+        {"Response": {"spim": base64.b64encode(b"start").decode()}},
+        {"Response": finish_answer},
+    ]
+    session = ProvisioningSession.__new__(ProvisioningSession)
+    session._ProvisioningSession__urlBag = {  # pyright: ignore[reportAttributeAccessIssue]
+        "midStartProvisioning": "https://gsa.example/start",
+        "midFinishProvisioning": "https://gsa.example/finish",
+    }
+    session._adi = MagicMock()
+    session._adi.start_provisioning.return_value = MagicMock(cpim=b"cpim", session=7)
+    session._post = lambda *_args: plistlib.dumps(answers.pop(0))  # pyright: ignore[reportAttributeAccessIssue]
+    try:
+        session.provision(-2)
+    except Exception as err:  # noqa: BLE001
+        return err
+    msg = "the provisioning was expected to fail"
+    raise AssertionError(msg)
+
+
+def test_failed_provisioning_is_described_with_the_status_apple_sent():
+    err = provisioning_failure(
+        {"Status": {"ec": -80045, "em": "This action cannot be completed\nat this time."}}
+    )
+    assert isinstance(err, KeyError)
+
+    described = config_flow._anisette_failure(err)
+
+    assert described == (
+        "KeyError: 'ptm' in anisette._session.provision; Apple answered with error -80045: "
+        "This action cannot be completed at this time."
+    )
+    assert config_flow._is_flow_error(err)
+
+
+def test_failed_provisioning_without_a_status_lists_the_fields_but_no_values():
+    err = provisioning_failure({"tk": base64.b64encode(b"TRUST-KEY-SECRET").decode(), "x": 1})
+
+    described = config_flow._anisette_failure(err)
+
+    assert described == (
+        "KeyError: 'ptm' in anisette._session.provision; Apple's answer holds only: tk, x"
+    )
+    assert "TRUST" not in (described or "")
+
+
+def test_other_errors_are_not_taken_for_an_anisette_failure():
+    answer: dict[str, str] = {}
+    with pytest.raises(KeyError) as raised:
+        _ = answer["ptm"]
+    # The same error, raised somewhere else: a bug that keeps its traceback.
+    assert config_flow._anisette_failure(raised.value) is None
+    assert not config_flow._is_flow_error(raised.value)
+    assert config_flow._anisette_failure(KeyError("ptm")) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_provisioning_is_a_form_error_with_what_apple_answered(hass, accounts, caplog):
+    _created, factory_state = accounts
+    factory_state["login_error"] = provisioning_failure(
+        {"Status": {"ec": -80045, "em": "This action cannot be completed at this time."}}
+    )
+    flow = make_flow(hass)
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.findmy"):
+        result = await flow.async_step_acc_login(login_input())
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "anisette_failed"}
+    shown = (result.get("description_placeholders") or {}).get("apple_message")
+    assert shown == (
+        "KeyError: 'ptm' in anisette._session.provision; Apple answered with error -80045: "
+        "This action cannot be completed at this time."
+    )
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning == f"The integrated Anisette provider failed during login: {shown}"
+    # A form error, not a traceback.
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_error_text_for_a_failed_provisioning_has_its_placeholder():
+    strings = json.loads((_COMPONENT / "translations" / "en.json").read_text(encoding="utf-8"))
+    assert "{apple_message}" in strings["config"]["error"]["anisette_failed"]

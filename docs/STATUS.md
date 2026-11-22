@@ -3,7 +3,7 @@
 Where the refactoring stands. The finding IDs (S1, R1, …) come from the
 [code review](CODE_REVIEW.md) and the [refactoring strategy](REFACTORING_STRATEGY.md).
 
-Last updated: 2026-11-20, after the open findings of the local Bluetooth path were worked off (A-6, A-7, A-8, A-10, K-6, S5).
+Last updated: 2026-11-22, after a second sign-in attempt on a real system failed, this time while the emulated device was registered (see "Open").
 
 ## Done
 
@@ -54,14 +54,14 @@ Last updated: 2026-11-20, after the open findings of the local Bluetooth path we
 | review N-2 | The fix for A-5 is tested through the coordinator: a fetch keeps the checkpoints of the chains it walked, and a device removed while the fetch is held up in the executor leaves none. |
 | review A-5 | A fetch that was cutting the search window of a device while the device was removed no longer brings its key chain checkpoints back. |
 | review A-9, A-15, A-18, A-19 | Wording: disabled entries lose their stored password once any entry of the integration is loaded; checkpoints change hourly with an account; the event loop does take the derivation lock briefly; the checkpoint file together with one recorded advertisement is enough to recognise the accessory later. |
-| — | A sign-in that Apple rejects is logged at warning level with what Apple answered (the e-mail address masked), and the form shows that answer instead of only "Invalid username or password". White space around the e-mail address is removed before it is sent. |
+| — | A sign-in that Apple rejects is logged at warning level with what Apple answered (the e-mail address masked), and the form shows that answer instead of only "Invalid username or password". White space around the e-mail address is removed before it is sent. A failure inside the integrated Anisette provider (its registration of the emulated device with Apple) is a form error of its own, with the error code and message of Apple's answer, instead of "Unknown error" and a traceback. |
 | review A-6 | An accessory that restarts up to a day below its last sighting (after a battery change, if it saves its index only now and then) is recognised at once. Such a match gives presence and battery and never moves the alignment backwards. No cost for an accessory heard within the last 12 hours; otherwise about 100 derivations once per alignment. |
 | review A-8 | A match that cannot align (the secondary key of a tag away from its owner's phone) raises the lower bound of the local gap to the day of the match. Such a tag no longer keeps about 9,500 candidates for good and no longer leaves the 90-day reach. Nothing of this is stored; the alignment stays as it is. |
 | review K-6, A-10 | Device entities never go unavailable because of a fetch: a device nothing is known about shows unknown, whatever the last refresh did. A refresh while every account waits for re-authentication keeps the data and logs at debug level instead of an error on every setup or reload. |
 | review A-7 | After a reload of a device entry the tracker starts from the local sighting stored in this run, with its attributes, address and alignment, and the battery entities show the stored local status at once. |
 | S5 (documentation) | The README says that local presence is not a security feature and why. |
-| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.4`), so that it can be told apart from the original integration (`v0.0.1`). |
-| — | Test suite (696 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
+| review G15 | The manifest carries a version of the fork's own (year.month.patch, currently `2026.11.5`), so that it can be told apart from the original integration (`v0.0.1`). |
+| — | Test suite (701 tests), CI for tests, hassfest and HACS validation, and a check that keeps version pins consistent. |
 
 ## Partly done
 
@@ -76,7 +76,8 @@ Last updated: 2026-11-20, after the open findings of the local Bluetooth path we
 
 | Finding | Summary |
 |---|---|
-| new, 2026-11-20 | **The first sign-in on a real system failed.** With 2026.11.2, the integrated Anisette provider and a new account entry, Apple rejected three attempts within four minutes at the first sign-in request, before the password is checked; the same credentials worked on icloud.com, and the same account had signed in with the original integration two days earlier. What Apple answered was not logged then (it is now). Reading the code found no difference to the original integration in what is sent: the sign-in call is the same, the device ids are created the same way, and the libraries loaded from the stored bundle are the ones the `anisette` package downloads itself. Not known: whether Apple limits new emulated devices per account. Every attempt, here as in the original, provisions a new emulated device. |
+| new, 2026-11-20/22 | **Signing in with an Apple account does not work on the one real system.** 2026-11-20 (version 2026.11.2, integrated Anisette, new entry): Apple rejected three attempts within four minutes at the first sign-in request, before the password is checked; what Apple answered was not logged then. 2026-11-22 (2026.11.4): one attempt failed earlier, while the `anisette` package registered the emulated device: Apple's answer to the request that finishes the provisioning had no `ptm` (`KeyError`), shown as "Unknown error"; the status of that answer was not visible (it is now). The same account had signed in with the original integration on 2026-11-18 and fetched reports with positions; the same credentials work on icloud.com. That makes five emulated devices registered for the account within five days. |
+| new, upstream | What upstream reports (read on 2026-11-20 and 2026-11-22, nothing verified against Apple): since about 2026-10-12 Apple rejects sign-ins of FindMy.py 0.10.2 at the first request with error -80045, "This action cannot be completed at this time.", with the integrated provider and with anisette-v3 servers alike (malmeloo/FindMy.py#278, malmeloo/hass-FindMy#65, Dadoum/anisette-v3-server#61). The stated cause: the `anisette` package emulates Apple's Android library while FindMy.py presents itself as a Mac, and Apple now checks that the two match; and the token for Find My is only issued to macOS or iOS identities. A fix (a macOS backend, malmeloo/Anisette.py#6 and malmeloo/FindMy.py#279) is open and unreleased; it needs a binary taken from macOS. No report of a provisioning answer without `ptm` was found. The sign-in of 2026-11-18 does not fit these reports and is not explained. Until upstream releases a fix, signing in is not expected to work; the fork will then have to follow, including the bundle handling in `anisette_libs.py`. |
 | R8, R9 | Device entries have no unique id; account devices are keyed by the local part of the e-mail address. |
 | R11 | Bluetooth is a hard dependency although local detection is optional. |
 | R18 (review G4) | The config entry is rewritten on every fetch that moves an alignment; estimated at 100 to 200 writes a day with four tags and an account. |
@@ -96,7 +97,7 @@ Last updated: 2026-11-20, after the open findings of the local Bluetooth path we
 
 - Nothing was tested against Apple's servers. All tests use mocks of the FindMy library.
 - The blueprints load and validate, but were not triggered in a running Home Assistant.
-- One real installation runs the integration since 2026-11-20 on Home Assistant Core 2026.11.2, four AirTags tracked locally, no account. The download of the Anisette bundle worked there (1.4 s). A sign-in did not (see "Open"), so nothing after it has run on a real system: 2FA, re-authentication, fetching. Neither has the migration of existing entries, because the switch there went through deleting and re-adding them (see the README).
+- One real installation runs the integration since 2026-11-20 on Home Assistant Core 2026.11.2, four AirTags tracked locally, no account. The download of the Anisette bundle worked there (1.4 s). A sign-in did not (see "Open"), so nothing after it has run on a real system: 2FA, re-authentication, fetching. Version 2026.11.4 with the local-path changes is installed there since 2026-11-22; nothing about them has been reported back yet. Neither has the migration of existing entries, because the switch there went through deleting and re-adding them (see the README).
 - The steps for switching through Home Assistant's integration marketplace in the README are what that one installation reported; they were not reproduced.
 - Whether the integrated Anisette emulation changes its serialised state on every fetch is unknown. If it does, the config entry of such an account is rewritten after every fetch.
 - The tests ran on Windows and, in CI, on Linux; never on ARM hardware.
